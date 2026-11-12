@@ -46,6 +46,7 @@ from basecradle_harness import (
     _openai,
 )
 from basecradle_harness._attribution import log_context_attribution
+from basecradle_harness._audio import Transcriber
 from basecradle_harness._describer import Describer
 from basecradle_harness._engine import _REASONS, Engine, _reason
 from basecradle_harness._exceptions import ProviderResponseError, ProviderServerError
@@ -1076,6 +1077,41 @@ def harness_and_mcp_tools(**_):
     engine._run_tool("no_such_tool", {})
 
 
+#: A host whose price is not OpenAI's table — a proxy the transcriber is aimed at.
+PROXY_HOST = "https://llm-proxy.example.com/v1"
+
+
+class _ListenTool(Tool):
+    """The assets tool's ``listen``, reduced to its one vendor call: the real `Transcriber`."""
+
+    name = "assets"
+    description = "Listen to an audio asset."
+
+    def __init__(self) -> None:
+        self._by_where = {
+            "proxy": Transcriber(api_key=OPENAI_KEY, base_url=PROXY_HOST),
+            "unknown": Transcriber(api_key=OPENAI_KEY, model="gpt-9-transcribe"),
+            "openai": Transcriber(api_key=OPENAI_KEY),
+        }
+
+    def run(self, where: str = "openai") -> str:
+        return self._by_where[where].transcribe(b"RIFF", "note.wav", "audio/wav", OPENAI_KEY)
+
+
+@scenario
+def unpriced_media_tools(router, **_):
+    """A billed tool use the harness cannot price, counted on its own line (issue #880): twice on a
+    proxy, once on a model the table lacks, and once priced."""
+    heard = {"text": "hello", "usage": {"type": "duration", "seconds": 60}}
+    router.post(f"{PROXY_HOST}/audio/transcriptions").mock(return_value=_ok(heard))
+    router.post(f"{OPENAI_HOST}/audio/transcriptions").mock(return_value=_ok(heard))
+    registry = ToolRegistry()
+    registry.register(_ListenTool())
+    engine = Engine(provider=None, tools=registry)  # type: ignore[arg-type]
+    for where in ("proxy", "proxy", "unknown", "openai"):
+        engine._run_tool("assets", {"where": where})
+
+
 #: What a fault-slug probe hands the adapter: an HTTP status, or no answer at all.
 TRANSPORT = "transport"
 #: One probe per row of the page's Fault Slugs table, and a second where a row names two statuses
@@ -1388,6 +1424,7 @@ EXPECTED_TOOLS = {
         ("workmail__send_email", "mcp", "ok"),
         ("no_such_tool", "harness", "error"),
     },
+    "unpriced_media_tools": {("assets", "harness", "ok")},
 }
 
 
@@ -1435,6 +1472,35 @@ def test_a_tool_fee_rides_its_tool_line_and_never_the_llm_line(rendered):
     assert not any(
         retired & set(line.fields) for lines in rendered.lines.values() for line in lines
     )
+
+
+def test_an_unpriced_tool_use_is_counted_on_its_own_line_and_named_once(rendered):
+    """Issue #880: the gap is a field on every use's `tool` line and one `cost unpriced` line per
+    gap per wake — never a sentence — and a priced use names none."""
+    uses = [line.fields for line in rendered.heads("unpriced_media_tools", "tool")]
+    assert [use.get("cost_gap") for use in uses] == [
+        "unpriced_host",
+        "unpriced_host",
+        "unknown_model",
+        None,
+    ]
+    assert ["cost" in use for use in uses] == [False, False, False, True]
+    assert uses[3]["cost"] == "0.0045" and uses[3]["cost_basis"] == "computed"
+    gaps = [line.fields for line in rendered.heads("unpriced_media_tools", "cost unpriced")]
+    assert gaps == [
+        {
+            "provider": "openai",
+            "model": "gpt-transcribe",
+            "charge": "audio",
+            "reason": "unpriced_host",
+        },
+        {
+            "provider": "openai",
+            "model": "gpt-9-transcribe",
+            "charge": "audio",
+            "reason": "unknown_model",
+        },
+    ]
 
 
 def test_an_unpriced_container_is_one_counted_line_on_both_vendors(rendered):
@@ -1568,7 +1634,9 @@ CHARGE_REASONS = frozenset(
     {"crashed", "startup_failed", "timeout", "cost_divergence", "no_rate_card"}
 )
 #: What a `cost unpriced` line may name as carrying no price (`browser_time`: issue #768).
-UNPRICED_CHARGES = frozenset({"tokens", "container_time", "browser_time", "grounding", "search"})
+UNPRICED_CHARGES = frozenset(
+    {"tokens", "container_time", "browser_time", "grounding", "search", "image", "audio"}
+)
 UNPRICED_REASONS = frozenset(
     {"unknown_model", "unpriced_tier", "unpriced_host", "not_reported", "rates_unavailable"}
 )

@@ -33,7 +33,8 @@ Pointed at OpenRouter, the response carries its own dollar figure and the line r
 at **OpenAI**, which returns tokens and no price, the line's ``cost=`` is computed from OpenAI's
 published Standard rates (`basecradle_harness._openai_rates`, issue #657) and tagged
 ``cost_basis=computed``; a web search's per-call fee rides that call's ``web_search`` ``tool`` line
-(``kind=search.web``), and a code-interpreter container — whose charge no response describes — is a
+(``kind=search.web``) — on another host, its ``cost_gap=unpriced_host`` and one ``cost unpriced
+charge=search`` line per wake (issue #880) — and a code-interpreter container — whose charge no response describes — is a
 stated gap, one ``cost unpriced charge=container_time`` WARNING per wake. A call the table cannot
 price is one ``cost unpriced charge=tokens`` WARNING per wake per gap, and says why on its own line,
 ``cost_gap=<reason>`` (issue #878). Every server-side tool a
@@ -86,6 +87,7 @@ from basecradle_harness._observability import (
     CONTAINER_TIME,
     NOT_REPORTED,
     RATES_UNAVAILABLE,
+    SEARCH_CHARGE,
     TOKENS_CHARGE,
     UNKNOWN_MODEL,
     UNPRICED_HOST,
@@ -944,22 +946,29 @@ class OpenAIProvider:
         ``incomplete`` as the line's ``reason=``, on every endpoint this adapter is aimed at — the
         items are the vendor's own account of what it ran. Two charges are OpenAI's alone. A web
         search is billed per *search* call on top of the tokens, so the ``web_search`` line carries
-        that fee (an ``open_page`` or ``find_in_page`` action is a use, and not a billed search). A
+        that fee (an ``open_page`` or ``find_in_page`` action is a use, and not a billed search), and
+        on any other host its ``cost_gap=unpriced_host`` beside one ``cost unpriced charge=search``
+        line per wake (issue #880): the fee is OpenAI's list price, never a proxy's. A
         code-interpreter container is billed per session and no response says how long one lived,
         so it is one ``cost unpriced charge=container_time`` line per wake, never a figure.
         """
         output = data.get("output")
         fees: dict[str, float | None] = {}
-        if self._computes_cost:
-            calls = search_calls(output)
-            if calls and self._priced_endpoint():
+        gaps: dict[str, str] = {}
+        calls = search_calls(output) if self._computes_cost else 0
+        if calls:
+            if self._priced_endpoint():
                 fees["web_search"] = web_search_cost(calls)
+            else:
+                self._state_gap(SEARCH_CHARGE, UNPRICED_HOST)
+                gaps["web_search"] = UNPRICED_HOST
         log_server_tools(
             tally_server_tools(server_tool_uses(output)),
             provider=self.provider,
             model=self.model,
             generation_id=generation_id(data),
             fees=fees,
+            gaps=gaps,
         )
         if self._computes_cost and ran_container(output) and "container" not in self._gaps_stated:
             self._gaps_stated.add("container")

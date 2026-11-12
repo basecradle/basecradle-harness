@@ -1528,6 +1528,7 @@ def test_a_search_writes_a_helper_llm_line_and_meters_its_grounding_fee(router, 
         "model": "gemini-3.8-flash",
         "count": 2,
         "cost": pytest.approx(0.028),
+        "cost_gap": None,
     }
     assert isinstance(fields["cost"], ComputedCost)
     assert not _lines_starting(caplog, "tool ")  # the line is the engine's, never the adapter's
@@ -1572,6 +1573,7 @@ def test_a_fee_that_cannot_be_counted_is_logged_without_a_cost_and_warned(router
         "model": "gemini-3.8-flash",
         "count": None,
         "cost": None,
+        "cost_gap": "not_reported",  # on the search's own `tool` line, every time (issue #880)
     }
     assert any(
         r.levelno == logging.WARNING and "grounding" in r.getMessage() for r in caplog.records

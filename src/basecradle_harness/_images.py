@@ -70,7 +70,6 @@ live-verified footguns below as the standing exception.
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import Any
 
@@ -89,13 +88,19 @@ from basecradle_harness._media import (
     slugify,
     uuid_list,
 )
-from basecradle_harness._observability import metered, tool_failed
+from basecradle_harness._observability import (
+    IMAGE_CHARGE,
+    NOT_REPORTED,
+    UNKNOWN_MODEL,
+    UNPRICED_HOST,
+    GapLedger,
+    metered,
+    tool_failed,
+)
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
-from basecradle_harness._openai_rates import image_cost, priced_host
+from basecradle_harness._openai_rates import image_cost, image_known, priced_host
 from basecradle_harness._platform import PlatformTool, explain
 from basecradle_harness._secret import reveal, secret
-
-_log = logging.getLogger("basecradle_harness")
 
 #: OpenAI's Images API root. Image generation/editing is an OpenAI service; this
 #: changes only for a proxy, not to reach another vendor (the key is the OpenAI key).
@@ -223,6 +228,8 @@ class _ImageTool(PlatformTool):
         self._model = model or self.MODEL
         self._default_size = size
         self._timeout = timeout
+        #: The ``cost unpriced`` gaps this tool has stated this wake (issue #880).
+        self._gaps = GapLedger()
 
     # --- shared helpers -------------------------------------------------------
 
@@ -240,27 +247,29 @@ class _ImageTool(PlatformTool):
         client = openai.OpenAI(api_key=key, base_url=self._base_url, timeout=self._timeout)
         return openai, client
 
-    def _cost(self, response: object) -> float | None:
-        """What this call cost at OpenAI's published image rates (issue #657), or ``None``.
+    def _cost(self, response: object) -> tuple[float | None, str | None]:
+        """This call's cost at OpenAI's published image rates (issue #657), or the reason it has none.
 
         OpenAI states no price on an Images response, only its token usage, so the figure is
         computed (`_openai_rates.image_cost`) and the tool line tags it ``cost_basis=computed``.
-        A call that cannot be priced — another host, a model or a usage shape the table does not
-        carry — says so in a WARNING, so the missing figure is a stated gap and never a silent one.
+        A call that cannot be priced is a counted gap, never a silent one or a sentence (issue
+        #880): its reason rides its own ``tool`` line as ``cost_gap=``, and one ``cost unpriced
+        charge=image`` line per wake per gap names it — ``unpriced_host`` for any host but OpenAI's
+        own, ``unknown_model`` for a model the table lacks, ``not_reported`` for a usage block that
+        does not state what the figure needs (absent, no input split, or text output on a model the
+        page gives no text-output rate).
         """
         if not priced_host(self._base_url):
-            _log.warning(
-                "Image call to %s is not priced: the harness prices OpenAI's own host only.",
-                self._base_url,
-            )
-            return None
+            return None, self._gap(UNPRICED_HOST)
         cost = image_cost(self._model, getattr(response, "usage", None))
-        if cost is None:
-            _log.warning(
-                "Image call on %r is not priced: its model or usage is not in _openai_rates.",
-                self._model,
-            )
-        return cost
+        if cost is not None:
+            return cost, None
+        return None, self._gap(UNKNOWN_MODEL if not image_known(self._model) else NOT_REPORTED)
+
+    def _gap(self, reason: str) -> str:
+        return self._gaps.state(
+            provider="openai", model=self._model, charge=IMAGE_CHARGE, reason=reason
+        )
 
     def _coverage_params(
         self,
@@ -421,7 +430,7 @@ class GenerateImageTool(_ImageTool):
                 sdk_error_context(openai),
             ):
                 response = client.images.generate(model=self._model, prompt=prompt, n=1, **coverage)
-                call.cost = self._cost(response)
+                call.cost, call.cost_gap = self._cost(response)
             image_bytes = self._decode(response)
         except ProviderTimeoutError as exc:
             # Reached, and out of time — a gateway's 504 included (#759): never "could not reach".
@@ -590,7 +599,7 @@ class EditImageTool(_ImageTool):
                 response = client.images.edit(
                     model=self._model, image=sources, prompt=prompt, n=1, **extra, **coverage
                 )
-                call.cost = self._cost(response)
+                call.cost, call.cost_gap = self._cost(response)
             image_bytes = self._decode(response)
         except ProviderTimeoutError as exc:
             return tool_failed(

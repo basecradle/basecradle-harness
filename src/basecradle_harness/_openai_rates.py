@@ -376,6 +376,16 @@ def known(model: str) -> bool:
     return _model_key(model) in RATES
 
 
+def image_known(model: str) -> bool:
+    """Whether `IMAGE_RATES` carries `model` — an unpriced image call's ``unknown_model`` otherwise."""
+    return _model_key(model) in IMAGE_RATES
+
+
+def transcription_known(model: str) -> bool:
+    """Whether `TRANSCRIPTION_RATES` carries `model` — ``unknown_model`` otherwise."""
+    return _model_key(model) in TRANSCRIPTION_RATES
+
+
 def priced_host(base_url: str | None) -> bool:
     """Whether `base_url` is OpenAI's own API host, the one these rates are the list price on."""
     if not base_url:

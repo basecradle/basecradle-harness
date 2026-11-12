@@ -351,12 +351,17 @@ def test_another_host_is_never_priced_and_says_so_once(router, caplog):
         provider.chat([Message.user("go")])
         provider.chat([Message.user("go")])
     assert all(" cost=" not in line for line in _lines(caplog, "llm "))
-    assert tool_lines(caplog)[0] == (
+    # The search fee is OpenAI's list price too, so every search on this host is a counted gap on its
+    # own line, and the gap is named once beside the tokens' (issue #880).
+    searches = [line for line in tool_lines(caplog) if line.startswith("tool name=web_search ")]
+    search = (
         "tool name=web_search executor=server provider=openai kind=search.web model=gpt-6-sol "
-        "count=1 outcome=ok generation_id=resp-fake0001"
+        "count=1 outcome=ok cost_gap=unpriced_host generation_id=resp-fake0001"
     )
+    assert searches == [search, search]
     assert _lines(caplog, "cost unpriced ") == [
-        "cost unpriced provider=openai model=gpt-6-sol charge=tokens reason=unpriced_host"
+        "cost unpriced provider=openai model=gpt-6-sol charge=tokens reason=unpriced_host",
+        "cost unpriced provider=openai model=gpt-6-sol charge=search reason=unpriced_host",
     ]
 
 

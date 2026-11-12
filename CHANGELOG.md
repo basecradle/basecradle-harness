@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.193.0] - 2026-11-12
+
+### Fixed: An unpriced image, transcription or search fee says why on its own `tool` line, never in a sentence (issue #880)
+
+0.192.0 made every model call a rate table cannot price carry its reason on its own `llm` line. The tools that bill per use were the last place a gap had no countable form: an OpenAI image (generate or edit) or transcription the harness could not price wrote a plain sentence per call (`Image call to … is not priced: …`), which no dashboard can count, extract or reconcile. Auditing every billed tool found two more: Google's grounding fee was named once per wake and never on the search's own line, and a web search through OpenAI's or Anthropic's server-side tool on a gateway was counted only beside the tokens' gap (OpenAI) or **priced at Anthropic's own list price** (Anthropic), though a gateway's price is its own.
+
+- **The `tool` line carries `cost_gap=`** where a fee the harness computes is missing, in the reason its once-per-wake `cost unpriced` WARNING names: `unpriced_host`, `unknown_model`, or `not_reported` (no usage, or a usage the table cannot read). Never beside a `cost=`; a priced use names none. The meter carries it for a harness tool (`MeteredCall.cost_gap`, `meter_tool(cost_gap=…)`) and `log_server_tools(gaps=…)` for a server-side one.
+- **Images and transcriptions state their gap as `cost unpriced charge=image|audio`**, once per wake per gap, where they wrote a sentence on every call. The two sentences are gone, and the second one's two causes (a model the table lacks, a usage it cannot read) are told apart.
+- **Google's grounded search names its fee's gap on its own `tool` line** too, beside the `charge=grounding` WARNING it already wrote.
+- **A server-side web search on a host the table does not price carries no figure**: `cost_gap=unpriced_host` on its `web_search` line and one `cost unpriced charge=search reason=unpriced_host` per wake, on OpenAI (which already withheld the figure) and on Anthropic (which priced it at $10 per 1,000).
+- `docs/telemetry.md` adds `cost_gap` to the `tool` head and `image` and `audio` to `cost unpriced`'s `charge`. xAI's media and search fees are vendor-stated and OpenRouter folds its searches into the call's own `cost`, so neither has a computed fee to name a gap for, and both are unchanged.
+- This version also carries 0.192.0 (issue #878), which was merged and never tagged.
+
 ## [0.192.0] - 2026-11-12
 
 ### Fixed: Every call a rate table cannot price says why on its own line, and a tier Anthropic's or Google's table does not carry is no longer silent (issue #878)

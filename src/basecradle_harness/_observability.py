@@ -1285,6 +1285,7 @@ def log_tool(
     model: str | None = None,
     count: int | None = None,
     cost: float | None = None,
+    cost_gap: str | None = None,
     generation_id: str | None = None,
 ) -> None:
     """**The** `tool` line — one per tool use, whoever executed it (issue #758).
@@ -1303,7 +1304,9 @@ def log_tool(
 
     ``cost`` is the tool's **own fee** — never model tokens, which stay on the `llm` line — rendered
     through the same `_money` formatter as every other dollar, with ``cost_basis=computed`` beside a
-    `ComputedCost`. A failed run (``outcome=error``) names why as a slug in ``reason``; when there is
+    `ComputedCost`. ``cost_gap`` stands where those two would on a fee the harness computes and could
+    not, in the reason its once-per-wake ``cost unpriced`` line names, so every unpriced use is
+    counted on its own line (issue #880) — never beside a ``cost``. A failed run (``outcome=error``) names why as a slug in ``reason``; when there is
     foreign text to show, ``error`` writes it on a second, WARNING ``tool`` line carrying only
     ``name`` and ``error``, as before. A server-side failure has a vendor code and no text, so it has
     no companion and is itself written at WARNING, where a severity filter still sees it.
@@ -1324,6 +1327,7 @@ def log_tool(
             reason=reason,
             cost=_money(cost),
             cost_basis=cost_basis(cost),
+            cost_gap=cost_gap if _money(cost) is None else None,
             generation_id=generation_id,
         ),
     )
@@ -1340,13 +1344,14 @@ def log_server_tool(
     generation_id: str | None,
     reason: str | None = None,
     cost: float | None = None,
+    cost_gap: str | None = None,
 ) -> None:
     """One `tool` line for a tool the vendor ran server-side: one per model call per tool.
 
     ``name`` is the harness's name for the capability (``web_search``, ``web_fetch``,
     ``code_execution``), never the vendor's block type; ``count`` is the uses the vendor reported on
     this call; ``reason`` is the vendor's own code for a use that failed, which makes the line
-    ``outcome=error``.
+    ``outcome=error``; ``cost_gap`` is why a fee the adapter computes is missing (issue #880).
     """
     log_tool(
         name=name,
@@ -1358,6 +1363,7 @@ def log_server_tool(
         model=model,
         count=count,
         cost=cost,
+        cost_gap=cost_gap,
         generation_id=generation_id,
     )
 
@@ -1392,8 +1398,13 @@ def log_server_tools(
     model: str,
     generation_id: str | None,
     fees: Mapping[str, float | None] | None = None,
+    gaps: Mapping[str, str] | None = None,
 ) -> None:
-    """`log_server_tool` for every tool in `tallies` that ran — the adapters' one call site."""
+    """`log_server_tool` for every tool in `tallies` that ran — the adapters' one call site.
+
+    ``fees`` maps a tool to its computed fee and ``gaps`` to the ``cost_gap`` reason a fee the
+    adapter computes could not be (issue #880); a tool in neither carries no price on its line.
+    """
     for name, tally in tallies.items():
         if tally.count:
             log_server_tool(
@@ -1404,6 +1415,7 @@ def log_server_tools(
                 generation_id=generation_id,
                 reason=tally.reason,
                 cost=(fees or {}).get(name),
+                cost_gap=(gaps or {}).get(name),
             )
 
 
@@ -1435,6 +1447,29 @@ def log_cost_unpriced(*, provider: str, charge: str, reason: str, model: str | N
     )
 
 
+class GapLedger:
+    """The ``cost unpriced`` gaps one holder has stated, so each is written once per wake.
+
+    A holder lives as long as the wake that built it (an adapter, a tool), so remembering what it
+    has stated is the once-per-wake rule `log_cost_unpriced` asks its callers to keep. A gap is what
+    the line says, so a second call unpriced for the same reason writes nothing more here; it is
+    counted on its own line, by ``cost_gap`` (issue #880).
+    """
+
+    __slots__ = ("_stated",)
+
+    def __init__(self) -> None:
+        self._stated: set[tuple[str, str, str | None]] = set()
+
+    def state(self, *, provider: str, charge: str, reason: str, model: str | None = None) -> str:
+        """Write the gap's ``cost unpriced`` line unless this holder already has; return `reason`."""
+        key = (charge, reason, model)
+        if key not in self._stated:
+            self._stated.add(key)
+            log_cost_unpriced(provider=provider, model=model, charge=charge, reason=reason)
+        return reason
+
+
 #: The ``charge=`` and ``reason=`` of a code sandbox's container time, which Anthropic and OpenAI
 #: both bill and no response of either states — the one shared spelling of that gap.
 CONTAINER_TIME = "container_time"
@@ -1448,6 +1483,12 @@ NOT_REPORTED = "not_reported"
 #: the price source itself has not been read (issue #874: no longer held unread for the wake).
 TOKENS_CHARGE = "tokens"
 GROUNDING_CHARGE = "grounding"
+#: A harness tool's or a server-side tool's own fee, named for the family of the work its `tool`
+#: line's ``kind`` carries (issue #880): a web search's per-call fee, a made or edited image, a
+#: transcribed recording.
+SEARCH_CHARGE = "search"
+IMAGE_CHARGE = "image"
+AUDIO_CHARGE = "audio"
 UNKNOWN_MODEL = "unknown_model"
 UNPRICED_TIER = "unpriced_tier"
 UNPRICED_HOST = "unpriced_host"
@@ -1467,7 +1508,8 @@ class ToolMeter:
     More than one unit in one run is summed: ``count`` becomes the units, and the fee the total of
     the units that **finished** — a failed unit bought nothing — tagged computed when any part of it
     is the harness's arithmetic, and absent when a finished unit's fee was, because a partial total
-    would be a figure nobody can stand behind. The vendor, kind and model are the first unit's.
+    would be a figure nobody can stand behind. The vendor, kind and model are the first unit's, and
+    an unpriced total's ``cost_gap`` the first finished unpriced unit's reason (issue #880).
 
     **Recording can never raise into a wake.** The fee and the count come off a vendor body, often
     in a ``tools/`` overlay tool someone wrote in an afternoon, and the meter is read *after* the
@@ -1479,7 +1521,7 @@ class ToolMeter:
     __slots__ = ("_units", "failure", "verdict")
 
     def __init__(self) -> None:
-        self._units: list[tuple[str, str, str, int | None, float | None, bool]] = []
+        self._units: list[tuple[str, str, str, int | None, float | None, bool, str | None]] = []
         self.failure: Exception | None = None
         #: ``(reason, error)`` from `tool_failed`: this run failed, with no vendor work to blame.
         self.verdict: tuple[str, str] | None = None
@@ -1493,27 +1535,38 @@ class ToolMeter:
         count: Any = None,
         cost: Any = None,
         failed: bool = False,
+        cost_gap: str | None = None,
     ) -> None:
         units = (
             count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else None
         )
         fee = cost if _money(cost) is not None else None
-        self._units.append((provider, kind, model, units, fee, failed))
+        gap = cost_gap if isinstance(cost_gap, str) and cost_gap and fee is None else None
+        self._units.append((provider, kind, model, units, fee, failed, gap))
 
     def fields(self) -> dict[str, Any]:
         """The `log_tool` keywords this run's recorded work fills (empty when it recorded none)."""
         if not self._units:
             return {}
-        provider, kind, model, count, _, _ = self._units[0]
+        provider, kind, model, count, *_ = self._units[0]
         if len(self._units) > 1:
             count = sum(unit[3] if unit[3] is not None else 1 for unit in self._units)
-        costs = [unit[4] for unit in self._units if not unit[5]]
+        finished = [unit for unit in self._units if not unit[5]]
+        costs = [unit[4] for unit in finished]
         cost: float | None = None
         if costs and all(c is not None for c in costs):
             total = math.fsum(costs)  # type: ignore[arg-type]
             computed = any(isinstance(c, ComputedCost) for c in costs)
             cost = ComputedCost(total) if computed else total
-        return {"provider": provider, "kind": kind, "model": model, "count": count, "cost": cost}
+        gap = None if cost is not None else next((u[6] for u in finished if u[6]), None)
+        return {
+            "provider": provider,
+            "kind": kind,
+            "model": model,
+            "count": count,
+            "cost": cost,
+            "cost_gap": gap,
+        }
 
 
 _METER: ContextVar[ToolMeter | None] = ContextVar("basecradle_harness_tool_meter", default=None)
@@ -1531,12 +1584,24 @@ def tool_meter() -> Iterator[ToolMeter]:
 
 
 def meter_tool(
-    *, provider: str, kind: str, model: str, count: Any = None, cost: Any = None
+    *,
+    provider: str,
+    kind: str,
+    model: str,
+    count: Any = None,
+    cost: Any = None,
+    cost_gap: str | None = None,
 ) -> None:
-    """Record one finished unit of vendor work on the running tool's meter (a no-op with none)."""
+    """Record one finished unit of vendor work on the running tool's meter (a no-op with none).
+
+    ``cost_gap`` is why a fee the tool computes is missing, in the reason its ``cost unpriced`` line
+    names (issue #880); it is dropped beside a fee.
+    """
     meter = _METER.get()
     if meter is not None:
-        meter.record(provider=provider, kind=kind, model=model, count=count, cost=cost)
+        meter.record(
+            provider=provider, kind=kind, model=model, count=count, cost=cost, cost_gap=cost_gap
+        )
 
 
 def meter_failure(exc: Exception, *, provider: str, kind: str, model: str) -> None:
@@ -1577,14 +1642,16 @@ class MeteredCall:
 
     The charge is knowable only *after* the vendor responds and its body is read — inside the block.
     The tool sets ``cost`` (a vendor-stated USD figure, a `ComputedCost`, or leaves it ``None`` when
-    neither is possible) and ``count`` (billed units, where there is more than one).
+    neither is possible), ``count`` (billed units, where there is more than one) and, for a fee it
+    computes and could not, ``cost_gap`` (the reason, issue #880).
     """
 
-    __slots__ = ("cost", "count")
+    __slots__ = ("cost", "cost_gap", "count")
 
     def __init__(self) -> None:
         self.cost: float | None = None
         self.count: int | None = None
+        self.cost_gap: str | None = None
 
 
 @contextmanager
@@ -1602,7 +1669,14 @@ def metered(*, provider: str, kind: str, model: str) -> Iterator[MeteredCall]:
     except Exception as exc:
         meter_failure(exc, provider=provider, kind=kind, model=model)
         raise
-    meter_tool(provider=provider, kind=kind, model=model, count=call.count, cost=call.cost)
+    meter_tool(
+        provider=provider,
+        kind=kind,
+        model=model,
+        count=call.count,
+        cost=call.cost,
+        cost_gap=call.cost_gap,
+    )
 
 
 def token_counts(usage: Any) -> dict[str, int]:

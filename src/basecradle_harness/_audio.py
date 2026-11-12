@@ -29,16 +29,20 @@ reasons, ``gpt-image-2.5`` paints, ``gpt-transcribe`` listens).
 
 from __future__ import annotations
 
-import logging
 import os
 
 from basecradle_harness._exceptions import ProviderError
-from basecradle_harness._observability import metered
+from basecradle_harness._observability import (
+    AUDIO_CHARGE,
+    NOT_REPORTED,
+    UNKNOWN_MODEL,
+    UNPRICED_HOST,
+    GapLedger,
+    metered,
+)
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
-from basecradle_harness._openai_rates import priced_host, transcription_cost
+from basecradle_harness._openai_rates import priced_host, transcription_cost, transcription_known
 from basecradle_harness._secret import reveal, secret
-
-_log = logging.getLogger("basecradle_harness")
 
 #: OpenAI's Audio API root. Transcription is an OpenAI service; this changes only for
 #: a proxy, not to reach another vendor (the key is the OpenAI key).
@@ -84,6 +88,8 @@ class Transcriber:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout
+        #: The ``cost unpriced`` gaps this transcriber has stated this wake (issue #880).
+        self._gaps = GapLedger()
 
     @property
     def key(self) -> str | None:
@@ -107,29 +113,31 @@ class Transcriber:
             response = client.audio.transcriptions.create(
                 model=self._model, file=(filename, data, content_type)
             )
-            call.cost = self._cost(response)
+            call.cost, call.cost_gap = self._cost(response)
         return _extract_transcript(response)
 
-    def _cost(self, response: object) -> float | None:
-        """What this transcription cost at OpenAI's published rates (issue #657), or ``None``.
+    def _cost(self, response: object) -> tuple[float | None, str | None]:
+        """This transcription's cost at OpenAI's published rates (issue #657), or why it has none.
 
         OpenAI states the audio's duration (or, for a token-billed model, its tokens) and no price,
         so the figure is computed (`_openai_rates.transcription_cost`) and the tool line tags it
-        ``cost_basis=computed``. A call that cannot be priced says so in a WARNING.
+        ``cost_basis=computed``. A call that cannot be priced is a counted gap (issue #880): its
+        reason rides its own ``tool`` line as ``cost_gap=``, and one ``cost unpriced charge=audio``
+        line per wake per gap names it — ``unpriced_host``, ``unknown_model``, or ``not_reported``
+        for a usage block that states neither a duration nor token counts the row has a rate for.
         """
         if not priced_host(self._base_url):
-            _log.warning(
-                "Transcription call to %s is not priced: the harness prices OpenAI's own host only.",
-                self._base_url,
-            )
-            return None
+            return None, self._gap(UNPRICED_HOST)
         cost = transcription_cost(self._model, getattr(response, "usage", None))
-        if cost is None:
-            _log.warning(
-                "Transcription on %r is not priced: its model or usage is not in _openai_rates.",
-                self._model,
-            )
-        return cost
+        if cost is not None:
+            return cost, None
+        known = transcription_known(self._model)
+        return None, self._gap(NOT_REPORTED if known else UNKNOWN_MODEL)
+
+    def _gap(self, reason: str) -> str:
+        return self._gaps.state(
+            provider="openai", model=self._model, charge=AUDIO_CHARGE, reason=reason
+        )
 
 
 def _extract_transcript(response: object) -> str:

@@ -344,3 +344,55 @@ def test_a_transcription_on_openai_is_priced_per_minute_of_audio(client, caplog)
 
     line = tool_lines(caplog)[0]
     assert line.endswith(" cost=0.00675 cost_basis=computed"), line
+    assert "cost_gap" not in line  # a priced call names no gap (issue #880)
+
+
+def _listen(client, caplog, transcriber, body, *, runs=1):
+    import logging
+
+    tool = AssetsTool(transcriber=transcriber)
+    tool.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets/{A_AUDIO}").mock(
+            return_value=httpx.Response(200, json={"asset": audio_asset()})
+        )
+        mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
+        mock.post(f"{transcriber._base_url}/audio/transcriptions").mock(
+            return_value=httpx.Response(200, json=body)
+        )
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            for _ in range(runs):
+                run_through_engine(tool, action="listen", uuid=A_AUDIO)
+    gaps = [r.getMessage() for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
+    return tool_lines(caplog), gaps
+
+
+@pytest.mark.parametrize(
+    ("base", "model", "usage", "reason"),
+    [
+        # Another host bills its own price (issue #880, the first of the two sentences it replaced).
+        ("https://llm-proxy.example.com/v1", "gpt-transcribe", None, "unpriced_host"),
+        # A model the table lacks, and a usage the row cannot read (the second sentence's two
+        # causes, now told apart).
+        ("https://api.openai.com/v1", "gpt-9-transcribe", None, "unknown_model"),
+        ("https://api.openai.com/v1", "gpt-transcribe", None, "not_reported"),
+        (
+            "https://api.openai.com/v1",
+            "gpt-transcribe",
+            {"type": "tokens", "input_tokens": 10, "output_tokens": 5},
+            "not_reported",
+        ),
+    ],
+)
+def test_an_unpriceable_transcription_counts_its_gap_on_its_own_line(
+    client, caplog, base, model, usage, reason
+):
+    """Each use carries the reason on its `tool` line; the gap is named once per wake."""
+    body = {"text": TRANSCRIPT, **({"usage": usage} if usage else {})}
+    transcriber = Transcriber(api_key=FAKE_KEY, base_url=base, model=model)
+    lines, gaps = _listen(client, caplog, transcriber, body, runs=2)
+    assert len(lines) == 2
+    for line in lines:
+        assert " cost=" not in line and line.endswith(f" cost_gap={reason}"), line
+    assert gaps == [f"cost unpriced provider=openai model={model} charge=audio reason={reason}"]
+    assert not any("not priced" in r.getMessage() for r in caplog.records)
