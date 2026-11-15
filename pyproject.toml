@@ -84,7 +84,7 @@ openrouter = ["openrouter>=1.1.70,<2"]
 # against (2.28.0); major-capped so a breaking 3.0 never auto-upgrades. It brings `google-auth`, which
 # loads the service-account key the adapter is configured with. Kept out of the base install so the
 # core stays light; a Google agent installs it.
-google-genai = ["google-genai>=2.28.0,<3"]
+google-genai = ["google-genai>=2.28.0,<4"]
 # Anthropic's own `anthropic` SDK (AI_SDK=anthropic): Claude, called direct (issue #725) — never an
 # OpenAI-compatible shim. Floor is the version this adapter was built and wire-tested against (2.3.0);
 # major-capped so a breaking 3.0 never auto-upgrades. Kept out of the base install so the core stays
@@ -175,7 +175,7 @@ dev = [
     "openai>=3.3.1,<4",
     "xai-sdk>=1.19.0,<2",
     "openrouter>=1.1.70,<2",
-    "google-genai>=2.28.0,<3",
+    "google-genai>=2.28.0,<4",
     "anthropic>=2.3.0,<3",
 ]
 
