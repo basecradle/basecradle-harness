@@ -75,6 +75,8 @@ from basecradle_harness._report import _PROVIDER_LABELS
 from basecradle_harness._retry import fault_slug
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._webfetch import WebFetchTool
+from tests._line_expectations import LLM_ALWAYS, Line, parse_line
+from tests._line_expectations import outcomes as _outcomes
 from tests.conftest import FAKE_KEY as OPENAI_KEY
 from tests.conftest import (
     out_code_interpreter_call,
@@ -550,28 +552,8 @@ def sites(scanned) -> list[Site]:
 
 # === the runtime half: a representative call through every adapter's log path =====================
 
-#: A strict structured line: a head of words, then one or more ``key=value`` fields. Anything else
-#: is a prose line, which carries no fields (`docs/telemetry.md` → Prose Lines).
-_KV = r'[a-z_][a-z0-9_]*=(?:"[^"]*"|[^\s"]+)'
-_LINE = re.compile(
-    rf"^(?:PROBE )?(?P<head>[A-Za-z][A-Za-z_-]*(?: [A-Za-z][A-Za-z_-]*)*?)(?P<fields>(?: {_KV})+)$"
-)
-_PAIR = re.compile(rf" ({_KV})")
-
-
-@dataclass
-class Line:
-    head: str
-    fields: dict[str, str]
-    message: str
-
-
-def parse_line(message: str) -> Line | None:
-    match = _LINE.match(message)
-    if match is None:
-        return None
-    pairs = (pair.split("=", 1) for pair in _PAIR.findall(match["fields"]))
-    return Line(match["head"], {key: value.strip('"') for key, value in pairs}, message)
+#: The line grammar's reader, `Line` and `parse_line`, lives in `tests/_line_expectations.py`, which
+#: the live suites read their lines with too (issue #904): one reader for every suite.
 
 
 @dataclass
@@ -2059,23 +2041,6 @@ def test_a_refusal_is_the_calls_own_line_and_outcome(rendered):
     assert line.fields["category"] == "cyber"
     assert line.fields["generation_id"] == "msg_01Refused"
     assert "reason" not in line.fields
-
-
-#: The fields every `llm` line carries, whatever its outcome.
-LLM_ALWAYS = frozenset({"provider", "purpose", "model", "outcome"})
-
-
-def _outcomes() -> dict[str, tuple[set[str], set[str]]]:
-    """The page's Outcomes table: each outcome's required and never-carried fields."""
-    table = DOC.read_text(encoding="utf-8").split("\n#### Outcomes\n", 1)[1].split("\n### ", 1)[0]
-    found: dict[str, tuple[set[str], set[str]]] = {}
-    for row in table.splitlines():
-        cells = [cell.strip() for cell in row.strip("|").split("|")]
-        if len(cells) == 4 and cells[0].startswith("`"):
-            names = [set(re.findall(r"`([a-z_]+)`", cell)) for cell in cells]
-            (outcome,) = names[0]
-            found[outcome] = (names[2], names[3])
-    return found
 
 
 def test_the_outcomes_table_is_the_vocabulary_and_names_only_llm_fields(contract):

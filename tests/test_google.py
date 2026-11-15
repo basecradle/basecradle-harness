@@ -65,6 +65,7 @@ from basecradle_harness._google import (
 from basecradle_harness._google_rates import Usage, call_cost
 from basecradle_harness._observability import ComputedCost, tool_meter, truncated
 from basecradle_harness._timeouts import CONNECT_TIMEOUT, TIMEOUT_RETRY_SCALE
+from tests._line_expectations import assert_direct_call, assert_priced_fee
 from tests.conftest import plain, run_through_engine, tool_lines
 
 MODEL = "gemini-3.8-flash"
@@ -993,6 +994,8 @@ def test_the_llm_line_shape(router, provider, caplog):
         r"generation_id=resp-0123456789abcdef",
         plain(line),
     ), line
+    # The contract's shape of the line, which the live gate reads Vertex's own line with (#904).
+    assert_direct_call(line, provider="google", model=MODEL, residency="us", cost="computed")
 
 
 def test_the_cost_is_computed_from_googles_rates(router, provider, caplog, monkeypatch):
@@ -1552,6 +1555,15 @@ def test_a_search_writes_a_helper_llm_line_and_meters_its_grounding_fee(router, 
         r"generation_id=resp-0123456789abcdef",
         llm,
     ), llm
+    assert_direct_call(
+        llm,
+        provider="google",
+        model=MODEL,
+        residency="us",
+        purpose="helper",
+        kind="search.grounding",
+        cost="computed",
+    )
     fields = meter.fields()
     assert fields == {
         "provider": "google",
@@ -1562,6 +1574,7 @@ def test_a_search_writes_a_helper_llm_line_and_meters_its_grounding_fee(router, 
         "cost_gap": None,
     }
     assert isinstance(fields["cost"], ComputedCost)
+    assert_priced_fee(fields, provider="google", kind="search.grounding")
     assert not _lines_starting(caplog, "tool ")  # the line is the engine's, never the adapter's
 
 

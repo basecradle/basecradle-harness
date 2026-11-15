@@ -29,13 +29,13 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 
 import pytest
 
 from basecradle_harness import Message, ToolCall, ToolSpec
 from basecradle_harness._basecradle import _config_from_env, _provider_from_config
 from basecradle_harness._observability import _money
+from tests._line_expectations import assert_direct_call
 
 pytestmark = pytest.mark.live
 
@@ -46,11 +46,6 @@ HOST = "https://api.refuseless.com/v1"
 needs_key = pytest.mark.skipif(
     not KEY, reason="set REFUSELESS_LIVE_API_KEY to run the live refuseless gate"
 )
-
-
-def _field(line: str, name: str) -> str | None:
-    found = re.search(rf"(?:^| ){name}=(\S+)", line)
-    return found.group(1) if found else None
 
 
 @needs_key
@@ -75,10 +70,8 @@ def test_one_real_call_is_priced_from_the_vendors_own_list(monkeypatch, caplog):
     (llm,) = [line for line in lines if line.startswith("llm ")]
     print(f"\n{llm}")
     assert not [line for line in lines if line.startswith("cost unpriced")], lines
-    assert _field(llm, "provider") == "refuseless"
-    assert _field(llm, "model") == MODEL
-    assert _field(llm, "cost_basis") == "computed"
-    assert _field(llm, "cost_gap") is None  # issue #874: a priced call names no gap
+    # The contract's shape of a priced direct call (`tests/_line_expectations.py`, issue #904).
+    fields = assert_direct_call(llm, provider="refuseless", model=MODEL, cost="computed")
 
     # The vendor's list, read by a client of the test's own: the harness's parser is not the judge.
     with openai.OpenAI(api_key=KEY, base_url=HOST) as client:
@@ -86,13 +79,13 @@ def test_one_real_call_is_priced_from_the_vendors_own_list(monkeypatch, caplog):
     row = rows[MODEL]
     pricing = row["pricing"]
     assert pricing["currency"] == "USD"
-    tokens_in, tokens_out = int(_field(llm, "tokens_in")), int(_field(llm, "tokens_out"))
+    tokens_in, tokens_out = int(fields["tokens_in"]), int(fields["tokens_out"])
     expected = (tokens_in * pricing["input_per_m"] + tokens_out * pricing["output_per_m"]) / 1e6
     print(
         f"{tokens_in} × ${pricing['input_per_m']}/M + {tokens_out} × ${pricing['output_per_m']}/M"
-        f" = ${expected!r} (line: cost={_field(llm, 'cost')})"
+        f" = ${expected!r} (line: cost={fields['cost']})"
     )
-    assert _field(llm, "cost") == _money(expected)
+    assert fields["cost"] == _money(expected)
     assert limit == row["context_length"]
 
 
@@ -131,13 +124,11 @@ def test_a_real_responses_call_is_priced_with_its_cached_split(monkeypatch, capl
     assert pricing["currency"] == "USD"
     for llm in calls:
         print(f"\n{llm}")
-        assert _field(llm, "provider") == "refuseless"
-        assert _field(llm, "cost_basis") == "computed"
-        assert _field(llm, "cost_gap") is None  # issue #874: a priced call names no gap
-        generation = _field(llm, "generation_id") or ""
+        fields = assert_direct_call(llm, provider="refuseless", model=MODEL, cost="computed")
+        generation = fields.get("generation_id", "")
         assert generation.startswith("resp"), llm  # the Responses shape, not a chat completion
-        tokens_in, tokens_out = int(_field(llm, "tokens_in")), int(_field(llm, "tokens_out"))
-        cached = int(_field(llm, "cached_tokens") or 0)
+        tokens_in, tokens_out = int(fields["tokens_in"]), int(fields["tokens_out"])
+        cached = int(fields.get("cached_tokens", 0))
         expected = (
             (tokens_in - cached) * pricing["input_per_m"]
             + cached * pricing["cached_input_per_m"]
@@ -146,9 +137,9 @@ def test_a_real_responses_call_is_priced_with_its_cached_split(monkeypatch, capl
         print(
             f"({tokens_in} − {cached}) × ${pricing['input_per_m']}/M + {cached} × "
             f"${pricing['cached_input_per_m']}/M + {tokens_out} × ${pricing['output_per_m']}/M"
-            f" = ${expected!r} (line: cost={_field(llm, 'cost')})"
+            f" = ${expected!r} (line: cost={fields['cost']})"
         )
-        assert _field(llm, "cost") == _money(expected)
+        assert fields["cost"] == _money(expected)
 
 
 @needs_key
@@ -195,7 +186,6 @@ def test_a_real_responses_call_takes_a_charter_a_tool_and_a_tool_round_trip(monk
     lines = [record.getMessage() for record in caplog.records]
     (llm,) = [line for line in lines if line.startswith("llm ")]
     print(llm)
-    assert _field(llm, "cost_basis") == "computed"
-    assert _field(llm, "cost_gap") is None  # issue #874: a priced call names no gap
-    assert (_field(llm, "generation_id") or "").startswith("resp"), llm
+    fields = assert_direct_call(llm, provider="refuseless", model=MODEL, cost="computed")
+    assert fields.get("generation_id", "").startswith("resp"), llm
     assert not [line for line in lines if line.startswith("cost unpriced")], lines

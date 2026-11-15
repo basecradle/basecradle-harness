@@ -53,6 +53,7 @@ from basecradle_harness._anthropic import (
 from basecradle_harness._basecradle import _provider_from_config, resolved_model_params
 from basecradle_harness._caching import EXPLICIT, anchor_cacheable_prefix
 from basecradle_harness._observability import TRUNCATED_FINISH_REASONS
+from tests._line_expectations import REPORTED, assert_direct_call, assert_server_tool_line
 from tests.conftest import plain, tool_lines
 
 MODEL = "claude-haiku-5-5"
@@ -748,6 +749,8 @@ def test_the_llm_line_grammar(router, provider, caplog):
         f"cache_write_tokens=3000 cost={cost:.6f} cost_basis=computed outcome=ok "
         "generation_id=msg_01GrammarGrammar"
     ).replace(f"cost={cost:.6f}", _money(cost))
+    # The contract's shape of both lines, which the live gate reads Anthropic's own with (#904).
+    assert_direct_call(line, provider="anthropic", model=MODEL, cost="computed")
     assert provider.last_tokens_in == 44_000
     # Each server tool the call ran is its own `tool` line, joined to the call by its id (#758).
     assert tool_lines(caplog) == [
@@ -761,6 +764,15 @@ def test_the_llm_line_grammar(router, provider, caplog):
             "count=1 outcome=ok generation_id=msg_01GrammarGrammar"
         ),
     ]
+    assert_server_tool_line(
+        tool_lines(caplog)[0],
+        name="web_search",
+        provider="anthropic",
+        model=MODEL,
+        kind="search.web",
+        joins="msg_01GrammarGrammar",
+        cost="computed",
+    )
 
 
 def _money(cost: float) -> str:
@@ -1445,6 +1457,19 @@ def test_the_served_geography_is_what_is_priced(router, provider, caplog):
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         provider.chat([Message.user("a")])
     assert _money(50_000 * 0.10 * 1.1 / 1_000_000) in llm_lines(caplog)[0]
+
+
+def test_the_geography_anthropic_reports_is_the_lines_residency(router, provider, caplog):
+    """Anthropic names where it ran a call it was not asked to place (``global``, measured live
+    2026-11-15), and the line says so: the shape the live gate reads its own line with (#904)."""
+    router.post(MESSAGES).mock(return_value=reply(text("ok"), used=usage(inference_geo="global")))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("a")])
+    (line,) = llm_lines(caplog)
+    fields = assert_direct_call(
+        line, provider="anthropic", model=MODEL, residency=REPORTED, cost="computed"
+    )
+    assert fields["residency"] == "global"
 
 
 def test_a_spend_limit_is_the_billing_class(router, provider):

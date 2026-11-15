@@ -40,6 +40,12 @@ from basecradle_harness import (
 from basecradle_harness._anthropic_rates import Usage, call_cost
 from basecradle_harness._caching import EXPLICIT, anchor_cacheable_prefix
 from basecradle_harness._observability import _money
+from tests._line_expectations import (
+    REPORTED,
+    assert_direct_call,
+    assert_server_tool_line,
+    fields_of,
+)
 
 pytestmark = pytest.mark.live
 
@@ -87,13 +93,6 @@ def _lines(caplog, head: str) -> list[str]:
     return [m for m in (r.getMessage() for r in caplog.records) if m.startswith(head)]
 
 
-def _field(line: str, name: str) -> str | None:
-    for part in line.split():
-        if part.startswith(f"{name}="):
-            return part.split("=", 1)[1]
-    return None
-
-
 @needs_key
 def test_a_chat_reply_and_its_line(caplog):
     adapter = _provider()
@@ -101,10 +100,13 @@ def test_a_chat_reply_and_its_line(caplog):
         answer = adapter.chat([Message.user("Reply with exactly the word: lighthouse")])
     assert "lighthouse" in (answer.content or "").lower()
     (line,) = _lines(caplog, "llm provider=")
-    assert line.startswith(f"llm provider=anthropic purpose=main model={MODEL} ")
-    assert _field(line, "cost_basis") == "computed"
-    assert int(_field(line, "tokens_in")) == adapter.last_tokens_in > 0
-    assert _field(line, "generation_id").startswith("msg_")
+    # The contract's shape (`tests/_line_expectations.py`, issue #904). Anthropic names where it
+    # ran a call nobody placed (`residency=global`, measured 2026-11-15), so the value is its own.
+    fields = assert_direct_call(
+        line, provider="anthropic", model=MODEL, residency=REPORTED, cost="computed"
+    )
+    assert int(fields["tokens_in"]) == adapter.last_tokens_in
+    assert fields["generation_id"].startswith("msg_"), line
 
 
 @needs_key
@@ -134,7 +136,8 @@ def test_the_second_call_on_the_same_prefix_reads_the_cache(caplog):
 
 def _cache(line: str) -> tuple[int, int]:
     """A line's ``(cached_tokens, cache_write_tokens)``, an absent field read as zero."""
-    return int(_field(line, "cached_tokens") or 0), int(_field(line, "cache_write_tokens") or 0)
+    fields = fields_of(line)
+    return int(fields.get("cached_tokens", 0)), int(fields.get("cache_write_tokens", 0))
 
 
 @needs_key
@@ -219,7 +222,7 @@ def test_the_next_step_of_a_wake_reads_the_brief_through_the_tail(caplog):
     read, written = _cache(first)
     assert written > 0, first
     assert _cache(second)[0] == read + written, second
-    assert int(_field(first, "tokens_in")) - (read + written) <= CLOSING_TOKENS, first
+    assert int(fields_of(first)["tokens_in"]) - (read + written) <= CLOSING_TOKENS, first
 
 
 @needs_key
@@ -230,19 +233,20 @@ def test_the_cost_is_the_tables_arithmetic_over_the_reported_usage(caplog):
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         adapter.chat(anchor_cacheable_prefix(convo, stable=1, mode=EXPLICIT))
     (line,) = _lines(caplog, "llm provider=")
-    read = int(_field(line, "cached_tokens") or 0)
-    written = int(_field(line, "cache_write_tokens") or 0)
+    fields = assert_direct_call(
+        line, provider="anthropic", model=MODEL, residency=REPORTED, cost="computed"
+    )
+    read, written = _cache(line)
     reported = Usage(
-        uncached=int(_field(line, "tokens_in")) - read - written,
+        uncached=int(fields["tokens_in"]) - read - written,
         write_5m=written,
         write_1h=0,
         read=read,
-        output=int(_field(line, "tokens_out")),
+        output=int(fields["tokens_out"]),
     )
     expected = call_cost(MODEL, reported)
     assert expected is not None and expected > 0
-    assert _field(line, "cost") == _money(expected)
-    assert _field(line, "cost_gap") is None, line  # issue #878: a priced call names no gap
+    assert fields["cost"] == _money(expected), line
 
 
 @needs_key
@@ -252,18 +256,25 @@ def test_a_web_search_runs_server_side_and_its_fee_is_logged(caplog):
         answer = adapter.chat(
             [Message.user("Search the web: what is the current stable version of Python? Cite it.")]
         )
-    calls = {_field(line, "generation_id") for line in _lines(caplog, "llm provider=")}
-    tools = _lines(
-        caplog, "tool name=web_search executor=server provider=anthropic kind=search.web"
-    )
-    uses = sum(int(_field(line, "count")) for line in tools)
-    assert uses >= 1, tools
+    calls = {fields_of(line)["generation_id"] for line in _lines(caplog, "llm provider=")}
     # One line per call that searched, joined to that call's `llm` line by its id (issue #758).
-    assert {_field(line, "generation_id") for line in tools} <= calls
+    tools = [
+        assert_server_tool_line(
+            line,
+            name="web_search",
+            provider="anthropic",
+            model=MODEL,
+            kind="search.web",
+            joins=calls,
+            cost="computed",
+        )
+        for line in _lines(caplog, "tool name=web_search ")
+    ]
+    uses = sum(int(fields["count"]) for fields in tools)
+    assert uses >= 1, tools
     # The fee is $10 per 1,000 *billed* searches; a failed use is counted and not billed.
-    billed = sum(float(_field(line, "cost") or 0) for line in tools) / 0.01
+    billed = sum(float(fields.get("cost", 0)) for fields in tools) / 0.01
     assert billed == pytest.approx(round(billed)) and 1 <= round(billed) <= uses, tools
-    assert all(_field(line, "cost_gap") is None for line in tools), tools  # issue #880
     # With dynamic filtering (web_search_20260318) a search the model runs from Anthropic's code
     # execution comes back with no citation blocks, so no Sources: footer is built (measured
     # 2026-10-31); since issue #740 it may also call the search directly. Neither is pinned: what
