@@ -2212,9 +2212,22 @@ def _max_steps_from_env() -> int:
     the single-integer operational knob (like ``HARNESS_WAKE_BREAKER_MAX``), not a
     ``model_params.json`` tuning key — the model id is env, and so is its step budget.
     """
+    override = _max_steps_override_from_env()
+    return DEFAULT_MAX_STEPS if override is None else override
+
+
+def _max_steps_override_from_env() -> int | None:
+    """The operator's ``HARNESS_MAX_STEPS`` override, or ``None`` when it is unset or blank.
+
+    The one parse of the variable, shared by the wake (`_max_steps_from_env`, which supplies the
+    default) and ``--resolved-config`` (issue #908, which reports the override as written so the
+    NOC compares it against its own declaration without restating the harness's default). A value
+    a wake refuses is refused here with the same words, so the report is red exactly when every
+    wake would be.
+    """
     raw = os.environ.get("HARNESS_MAX_STEPS")
     if raw is None or not raw.strip():
-        return DEFAULT_MAX_STEPS
+        return None
     value = int(raw)
     if value <= 0:
         raise ValueError(f"HARNESS_MAX_STEPS must be a positive integer, got {value}.")

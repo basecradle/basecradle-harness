@@ -63,7 +63,12 @@ from basecradle_harness import (
 )
 from basecradle_harness import _brief as brief_module
 from basecradle_harness import _wake as wake_module
-from basecradle_harness._basecradle import _incoming_text, _messages_since, _parse_created_at
+from basecradle_harness._basecradle import (
+    _incoming_text,
+    _max_steps_from_env,
+    _messages_since,
+    _parse_created_at,
+)
 from basecradle_harness._brief import your_home_text
 from basecradle_harness._cleanup import prune_settled_claims
 from basecradle_harness._messages import ToolCall
@@ -4212,6 +4217,37 @@ def test_resolved_config_reports_the_breaker_and_fails_where_a_wake_would(
     assert main(["--resolved-config"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert (report["wake_breaker_max"], report["wake_breaker_window"]) == (0, None)
+
+
+@pytest.mark.parametrize(
+    ("value", "reported"),
+    [(None, None), ("", None), ("   ", None), ("48", 48), (" 48 ", 48), ("24", 24)],
+)
+def test_resolved_config_reports_the_step_limit_override_as_written(
+    wake_env, monkeypatch, capsys, value, reported
+):
+    """``max_steps`` is the operator's ``HARNESS_MAX_STEPS`` override, ``null`` when unset or
+    blank (issue #908), so the NOC audits what it wrote without restating the harness's default.
+    An override equal to the default still reads as the override: it was written, so it is there."""
+    if value is None:
+        monkeypatch.delenv("HARNESS_MAX_STEPS", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_MAX_STEPS", value)
+    assert main(["--resolved-config"]) == 0
+    assert json.loads(capsys.readouterr().out)["max_steps"] == reported
+
+
+@pytest.mark.parametrize("value", ["forty-eight", "48.0", "0", "-3"])
+def test_resolved_config_fails_on_a_step_limit_a_wake_refuses(wake_env, monkeypatch, capsys, value):
+    """A malformed or non-positive ``HARNESS_MAX_STEPS`` fails the report exactly as it fails a
+    wake, in the wake's own words, so the deploy verifier is red exactly when every wake would be."""
+    monkeypatch.setenv("HARNESS_MAX_STEPS", value)
+    with pytest.raises(ValueError) as wake_refusal:
+        _max_steps_from_env()
+    assert main(["--resolved-config"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"basecradle-harness-wake: {wake_refusal.value}\n"
 
 
 def test_a_zero_cooldown_is_allowed_and_holds_nothing(tmp_path):
