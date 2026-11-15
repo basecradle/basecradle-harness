@@ -254,5 +254,7 @@ def test_the_live_line_names_the_call_by_xais_own_response_id(caplog):
     line = next(
         r.getMessage() for r in caplog.records if r.getMessage().startswith("llm provider=")
     )
-    generation = line.split()[-1].removeprefix("generation_id=")
+    found = re.search(r"\bgeneration_id=(\S+)", line)
+    assert found, line
+    generation = found.group(1)
     assert str(uuid.UUID(generation)) == generation, line

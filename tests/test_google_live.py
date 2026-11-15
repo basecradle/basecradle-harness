@@ -19,7 +19,7 @@ project the key names, and ``VERTEX_MODEL`` to ``gemini-3.8-flash``. A SKIP here
 pytest exits 0 when every test skips, so read the report, not the exit code.
 
 What each test pins is a value, never mere presence (a field that is present and wrong passes a
-presence check): the endpoint is the location asked for, the cost equals the table's own arithmetic
+presence check): the residency is the location asked for, the cost equals the table's own arithmetic
 over the usage Vertex reported, a call whose turn needs a thought signature is accepted, and so on.
 """
 
@@ -92,7 +92,10 @@ def test_a_real_turn_answers_and_its_line_says_what_happened(caplog):
     assert reply.role == "assistant" and reply.content
     line = _llm_line(caplog)
     assert _field(line, "provider") == "google"
-    assert _field(line, "endpoint") == LOCATION
+    # `residency` is where Vertex ran the call; `endpoint` is a router's serving upstream only, so
+    # a direct call carries none (docs/telemetry.md → `llm`; the move landed in 0.168.0, #759).
+    assert _field(line, "residency") == LOCATION, line
+    assert _field(line, "endpoint") is None, line
     assert _field(line, "model") == MODEL
     assert int(_field(line, "tokens_in")) > 0 and int(_field(line, "tokens_out")) > 0
     assert _field(line, "generation_id")
