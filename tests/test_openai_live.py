@@ -123,7 +123,7 @@ def test_the_live_line_names_the_call_by_openais_own_id(surface, prefix, caplog)
         line = next(
             r.getMessage() for r in caplog.records if r.getMessage().startswith("llm provider=")
         )
-        generation = line.split()[-1].removeprefix("generation_id=")
+        generation = _field(line, "generation_id") or ""
         assert generation.startswith(prefix), line
         if surface == "responses":
             assert provider._client.responses.retrieve(generation).id == generation
