@@ -124,6 +124,9 @@ jobs:
       # Better Stack pages when the day and the grace pass. The URL is write-only and never
       # printed: the one step here that expands a secret in the shell runs with xtrace off
       # (issue #832). It is its own process, so there is no caller's setting to restore.
+      # Nor does the URL ride a command line, which other processes can read: `printf` is a
+      # builtin, and curl reads the URL from its config on stdin, with `-q` keeping a
+      # `.curlrc` from adding options (issue #906).
       - name: Ping the basecradle-harness Dependency Scan heartbeat
         if: ${{ success() }}
         env:
@@ -135,7 +138,7 @@ jobs:
           if [ "$(jq -r '.verdict' "$RUNNER_TEMP/plan.json")" = "error" ]; then
             echo "a scanner reached no verdict: the heartbeat is withheld"
           else
-            curl -fsS --retry 3 --max-time 15 -o /dev/null "$HEARTBEAT_URL"
+            printf 'url = "%s"\n' "$HEARTBEAT_URL" | curl -q -fsS --retry 3 --max-time 15 -o /dev/null --config -
           fi
 
       # A run that found something, or could not look, is red.
