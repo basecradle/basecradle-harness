@@ -53,6 +53,7 @@ from basecradle_harness import (
 )
 from basecradle_harness._caching import AUTOMATIC
 from basecradle_harness._google import (
+    API_VERSION,
     LOCAL_CALL_ID_PREFIX,
     SKIP_SIGNATURE,
     SYSTEM_LABEL,
@@ -577,6 +578,32 @@ def test_an_endpoint_override_is_honoured(router, key_file):
     with build(key_file, base_url="https://vertex.proxy.test/") as p:
         p.chat([Message.user("hello")])
     assert route.called
+    assert route.calls.last.request.url.path.startswith(f"/{API_VERSION}/projects/")
+
+
+@pytest.mark.parametrize("env_version", [None, "v1", "beta", "v1beta"])
+def test_the_api_version_is_the_adapters_own_never_the_sdks(
+    router, key_file, monkeypatch, env_version
+):
+    """Issue #901: Vertex is called on ``v1beta1`` because this adapter says so, on every path.
+
+    The SDK's default is a value the vendor can move (google-genai 3.0 moved the Developer API's),
+    and from 3.0 the SDK also takes ``GOOGLE_GENAI_API_VERSION`` from the environment for a Vertex
+    client. So the version is asserted on the request's own URL, for a turn and for a grounded
+    search, with that variable unset and set to what a box might carry for another program.
+    """
+    assert API_VERSION == "v1beta1"
+    if env_version is None:
+        monkeypatch.delenv("GOOGLE_GENAI_API_VERSION", raising=False)
+    else:
+        monkeypatch.setenv("GOOGLE_GENAI_API_VERSION", env_version)
+    route = router.post(GENERATE).mock(return_value=ok(text("hi")))
+    with build(key_file) as p:
+        p.chat([Message.user("hello")])
+        p.search("who won")
+    assert route.call_count == 2
+    for sent_call in route.calls:
+        assert sent_call.request.url.path.startswith(f"/{API_VERSION}/projects/{PROJECT}/")
 
 
 def test_each_phase_gets_its_own_budget_on_the_wire(router, provider):
@@ -910,8 +937,12 @@ def test_a_call_keeps_the_models_id_and_gets_a_local_one_when_it_has_none(router
     assert second.id.startswith(LOCAL_CALL_ID_PREFIX) and second.arguments == {"query": "b"}
 
 
-def test_a_malformed_function_call_is_the_transient_response_class(router, provider):
-    router.post(GENERATE).mock(return_value=ok(finish="MALFORMED_FUNCTION_CALL"))
+@pytest.mark.parametrize(
+    "finish", ["MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "MALFORMED_RESPONSE"]
+)
+def test_a_broken_empty_reply_is_the_transient_response_class(router, provider, finish):
+    """A reply the model broke is retried, never a silent turn (``MALFORMED_RESPONSE``: #901)."""
+    router.post(GENERATE).mock(return_value=ok(finish=finish))
     with pytest.raises(ProviderResponseError):
         provider.chat([Message.user("go")], [MEMORY_TOOL])
 

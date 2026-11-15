@@ -211,6 +211,15 @@ PROJECT_VAR = "AI_PROJECT"
 #: The OAuth scope a Vertex call needs — the one Google's own SDK asks for.
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
+#: The Vertex API version every call is sent on — named here, never inherited from the SDK (issue
+#: #901). It is the version both google-genai 2.x and 3.x resolve to for a Vertex client, and the one
+#: every live proof of this adapter ran on. Left to the SDK, it is a default the vendor can move: 3.0
+#: moved the Developer API's from ``v1beta`` to ``v1``, and from 3.0 the SDK also reads
+#: ``GOOGLE_GENAI_API_VERSION`` from the environment for a Vertex client, so a variable set on the
+#: box for some other program would change the API this agent calls, with nothing logged. Moving to
+#: another version is a change to this constant, proven live, never a side effect of an SDK bump.
+API_VERSION = "v1beta1"
+
 #: Google's documented stand-in for a function call's thought signature, for a call whose real one
 #: is not available ("transferring history from a model that does not include thought signatures").
 #: Google: "this should be a last resort as it will negatively impact model performance". It is
@@ -232,9 +241,13 @@ SYSTEM_LABEL = "[System]\n"
 #: almost certainly the key itself pasted where its path belongs.
 _PATH_LIMIT = 1024
 
-#: The finish reasons that mean the model tried to call a function and produced nothing usable. A
-#: retry very often succeeds, so they are the transient response class, never a silent turn.
-_BROKEN_CALL_REASONS = frozenset({"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"})
+#: The finish reasons that mean the model's output broke and nothing usable came back. A retry very
+#: often succeeds, so they are the transient response class, never a silent turn. The function-call
+#: pair is a broken call; ``MALFORMED_RESPONSE`` (new in google-genai 3.x's enum, issue #901) is the
+#: same fault without the call: "token generation stopped because the response was malformed".
+_BROKEN_REPLY_REASONS = frozenset(
+    {"MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "MALFORMED_RESPONSE"}
+)
 
 
 class GoogleConfigError(ValueError):
@@ -648,7 +661,9 @@ class GoogleProvider:
         self._http = httpx.Client(follow_redirects=True, event_hooks={"request": [self._phased]})
         # After `_phased`, which sets the timeout the deadline is read from (issue #788).
         bound_attempts(self._http)
-        options: dict[str, Any] = {"httpx_client": self._http}
+        # The API version is ours (`API_VERSION`): an explicit value wins over the SDK's default and
+        # over its `GOOGLE_GENAI_API_VERSION` environment read, and the per-call options name none.
+        options: dict[str, Any] = {"httpx_client": self._http, "api_version": API_VERSION}
         if base_url:
             options["base_url"] = base_url
         self._client = self._genai.Client(
@@ -1129,7 +1144,7 @@ class GoogleProvider:
             if text:
                 texts.append(text)
         if not calls and not texts:
-            if reason in _BROKEN_CALL_REASONS:
+            if reason in _BROKEN_REPLY_REASONS:
                 raise ProviderResponseError(
                     f"Vertex returned no usable reply (finish_reason={reason}); retrying."
                 )

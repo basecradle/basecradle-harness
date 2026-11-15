@@ -7,6 +7,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.196.0] - 2026-11-15
+
+### Changed: The `google-genai` extra admits 3.x, and the Vertex API version is the adapter's own (issue #901)
+
+- **`google-genai` 3.x is allowed.** The `[google-genai]` extra is now `>=2.28.0,<4` (was `<3`), and the lock moves to 3.2.0 (Dependabot's PR #900, folded into this change). 3.0's one breaking change, the Gemini Developer API defaulting to `v1`, does not reach a Vertex client. Read against the SDK source from 2.34.0 to 3.2.0, nothing the adapter calls was renamed, removed or changed in meaning: the client constructor, `HttpOptions`, the `generate_content` call, `GenerateContentConfig` (no field added or removed), the thinking, tool and function-call types, `usage_metadata`, the error classes, and the Vertex serializers are unchanged. The adapter still sends through its own `httpx` client, so its phased budgets and whole-attempt deadline hold, although 3.x now defaults to HTTPX2 for a client it builds itself.
+- **The Vertex API version is named by the adapter, never inherited.** Every call goes to `v1beta1` because `_google.API_VERSION` says so. Before, it was the SDK's default, which happened to be `v1beta1` on 2.x and 3.x alike. From 3.0 the SDK also reads `GOOGLE_GENAI_API_VERSION` from the environment for a Vertex client, so a variable set on a box for another program would have moved this agent onto another API, with nothing logged. The variable no longer has any effect on the harness. A test asserts the version on the request's own URL, for a turn and for a grounded search, with the variable unset and set.
+- **A `MALFORMED_RESPONSE` finish is retried.** 3.x adds `MALFORMED_RESPONSE` to Gemini's finish reasons ("the response was malformed"). An empty reply that ends on it is now the transient response class, retried like `MALFORMED_FUNCTION_CALL`, rather than a silent turn.
+
 ## [0.195.0] - 2026-11-15
 
 ### Changed: Four log fixes from the first red-team run (issue #892)
