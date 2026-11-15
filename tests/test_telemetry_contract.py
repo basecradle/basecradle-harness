@@ -2134,7 +2134,7 @@ def written_providers(source: Path = SRC) -> dict[str, str]:
     from configuration, which `KNOWN_PROVIDERS` and the rendered lines cover.
     """
     modules = [
-        (path.name, ast.parse(path.read_text(encoding="utf-8"))) for path in SRC.glob("*.py")
+        (path.name, ast.parse(path.read_text(encoding="utf-8"))) for path in source.glob("*.py")
     ]
     package: dict[str, set[str]] = {}
     local = {}

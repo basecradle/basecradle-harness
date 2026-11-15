@@ -634,7 +634,7 @@ def test_main_exits_nonzero_with_no_json_on_a_bad_question(capsys):
     assert main(["--provider", "No/pe"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "no/pe" in captured.err
+    assert "No/pe" in captured.err  # quoted as written, never folded (issue #889)
 
     assert main(["--opt-in", "xai_serch"]) == 1
     captured = capsys.readouterr()

@@ -802,12 +802,19 @@ def test_config_from_env_defaults_to_the_openai_sdk_responses_stack(monkeypatch)
     assert _config_from_env() == ("openai", "openai", "responses")
 
 
-def test_config_from_env_is_case_insensitive(monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER", "XAI")
+def test_config_from_env_folds_the_surface_case(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "xai")
     monkeypatch.setenv("AI_SDK_SURFACE", "Chat")
     provider, _sdk, surface = _config_from_env()
     assert provider == "xai"
     assert surface == "chat"
+
+
+def test_config_from_env_refuses_a_capitalized_provider_never_folds_it(monkeypatch):
+    # Issue #889: `provider` is the lowercase slug every consumer joins on, so `XAI` is refused.
+    monkeypatch.setenv("AI_PROVIDER", "XAI")
+    with pytest.raises(ValueError, match="Write it as 'xai'"):
+        _config_from_env()
 
 
 def test_config_from_env_rejects_a_malformed_provider(monkeypatch):
