@@ -1276,8 +1276,13 @@ def mcp_tool_name(server: str, tool: str) -> str:
 
 
 def _sanitize(part: str) -> str:
-    """Coerce a name part to the ``[A-Za-z0-9_-]`` the providers require, collapsing the rest to ``_``."""
-    return "".join(c if (c.isalnum() or c in "_-") else "_" for c in part) or "_"
+    """Coerce a name part to the ``[A-Za-z0-9_-]`` the providers require, collapsing the rest to ``_``.
+
+    ASCII only: `str.isalnum` alone is true of every Unicode letter and digit (``Ü``, ``٣``), which
+    let a non-ASCII server or tool name out of the grammar the vendors refuse a function name
+    outside (issue #889, `docs/telemetry.md` → Identifiers).
+    """
+    return "".join(c if (c.isascii() and c.isalnum()) or c in "_-" else "_" for c in part) or "_"
 
 
 # --- resolution into the active tool set --------------------------------------

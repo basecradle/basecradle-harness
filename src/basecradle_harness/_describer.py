@@ -998,10 +998,12 @@ def describer_stack_from_env(env: Any = None) -> tuple[str | None, str | None]:
     """The describer's own ``(provider, sdk)`` override as configured, either half ``None`` if unset.
 
     Read raw and unvalidated: `describer_from_env` decides what an incomplete or unknown stack means
-    (a config fault), and ``--resolved-config`` reports what the operator wrote.
+    (a config fault), and ``--resolved-config`` reports what the operator wrote. The provider is
+    never case-folded (issue #889): a value that is not a lowercase slug is `normalize_provider`'s
+    refusal, ``config:invalid_provider``, never a vendor this read quietly rewrote into one.
     """
     source = env if env is not None else os.environ
-    provider = (source.get(DESCRIBER_PROVIDER_VAR) or "").strip().lower() or None
+    provider = (source.get(DESCRIBER_PROVIDER_VAR) or "").strip() or None
     sdk = (source.get(DESCRIBER_SDK_VAR) or "").strip().lower() or None
     return provider, sdk
 

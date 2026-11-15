@@ -698,7 +698,8 @@ def test_the_rerankers_key_is_read_at_the_rerankers_own_host(monkeypatch):
     ("describer_provider", "used"),
     [
         pytest.param("openrouter", True, id="own-openrouter-stack"),
-        pytest.param("OpenRouter", True, id="slug-normalized"),
+        # Issue #889: not a slug, so the describer is config-dead and its key serves no stack here.
+        pytest.param("OpenRouter", False, id="a-capitalized-provider-is-refused"),
         pytest.param(None, False, id="rides-the-brains-stack"),
         pytest.param("google", False, id="own-google-stack"),
     ],

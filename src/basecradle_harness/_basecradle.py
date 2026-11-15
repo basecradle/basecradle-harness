@@ -27,12 +27,15 @@ identical in the env, the code, and the docs:
 
 - ``AI_PROVIDER``             — **the vendor that bills the account** (whose key it is), and the
   label every ``llm provider=`` line carries — the fleet's spend chart groups on it (issue #670).
-  Five vendors are *known* and get conventions: ``openai`` (default) | ``xai`` | ``openrouter`` |
-  ``google`` | ``anthropic``. Both ``openai`` and ``xai`` are wired through the one ``openai`` SDK adapter (xAI's
-  endpoint speaks the same wire — ``AI_PROVIDER=xai`` points the SDK at ``api.x.ai``, issue #163);
+  Six vendors are *known* and get conventions: ``openai`` (default) | ``xai`` | ``openrouter`` |
+  ``google`` | ``anthropic`` | ``refuseless``. ``openai``, ``xai`` and ``refuseless`` are wired
+  through the one ``openai`` SDK adapter (xAI's endpoint speaks the same wire —
+  ``AI_PROVIDER=xai`` points the SDK at ``api.x.ai``, issue #163; refuseless, issue #844);
   ``openrouter`` has its native SDK as well, and ``google`` is Gemini on Vertex AI over
   ``google-genai`` (issue #655), and ``anthropic`` is Claude over Anthropic's own ``anthropic`` SDK
-  (issue #725). **Any other slug** (``^[a-z0-9._-]+$``, e.g. ``wiro``) is a legal
+  (issue #725). The value must already be a **lowercase slug** (``^[a-z0-9._-]+$``): a value
+  outside it, capitals included, is refused rather than folded (issue #889). **Any other slug**
+  (e.g. ``wiro``) is a legal
   vendor with the *generic* OpenAI-compatible profile: ``AI_SDK=openai`` and ``AI_BASE_URL`` are
   required, the surface defaults to ``chat``, and nothing vendor-specific goes on the wire
   (`_provider_from_config`). The dialect is derived from the vendor, never configured.
@@ -643,10 +646,12 @@ DEFAULT_SDK = "openai"
 #: matters — a vendor not named here gets **no** convention, never a guessed one.
 KNOWN_PROVIDERS = ("openai", "xai", "openrouter", "google", "anthropic", "refuseless")
 
-#: The shape every provider token must have, known or not. It is the NOC dashboard's own extraction
-#: (``provider=([A-Za-z0-9._-]+)``) narrowed to the lowercase this layer normalizes to, so a token
-#: that passes here is one the spend chart reads whole — a typo'd ``Wiro.AI/`` would otherwise land
-#: as a truncated label and split the chart.
+#: The shape every provider token must have, known or not: the grammar of ``provider`` on every log
+#: line (`docs/telemetry.md` → Common Fields, held there by `tests/test_telemetry_contract.py`). It
+#: is the NOC dashboard's own extraction (``provider=([A-Za-z0-9._-]+)``) narrowed to lowercase, so a
+#: token that passes here is one the spend chart reads whole — a typo'd ``Wiro.AI/`` would otherwise
+#: land as a truncated label and split the chart. The value is the machine identifier every consumer
+#: joins on; how a person reads it is `_report._PROVIDER_LABELS`'s, never this token's (issue #889).
 _PROVIDER_SLUG = re.compile(r"[a-z0-9._-]+")
 
 #: The surface a generic vendor gets when ``AI_SDK_SURFACE`` is unset: Chat Completions is what
@@ -668,19 +673,28 @@ _VENDOR_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
 
 
 def normalize_provider(raw: str | None) -> str:
-    """``raw`` as a provider token — stripped, lowercased, and validated as a slug.
+    """``raw`` as a provider token — stripped of surrounding whitespace and validated as a slug.
 
     The one reader of the provider *shape*, shared by the wake, the off-box resolver and the
     describer's own stack, so the three cannot disagree on which tokens are legal. Empty or unset
     is the default vendor; anything that is not a slug is a hard error naming the rule.
+
+    **The value is refused, never folded** (issue #889, @origin's ruling of 2026-11-14): a token
+    with a capital in it (``OpenRouter``) is not a slug, so it is a startup error naming the slug it
+    would be, rather than a value the harness quietly rewrites. Until 0.194.0 it was lowercased
+    here, which let a box run on a spelling the NOC's inventory refuses and its drift check compares
+    as written. Surrounding whitespace is still stripped: it is not part of the value, and systemd's
+    ``EnvironmentFile=`` strips it too.
     """
-    provider = (raw or DEFAULT_PROVIDER).strip().lower()
+    provider = (raw or DEFAULT_PROVIDER).strip()
     if not _PROVIDER_SLUG.fullmatch(provider):
+        lowered = provider.lower()
+        hint = f" Write it as {lowered!r}." if _PROVIDER_SLUG.fullmatch(lowered) else ""
         raise ValueError(
             f"AI_PROVIDER={provider!r} is not a provider slug: it names the vendor that bills the "
-            "account, as lowercase letters, digits, '.', '_' or '-' (e.g. 'openai', 'wiro'). Known "
-            f"vendors: {', '.join(KNOWN_PROVIDERS)}; any other slug takes AI_SDK=openai and "
-            "AI_BASE_URL."
+            "account, as lowercase letters, digits, '.', '_' or '-' (e.g. 'openai', 'wiro'), and "
+            f"is never folded to one.{hint} Known vendors: {', '.join(KNOWN_PROVIDERS)}; any other "
+            "slug takes AI_SDK=openai and AI_BASE_URL."
         )
     return provider
 
