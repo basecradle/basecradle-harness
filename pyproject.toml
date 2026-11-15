@@ -82,11 +82,11 @@ openrouter = ["openrouter>=1.1.70,<2"]
 # Google's `google-genai` SDK (AI_SDK=google-genai): Gemini on Vertex AI, called direct (issue #655) —
 # a brain, or a describer on its own stack. Floor is the version this adapter was built and wire-tested
 # against (2.28.0); major-capped so a breaking 4.0 never auto-upgrades. 3.x was read against the
-# adapter before the cap moved (issue #901): its one breaking change, the Developer API's default
-# version, does not reach a Vertex client, and the version the adapter calls is its own constant
-# (`_google.API_VERSION`), so 2.x and 3.x send the same request. It brings `google-auth`, which
-# loads the service-account key the adapter is configured with. Kept out of the base install so the
-# core stays light; a Google agent installs it.
+# adapter before the cap moved (issue #901): none of its breaking changes reaches a Vertex client,
+# and the version the adapter calls is its own constant (`_google.API_VERSION`), so 2.x and 3.x send
+# the same request. It brings `google-auth`, which loads the service-account key the adapter is
+# configured with, and from 3.x `httpx2` too (the adapter still hands it an `httpx` client). Kept
+# out of the base install so the core stays light; a Google agent installs it.
 google-genai = ["google-genai>=2.28.0,<4"]
 # Anthropic's own `anthropic` SDK (AI_SDK=anthropic): Claude, called direct (issue #725) — never an
 # OpenAI-compatible shim. Floor is the version this adapter was built and wire-tested against (2.3.0);
