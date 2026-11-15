@@ -367,6 +367,23 @@ def test_the_describer_needs_only_what_its_provider_takes(
     }
 
 
+@pytest.mark.parametrize(
+    ("var", "sdk"), [("HARNESS_DESCRIBER_PROVIDER", "google-genai"), ("AI_PROVIDER", None)]
+)
+def test_a_capitalised_describer_provider_is_refused_not_misread(
+    openrouter_brain, clean_describer, monkeypatch, var, sdk
+):
+    # `Google` is not a slug (issue #889), so it is neither Vertex nor a key-based vendor: the read
+    # refuses it in the wake's words, naming the variable, rather than naming a credential (#891).
+    monkeypatch.setenv("HARNESS_DESCRIBER_MODEL", GEMINI)
+    monkeypatch.setenv(var, "Google")
+    if sdk:
+        monkeypatch.setenv("HARNESS_DESCRIBER_SDK", sdk)
+
+    with pytest.raises(ValueError, match=rf"^{var}='Google' is not a provider slug"):
+        describer_required_env()
+
+
 # === --resolved-config ========================================================================
 
 

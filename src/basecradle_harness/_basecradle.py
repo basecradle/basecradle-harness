@@ -672,12 +672,15 @@ _VENDOR_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
 }
 
 
-def normalize_provider(raw: str | None) -> str:
+def normalize_provider(raw: str | None, *, provider_var: str = "AI_PROVIDER") -> str:
     """``raw`` as a provider token — stripped of surrounding whitespace and validated as a slug.
 
-    The one reader of the provider *shape*, shared by the wake, the off-box resolver and the
-    describer's own stack, so the three cannot disagree on which tokens are legal. Empty or unset
-    is the default vendor; anything that is not a slug is a hard error naming the rule.
+    The one reader of the provider *shape*, shared by the wake, the off-box resolver, the
+    describer's own stack, the installer and ``basecradle-harness-verify`` (issue #891), so none of
+    them can disagree on which tokens are legal. Empty or unset is the default vendor; anything
+    that is not a slug is a hard error naming the rule. `provider_var` names where the value was
+    read (``HARNESS_DESCRIBER_PROVIDER``, ``--provider``), so the refusal points at the setting the
+    operator wrote; the rest of the message is the same wherever it is read.
 
     **The value is refused, never folded** (issue #889, @origin's ruling of 2026-11-14): a token
     with a capital in it (``OpenRouter``) is not a slug, so it is a startup error naming the slug it
@@ -691,7 +694,7 @@ def normalize_provider(raw: str | None) -> str:
         lowered = provider.lower()
         hint = f" Write it as {lowered!r}." if _PROVIDER_SLUG.fullmatch(lowered) else ""
         raise ValueError(
-            f"AI_PROVIDER={provider!r} is not a provider slug: it names the vendor that bills the "
+            f"{provider_var}={provider!r} is not a provider slug: it names the vendor that bills the "
             "account, as lowercase letters, digits, '.', '_' or '-' (e.g. 'openai', 'wiro'), and "
             f"is never folded to one.{hint} Known vendors: {', '.join(KNOWN_PROVIDERS)}; any other "
             "slug takes AI_SDK=openai and AI_BASE_URL."

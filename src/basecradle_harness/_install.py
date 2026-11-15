@@ -151,10 +151,6 @@ def config_home(home: str | os.PathLike[str] | None = None) -> Path:
 
 # --- provider affinity (issue #160) -------------------------------------------
 
-# The active provider when none is named — mirrors `_basecradle.DEFAULT_PROVIDER`. Inlined as a
-# string (not imported) because `_basecradle` imports this module: the dependency runs one way.
-_DEFAULT_PROVIDER = "openai"
-
 # The `requires` marker calls (from `_plugins`) that declare a plugin's provider affinity in its
 # source. `Vendor("x")` ties a plugin to provider ``x``; `OpenAIKey()`/`OpenAISurface()` tie it to
 # ``openai``. Matched by *name in the source's AST* — so a provider-mismatched plugin is classified
@@ -242,16 +238,18 @@ def plugin_opts_in(source: str) -> bool:
 
 
 def active_provider_from_env() -> str:
-    """The active ``AI_PROVIDER`` for provider-aware install/reconcile, normalized (default openai).
+    """The active ``AI_PROVIDER`` for provider-aware install/reconcile, validated (default openai).
 
-    Any token passes (issue #670): ``AI_PROVIDER`` names the vendor that bills the account, and a
+    Any slug passes (issue #670): ``AI_PROVIDER`` names the vendor that bills the account, and a
     vendor the harness does not know simply has no plugin naming it — so `plugin_relevant_to` keeps
     every vendor-neutral default and prunes every vendor-affine one, with no list of known vendors
-    consulted here. The slug's *shape* is not checked here: a wake refuses a malformed one
-    (`_basecradle.normalize_provider`) before its reconcile runs, while the installer CLI takes its
-    ``--provider`` as given, as it always has.
+    consulted here. The slug's *shape* is the wake's rule, read through the one function that
+    decides it (`_basecradle.normalize_provider`, issue #891): a value that is not a slug raises
+    ``ValueError`` in the wake's words, never folded into one the installer then filters for.
     """
-    return (os.environ.get("AI_PROVIDER") or _DEFAULT_PROVIDER).strip().lower()
+    from basecradle_harness._basecradle import normalize_provider  # deferred: it imports us
+
+    return normalize_provider(os.environ.get("AI_PROVIDER"))
 
 
 # --- the shipped defaults -----------------------------------------------------
@@ -424,7 +422,15 @@ def install(
     strip, and the symmetric way to withdraw the grant is ``revoke_opt_in`` (the
     ``--revoke-opt-in`` flag) — which drops it from the declaration and removes the pristine file.
     Without that asymmetry a prune erases its own evidence and every later reconcile ratifies it.
+
+    A ``provider`` that is not a slug raises ``ValueError`` before anything is written, in the
+    wake's words (`_basecradle.normalize_provider`, issue #891): the reconcile filters a vendor's
+    tranche by it, so a folded value would lay down an overlay for a vendor the wake refuses.
     """
+    if provider is not None:
+        from basecradle_harness._basecradle import normalize_provider  # deferred: it imports us
+
+        provider = normalize_provider(provider, provider_var="provider")
     root = config_home(home)
     report = InstallReport(config_home=root)
 
@@ -1081,7 +1087,9 @@ def overlay_provider(root: str | os.PathLike[str] | None = None) -> str | None:
     filtered for another vendor (issue #672). This read lets ``--resolved-config`` report that
     input beside ``ai_provider`` so the two can be compared off the box. Three values:
 
-    - the normalized slug the reconcile filtered for;
+    - the slug the reconcile filtered for, as recorded — never folded (issue #891): a value an
+      installer before 0.195.0 recorded from a capitalised ``--provider`` reads as written, so it
+      differs from ``ai_provider`` the way the overlay it filtered differs from the agent's;
     - `OVERLAY_ALL_PROVIDERS` for an unfiltered (``--all-providers``) install, which matches every
       agent, as `_verify._check_provider` reads it. The file records that as JSON ``null``; it is
       reported as its own value so it cannot be mistaken for the next case;
@@ -1096,7 +1104,7 @@ def overlay_provider(root: str | os.PathLike[str] | None = None) -> str | None:
     if value is None:
         return OVERLAY_ALL_PROVIDERS
     if isinstance(value, str) and value.strip():
-        return value.strip().lower()
+        return value.strip()
     return None
 
 
@@ -1367,7 +1375,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    provider = None if args.all_providers else (args.provider or active_provider_from_env())
+    # The provider is refused here, before anything is written, in the wake's words (issue #891).
+    from basecradle_harness._basecradle import normalize_provider  # deferred: it imports us
+
+    try:
+        if args.all_providers:
+            provider = None
+        elif args.provider:
+            provider = normalize_provider(args.provider, provider_var="--provider")
+        else:
+            provider = active_provider_from_env()
+    except ValueError as error:
+        parser.error(str(error))
     opt_in = [name.strip() for name in args.opt_in.split(",") if name.strip()]
     revoke = [name.strip() for name in args.revoke_opt_in.split(",") if name.strip()]
     report = install(args.config_home, provider=provider, opt_in=opt_in, revoke_opt_in=revoke)
