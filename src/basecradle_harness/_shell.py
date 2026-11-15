@@ -291,9 +291,10 @@ class ShellTool(Tool):
 
         # Past the output cap the agent still gets the head, marked as cut and at what size, and the
         # line says `degraded` (issue #892): the work was done and what came back is usable, short of
-        # whole. Whether the command was still writing (killed, since nothing reads the pipe any more
+        # whole. Whether the command was still running (killed, since nothing reads the pipe any more
         # and the kill is what keeps a flood from holding the box until the timeout) or had already
-        # exited is a race between it and the reader, so both are the one verdict.
+        # exited is a race between it and the reader, so both are the one verdict. (A background child
+        # left writing by a shell that exited is not killed here; that is unchanged.)
         if pump.capped and proc.poll() is None:
             _kill_group(proc)
             self._reap(proc)
