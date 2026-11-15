@@ -1478,7 +1478,7 @@ EXPECTED_TOOLS = {
     "unpriced_media_tools": {("assets", "harness", "ok")},
     "answered_cut_and_targeted_tools": {
         ("web_fetch", "harness", "ok"),
-        ("shell", "harness", "degraded"),
+        ("shell", "harness", "ok"),
         ("messages", "harness", "error"),
     },
 }
@@ -1521,13 +1521,27 @@ def test_an_answer_is_not_a_tool_error_and_carries_its_status(rendered):
     assert not [c for c in companions if c.fields["name"] == "web_fetch"]
 
 
-def test_a_cut_shell_output_is_degraded_with_no_companion(rendered):
-    """Issue #892, change 4: past the output cap the work was done and is usable short of whole —
-    the contract's `degraded` — and nothing failed, so there is no WARNING."""
+def test_a_cut_shell_output_is_ok_and_says_where_it_was_cut(rendered):
+    """Issue #892, change 4: past the output cap the work was done and the agent got the head, so
+    the line is `ok` with `cut_at` — never `degraded`, which pages @origin through the NOC's *Tool
+    Outcome Degraded* — and nothing failed, so there is no WARNING."""
     verdicts, companions = _tool_lines(rendered, "answered_cut_and_targeted_tools")
     (shell,) = [l.fields for l in verdicts if l.fields["name"] == "shell"]
-    assert (shell["outcome"], shell["reason"]) == ("degraded", "output_limit")
+    assert (shell["outcome"], shell["cut_at"]) == ("ok", "10")
+    assert "reason" not in shell
     assert not [c for c in companions if c.fields["name"] == "shell"]
+
+
+def test_no_harness_tool_line_is_degraded(rendered):
+    """`degraded` pages a person (basecradle-noc's *Tool Outcome Degraded*), so no `tool` line the
+    harness renders carries it, and no helper the package ships writes it (issue #892)."""
+    import basecradle_harness
+
+    for name in rendered.lines:
+        assert not [
+            l for l in rendered.heads(name, "tool") if l.fields.get("outcome") == "degraded"
+        ]
+    assert not hasattr(basecradle_harness, "tool_degraded")
 
 
 def test_a_failed_platform_read_names_its_target_on_the_companion(rendered):

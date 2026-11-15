@@ -77,7 +77,7 @@ import signal
 import subprocess
 import threading
 
-from basecradle_harness._observability import tool_degraded, tool_failed
+from basecradle_harness._observability import tool_cut, tool_failed
 from basecradle_harness._policy import SHELL
 from basecradle_harness._tools import Tool
 from basecradle_harness._venv import path_preamble, with_interpreter_bin
@@ -236,7 +236,7 @@ class ShellTool(Tool):
         a failing command is a normal result the model reads and reacts to, not a tool
         error. A command that outruns its timeout is killed by its process group (children
         included) and reported as such. One that writes more than the output cap returns its
-        head, marked as cut, and is killed when it is still writing (``outcome=degraded``).
+        head, marked as cut, and is killed when it is still writing (``outcome=ok cut_at=<cap>``).
         """
         # Defense-in-depth privilege backstop: even a tool constructed and invoked
         # directly (bypassing the registry's load-time refusal) must never hand the
@@ -290,21 +290,22 @@ class ShellTool(Tool):
             )
 
         # Past the output cap the agent still gets the head, marked as cut and at what size, and the
-        # line says `degraded` (issue #892): the work was done and what came back is usable, short of
-        # whole. Whether the command was still running (killed, since nothing reads the pipe any more
-        # and the kill is what keeps a flood from holding the box until the timeout) or had already
+        # line stays `ok` with `cut_at=` (issue #892): the work was done and what came back is usable,
+        # and `degraded` would page a person. Whether the command was still running (killed, since
+        # nothing reads the pipe any more and the kill is what keeps a flood from holding the box
+        # until the timeout) or had already
         # exited is a race between it and the reader, so both are the one verdict. (A background child
         # left writing by a shell that exited is not killed here; that is unchanged.)
         if pump.capped and proc.poll() is None:
             _kill_group(proc)
             self._reap(proc)
-            return tool_degraded(self._format(pump.text(), over_cap=True), reason="output_limit")
+            return tool_cut(self._format(pump.text(), over_cap=True), at=self._max_output)
 
         # Finished on its own. A nonzero exit is the command's answer, which the tool delivered:
         # `outcome=ok`, never a tool failure.
         self._reap(proc)
         result = self._format(pump.text(), returncode=proc.returncode)
-        return tool_degraded(result, reason="output_limit") if pump.capped else result
+        return tool_cut(result, at=self._max_output) if pump.capped else result
 
     def _resolve_timeout(self, timeout: int | None) -> int:
         """The effective timeout: the (clamped) default when unset/invalid, else clamped."""

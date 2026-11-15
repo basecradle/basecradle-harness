@@ -1291,6 +1291,7 @@ def log_tool(
     generation_id: str | None = None,
     status: int | str | None = None,
     target: tuple[str, str] | None = None,
+    cut_at: int | None = None,
 ) -> None:
     """**The** `tool` line — one per tool use, whoever executed it (issue #758).
 
@@ -1320,7 +1321,9 @@ def log_tool(
     a 404 did its work, so it is ``outcome=ok`` with the 404 on the line, never an error (issue
     #892). ``target`` is what the call asked the platform for, ``(kind, identifier)``, recorded by
     `tool_target`; it rides the WARNING companion only, as ``target=<kind>:<identifier>``, because
-    it is the half of a failure's explanation the error text does not carry.
+    it is the half of a failure's explanation the error text does not carry. ``cut_at`` is the
+    length, in characters, a result was cut at, recorded by `tool_cut`: the work was done and the
+    agent got the head, so the line stays ``outcome=ok`` and the cut is still countable.
     """
     failed_server = executor == SERVER_EXECUTOR and outcome == "error"
     _log.log(
@@ -1337,6 +1340,7 @@ def log_tool(
             outcome=outcome,
             reason=reason,
             status=status,
+            cut_at=cut_at,
             cost=_money(cost),
             cost_basis=cost_basis(cost),
             cost_gap=cost_gap if _money(cost) is None else None,
@@ -1531,14 +1535,15 @@ class ToolMeter:
     count that is not a positive ``int`` likewise.
     """
 
-    __slots__ = ("_units", "failure", "status", "target", "verdict")
+    __slots__ = ("_units", "cut_at", "failure", "status", "target", "verdict")
 
     def __init__(self) -> None:
         self._units: list[tuple[str, str, str, int | None, float | None, bool, str | None]] = []
         self.failure: Exception | None = None
-        #: ``(outcome, reason, error)`` from `tool_failed` (``error``) or `tool_degraded`
-        #: (``degraded``, with no error text): the run's verdict, with no vendor work to blame.
-        self.verdict: tuple[str, str, str | None] | None = None
+        #: ``(reason, error)`` from `tool_failed`: this run failed, with no vendor work to blame.
+        self.verdict: tuple[str, str] | None = None
+        #: The length, in characters, the run's result was cut at, from `tool_cut` (issue #892).
+        self.cut_at: int | None = None
         #: What the far end answered with, from `tool_answered` (issue #892).
         self.status: int | str | None = None
         #: ``(kind, identifier)`` the run last asked the platform for, from `tool_target`.
@@ -1651,21 +1656,21 @@ def tool_failed(text: str, *, reason: str, error: str | None = None) -> str:
     """
     meter = _METER.get()
     if meter is not None:
-        meter.verdict = ("error", reason, text.removeprefix("Error: ") if error is None else error)
+        meter.verdict = (reason, text.removeprefix("Error: ") if error is None else error)
     return text
 
 
-def tool_degraded(text: str, *, reason: str) -> str:
-    """Record that the running tool did its work with a shortfall, and hand back ``text``, unchanged.
+def tool_cut(text: str, *, at: int) -> str:
+    """Record that the running tool's result was cut at ``at`` characters, and hand back ``text``.
 
-    ``degraded`` is the `tool` line's middle verdict: the work was done and what the model got is
-    usable, but short of whole — a shell command whose output was cut at the cap (issue #892).
-    ``reason`` names the shortfall as a slug from the `tool` line's vocabulary. It writes no WARNING
-    companion: nothing failed, and the line's ``reason`` is the whole record. A no-op outside a run.
+    The work was done and the agent got the head, marked as cut, so the line stays ``outcome=ok``
+    and carries ``cut_at=<at>`` (issue #892): a long shell output is countable, and it is not a
+    shortfall a person should be paged for, which is what ``degraded`` means to the fleet's alerts.
+    ``text`` is returned unchanged. A no-op outside a tool run.
     """
     meter = _METER.get()
     if meter is not None:
-        meter.verdict = ("degraded", reason, None)
+        meter.cut_at = at
     return text
 
 

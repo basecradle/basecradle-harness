@@ -198,16 +198,17 @@ def test_a_target_is_never_written_when_the_run_succeeds(caplog):
 
 
 @pytest.mark.parametrize("command", ["yes", "printf 'abcdefghijklmnop'"])
-def test_past_the_output_cap_the_agent_gets_the_head_and_the_run_is_degraded(caplog, command):
+def test_past_the_output_cap_the_agent_gets_the_head_and_the_line_says_it_was_cut(caplog, command):
     """Past the shell output limit the agent gets the head, told it was cut and at what size, and
-    the line says `degraded` (issue #892). `yes` is still writing and is killed; the `printf` has
-    usually exited by the time the reader stops — a race, so both are the one verdict."""
+    the line is `ok` with `cut_at` (issue #892) — never `degraded`, which pages a person. `yes` is
+    still writing and is killed; the `printf` has usually exited by the time the reader stops — a
+    race, so both are the one line."""
     shell = ShellTool(max_output=10, drain_timeout=2)
     result, line, companions = _run(shell, caplog, command=command, timeout=30)
     assert result.startswith(("y\ny\ny\ny\ny", "abcdefghij"))
     assert "[output cut at 10 characters" in result
-    assert line.endswith(" outcome=degraded reason=output_limit")
-    assert companions == []  # nothing failed; the line's reason is the whole record
+    assert line.endswith(" outcome=ok cut_at=10") and "reason=" not in line
+    assert companions == []  # nothing failed
 
 
 def test_a_nonzero_exit_is_the_commands_answer_and_a_kill_is_a_failure(caplog):

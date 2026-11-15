@@ -107,7 +107,7 @@ from basecradle_harness._messages import (
 )
 from basecradle_harness._observability import (
     tool_answered,
-    tool_degraded,
+    tool_cut,
     tool_failed,
     tool_target,
 )
@@ -234,7 +234,7 @@ __all__ = [
     "Tool",
     "ToolRegistry",
     "tool_failed",
-    "tool_degraded",
+    "tool_cut",
     "tool_answered",
     "tool_target",
     "Secret",
