@@ -5426,6 +5426,28 @@ def test_without_the_delivery_var_the_field_is_simply_absent(
     assert "delivery=" not in _line(caplog, "wake start")
 
 
+def test_wake_start_names_the_active_mcp_servers_once_per_wake(platform, tmp_path, caplog):
+    """Running beyond the safe-by-default tool set is on the record once per wake, structured, on
+    `wake start` (issue #892) — not a WARNING per server on every wake."""
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, _ = build_wake(tmp_path, mcp_servers=["fetch", "playwright", "steel"])
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert " mcp_servers=fetch,playwright,steel" in _line(caplog, "wake start")
+
+
+def test_wake_start_carries_no_mcp_servers_when_none_is_active(platform, tmp_path, caplog):
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, _ = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert "mcp_servers=" not in _line(caplog, "wake start")  # absent, never empty
+
+
 def test_a_quiet_wake_reports_ok_with_nothing_posted(platform, tmp_path, caplog):
     serve_messages(platform, page(message(uuid=M0, body="hi", mine=True)))  # only its own post
     agent, provider = build_wake(tmp_path)

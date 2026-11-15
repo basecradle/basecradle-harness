@@ -51,7 +51,7 @@ import itertools
 from basecradle import BaseCradleError
 
 from basecradle_harness._idempotency import WEBHOOK_ENDPOINT
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import tool_failed, tool_target
 from basecradle_harness._platform import PlatformTool, explain
 
 # How many endpoints/events one `list` returns. The cap keeps a pathological
@@ -179,6 +179,7 @@ class WebhookEndpointsTool(PlatformTool):
         The one create whose duplicate would be quietly expensive rather than merely noisy: a second
         endpoint means a second secret ingest URL, and the sender only ever holds the first.
         """
+        tool_target("timeline", timeline)
         endpoint = self.context.client.timelines.get(timeline).webhook_endpoints.create(
             description=description, idempotency_key=key
         )
@@ -194,6 +195,7 @@ class WebhookEndpointsTool(PlatformTool):
         # Pull one past the cap so "there may be more" is only said when a
         # (DEFAULT_LIST_LIMIT + 1)th endpoint actually exists. The SDK filter is lazy
         # and paginating, so islice fetches only what it needs.
+        tool_target("timeline", timeline)
         endpoints = list(
             itertools.islice(
                 self.context.client.webhook_endpoints.filter(timeline=timeline),
@@ -208,6 +210,7 @@ class WebhookEndpointsTool(PlatformTool):
         return "Webhook endpoints on this timeline (newest first):\n" + "\n".join(lines)
 
     def _set_enabled(self, uuid: str, *, enabled: bool) -> str:
+        tool_target("webhook_endpoint", uuid)
         endpoint = self.context.client.webhook_endpoints.get(uuid)
         if enabled:
             endpoint.enable()
@@ -219,6 +222,7 @@ class WebhookEndpointsTool(PlatformTool):
         )
 
     def _rotate(self, uuid: str) -> str:
+        tool_target("webhook_endpoint", uuid)
         endpoint = self.context.client.webhook_endpoints.get(uuid)
         endpoint.rotate()
         return (
@@ -308,6 +312,7 @@ class WebhookEventsTool(PlatformTool):
 
     def _list(self, timeline: str, endpoint: str | None) -> str:
         # `filter` ignores a None endpoint, so this narrows only when one is given.
+        tool_target("timeline", timeline)
         events = list(
             itertools.islice(
                 self.context.client.webhook_events.filter(timeline=timeline, endpoint=endpoint),
@@ -323,6 +328,7 @@ class WebhookEventsTool(PlatformTool):
         return "Webhook events on this timeline (newest first):\n" + "\n".join(lines)
 
     def _read(self, uuid: str) -> str:
+        tool_target("webhook_event", uuid)
         event = self.context.client.webhook_events.get(uuid)
         content = event.content
         headers = "\n".join(f"  {key}: {value}" for key, value in content.headers.items())

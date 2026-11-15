@@ -1308,6 +1308,9 @@ class McpResolution:
             the model was never offered, so the model is told why rather than "no tool named".
         about: One block per active server that said something about itself or carries an
             operator's ``note`` (issue #553), for the brief's ``mcp`` part.
+        servers: Every active server, in load order, by the sanitized name its tools' names begin
+            with (``<server>__…``) — what the ``wake start`` line carries as ``mcp_servers``, the
+            journal's record that this agent runs beyond the safe-by-default tool set (issue #892).
     """
 
     tools: list[Tool] = field(default_factory=list)
@@ -1318,6 +1321,7 @@ class McpResolution:
     images: McpImageStore | None = None
     withheld: dict[str, str] = field(default_factory=dict)
     about: list[str] = field(default_factory=list)
+    servers: list[str] = field(default_factory=list)
 
 
 def _timeout_from_env() -> float:
@@ -1444,10 +1448,14 @@ def load_mcp_tools(
                 ", ".join(withheld),
             )
         resolution.clients.append(client)
+        resolution.servers.append(_sanitize(config.name))  # its tools' prefix: no `,` to split on
         atexit.register(client.close)
-        _log.warning(
-            "MCP server %r active: %d tool(s) loaded — this agent has extended beyond the "
-            "safe-by-default tool set.",
+        # A fact true on every wake is not a warning on every wake (issue #892): until then this
+        # line was 116 of one run's 140 WARNINGs and buried the 24 that meant something. Running
+        # beyond the safe-by-default set stays on the record, structured, as `wake start`'s
+        # `mcp_servers`; this INFO line keeps the per-server tool count beside it.
+        _log.info(
+            "MCP server %r active: %d tool(s) loaded, beyond the safe-by-default tool set.",
             config.name,
             loaded,
         )

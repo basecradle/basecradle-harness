@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import socket
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,12 @@ from basecradle_harness._system_prompt import SystemPromptEditTool
 from basecradle_harness._webfetch import WebFetchTool
 
 TIMELINE = "0191f3a4-7c11-7b5e-9a42-1d2e3f4a5b6c"
+
+
+@pytest.fixture(autouse=True)
+def _plain(monkeypatch):
+    """Lines read as bytes, without the verdict's color, so a field's neighbors can be asserted."""
+    monkeypatch.setenv("NO_COLOR", "1")
 
 
 class _Scripted(Tool):
@@ -134,6 +141,73 @@ def test_a_shipped_tool_tells_a_bad_call_from_a_platform_refusal(caplog):
     assert isinstance(result, str) and "not a viewer" in result
     assert line.endswith(" reason=platform_error")
     assert len(companions) == 1 and "not a viewer" in companions[0]
+    assert f" target=timeline:{TIMELINE} " in companions[0]
+
+
+MESSAGE = "0191f3a4-8d22-7c6f-8b53-2e3f4a5b6c7d"
+
+
+def test_a_failed_platform_read_names_what_it_asked_for(caplog):
+    """The platform's own text does not say which uuid it could not find, so the companion line
+    does (issue #892): two `messages` reads failed in a red-team run and nothing could say why."""
+
+    def missing(uuid):
+        raise BaseCradleError("No record exists for the given UUID.")
+
+    client = SimpleNamespace(messages=SimpleNamespace(get=missing))
+    result, line, companions = _run(_messages(client), caplog, action="read", uuid=MESSAGE)
+    assert result == "Couldn't read messages: No record exists for the given UUID."
+    assert line.endswith(" outcome=error reason=platform_error") and "target=" not in line
+    assert companions == [
+        (
+            f"tool name=messages target=message:{MESSAGE} error=\"Couldn't read messages: "
+            'No record exists for the given UUID."'
+        )
+    ]
+
+
+def test_an_uncaught_platform_error_still_names_its_target(caplog):
+    """A tool that lets the SDK's error escape (the assets tool) is marked by the engine, and the
+    target its run recorded still rides the companion."""
+    from basecradle_harness._assets import AssetsTool
+
+    def missing(uuid):
+        raise BaseCradleError("No record exists for the given UUID.")
+
+    tool = AssetsTool()
+    tool.bind(
+        PlatformContext(
+            client=SimpleNamespace(assets=SimpleNamespace(get=missing)), timeline=TIMELINE
+        )
+    )
+    _, line, companions = _run(tool, caplog, action="read", uuid=MESSAGE)
+    assert line.endswith(" reason=exception")
+    assert len(companions) == 1 and f" target=asset:{MESSAGE} " in companions[0]
+
+
+def test_a_target_is_never_written_when_the_run_succeeds(caplog):
+    message = SimpleNamespace(
+        content=SimpleNamespace(uuid=MESSAGE, body="hi"),
+        user=SimpleNamespace(handle="john"),
+        created_at="2026-11-14T21:38:00Z",
+    )
+    client = SimpleNamespace(messages=SimpleNamespace(get=lambda uuid: message))
+    _, line, companions = _run(_messages(client), caplog, action="read", uuid=MESSAGE)
+    assert "outcome=ok" in line and "target=" not in line
+    assert companions == []
+
+
+@pytest.mark.parametrize("command", ["yes", "printf 'abcdefghijklmnop'"])
+def test_past_the_output_cap_the_agent_gets_the_head_and_the_run_is_degraded(caplog, command):
+    """Past the shell output limit the agent gets the head, told it was cut and at what size, and
+    the line says `degraded` (issue #892). `yes` is still writing and is killed; the `printf` has
+    usually exited by the time the reader stops — a race, so both are the one verdict."""
+    shell = ShellTool(max_output=10, drain_timeout=2)
+    result, line, companions = _run(shell, caplog, command=command, timeout=30)
+    assert result.startswith(("y\ny\ny\ny\ny", "abcdefghij"))
+    assert "[output cut at 10 characters" in result
+    assert line.endswith(" outcome=degraded reason=output_limit")
+    assert companions == []  # nothing failed; the line's reason is the whole record
 
 
 def test_a_nonzero_exit_is_the_commands_answer_and_a_kill_is_a_failure(caplog):
@@ -174,11 +248,63 @@ def test_the_system_prompt_gate_marks_only_a_wrong_token(
     assert ("outcome=ok" in line) == (not marked)
 
 
-def test_a_fetched_error_status_is_a_failed_fetch(caplog):
+@pytest.fixture
+def public_dns(monkeypatch):
+    """`example.com` resolves to a public address, offline: the SSRF check resolves every host."""
+
+    def resolve(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+
+
+@pytest.mark.parametrize("status", [200, 404, 410, 503])
+def test_a_fetch_the_server_answered_is_ok_and_carries_the_status(caplog, public_dns, status):
+    """An answer is not a tool error (issue #892): a 404 is the far end's answer to the URL the
+    model chose, so the line is `ok`, the status is on it, and no WARNING is written — guessed URLs
+    stay countable, and a reader filtering for warnings sees only a fetch that broke."""
     with respx.mock() as mock:
-        mock.route(host="example.com").mock(return_value=httpx.Response(500))
-        _, line, _ = _run(WebFetchTool(), caplog, url="https://example.com/")
-    assert line.endswith(" reason=fetch_failed")
+        mock.route(host="example.com").mock(return_value=httpx.Response(status, text="body"))
+        result, line, companions = _run(WebFetchTool(), caplog, url="https://example.com/guess")
+    assert f" outcome=ok status={status}" in line and "reason=" not in line
+    assert companions == []
+    if status >= 400:  # what the model reads is unchanged
+        assert (
+            result
+            == f"The server returned HTTP {status} for https://example.com/guess. Nothing to read."
+        )
+
+
+def test_a_host_dns_says_does_not_exist_is_an_answer_too(caplog, monkeypatch):
+    def no_such_name(host, port, *args, **kwargs):
+        raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_such_name)
+    result, line, companions = _run(WebFetchTool(), caplog, url="https://no-such-host.example/")
+    assert (
+        result
+        == "Couldn't fetch 'https://no-such-host.example/': could not resolve host 'no-such-host.example'."
+    )
+    assert " outcome=ok status=nxdomain" in line and "reason=" not in line
+    assert companions == []
+
+
+def test_a_resolver_that_could_not_answer_is_still_a_failed_fetch(caplog, monkeypatch):
+    def try_again(host, port, *args, **kwargs):
+        raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+
+    monkeypatch.setattr(socket, "getaddrinfo", try_again)
+    _, line, companions = _run(WebFetchTool(), caplog, url="https://example.com/")
+    assert " outcome=error reason=fetch_failed" in line and "status=" not in line
+    assert len(companions) == 1 and "could not resolve host" in companions[0]
+
+
+def test_a_fetch_with_no_answer_is_an_error_with_no_status(caplog, public_dns):
+    with respx.mock() as mock:
+        mock.route(host="example.com").mock(side_effect=httpx.ConnectError("refused"))
+        _, line, companions = _run(WebFetchTool(), caplog, url="https://example.com/")
+    assert " outcome=error reason=transport" in line and "status=" not in line
+    assert len(companions) == 1
 
 
 def test_a_rejected_management_key_is_a_config_fault(caplog, monkeypatch):

@@ -64,7 +64,7 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._idempotency import ASSET
 from basecradle_harness._messages import FrameSampling, ImageContent, ToolResult, VideoContent
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import tool_failed, tool_target
 from basecradle_harness._platform import PlatformTool
 
 if TYPE_CHECKING:  # type-only: neither is a runtime dependency of this module
@@ -313,6 +313,7 @@ class AssetsTool(PlatformTool):
         # Pull one past the cap so "there may be more" is only said when a
         # (DEFAULT_LIST_LIMIT + 1)th asset actually exists — never on an exact 50.
         # The SDK filter is lazy and paginating, so islice fetches only what it needs.
+        tool_target("timeline", timeline)
         assets = list(
             itertools.islice(client.assets.filter(timeline=timeline), DEFAULT_LIST_LIMIT + 1)
         )
@@ -327,6 +328,7 @@ class AssetsTool(PlatformTool):
 
     def _read(self, uuid: str) -> str:
         client = self.context.client
+        tool_target("asset", uuid)
         asset = client.assets.get(uuid)
         file = asset.content.file
         meta = _describe(asset)
@@ -377,6 +379,7 @@ class AssetsTool(PlatformTool):
         a text-only model, says plainly they were described, not shown — issue #316).
         Claiming "looking at it now" here would promise vision the tool cannot verify.
         """
+        tool_target("asset", uuid)
         asset = self.context.client.assets.get(uuid)
         meta = _describe(asset)
         result = image_input(asset.content.file)
@@ -408,6 +411,7 @@ class AssetsTool(PlatformTool):
         """
         from basecradle_harness._video import DEFAULT_EVERY, clip_facts
 
+        tool_target("asset", uuid)
         asset = self.context.client.assets.get(uuid)
         meta = _describe(asset)
         sampling = FrameSampling(
@@ -433,6 +437,7 @@ class AssetsTool(PlatformTool):
         """
         from basecradle_harness._audio import MAX_AUDIO_BYTES, Transcriber
 
+        tool_target("asset", uuid)
         asset = self.context.client.assets.get(uuid)
         file = asset.content.file
         meta = _describe(asset)
@@ -741,6 +746,7 @@ def _upload(
     """
     buffer = io.BytesIO(data)
     buffer.name = filename
+    tool_target("timeline", timeline)
     return client.timelines.get(timeline).assets.create(
         file=buffer, description=description, idempotency_key=idempotency_key
     )
@@ -841,6 +847,7 @@ def resolve_uuid(client: Any, uuid: str, timeline: str) -> str | None:
     """
     if uuid.strip().lower() != "latest":
         return uuid
+    tool_target("timeline", timeline)
     newest = next(iter(client.assets.filter(timeline=timeline)), None)
     return newest.content.uuid if newest is not None else None
 

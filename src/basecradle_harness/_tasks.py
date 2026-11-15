@@ -58,7 +58,7 @@ from datetime import UTC, datetime, timedelta
 from basecradle import BaseCradleError
 
 from basecradle_harness._idempotency import TASK
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import tool_failed, tool_target
 from basecradle_harness._platform import PlatformTool, explain
 
 # How many tasks one `list` returns. The cap keeps a pathological timeline from
@@ -199,6 +199,7 @@ class TasksTool(PlatformTool):
         except ValueError as error:
             return tool_failed(f"Error: {error}", reason="invalid_arguments")
         client = self.context.client
+        tool_target("timeline", timeline)
         task = client.timelines.get(timeline).tasks.create(
             instructions=instructions, activate_at=when, idempotency_key=key
         )
@@ -212,6 +213,7 @@ class TasksTool(PlatformTool):
         # Pull one past the cap so "there may be more" is only said when a
         # (DEFAULT_LIST_LIMIT + 1)th task actually exists — never on an exact 50.
         # The SDK filter is lazy and paginating, so islice fetches only what it needs.
+        tool_target("timeline", timeline)
         tasks = list(
             itertools.islice(client.tasks.filter(timeline=timeline), DEFAULT_LIST_LIMIT + 1)
         )
@@ -226,6 +228,7 @@ class TasksTool(PlatformTool):
 
     def _read(self, uuid: str) -> str:
         client = self.context.client
+        tool_target("task", uuid)
         task = client.tasks.get(uuid)
         content = task.content
         return (
@@ -245,6 +248,7 @@ class TasksTool(PlatformTool):
         """
         client = self.context.client
         try:
+            tool_target("task", uuid)
             task = client.tasks.get(uuid)
             task.cancel()
         except BaseCradleError as error:

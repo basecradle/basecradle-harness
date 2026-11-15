@@ -1193,18 +1193,22 @@ class Engine:
         elapsed = (self._clock() - started).total_seconds()
         work = meter.fields() if meter is not None else {}
         failure = meter.failure if meter is not None else None
+        outcome = _outcome(reason)
         if reason is None and failure is not None:
             reason = _reason(failure) if isinstance(failure, ProviderError) else "exception"
             error = str(failure)
+            outcome = "error"
         elif reason is None and meter is not None and meter.verdict is not None:
-            reason, error = meter.verdict
+            outcome, reason, error = meter.verdict
         log_tool(
             name=name,
             executor=executor,
-            outcome=_outcome(reason),
+            outcome=outcome,
             seconds=elapsed,
             reason=reason,
             error=error,
+            status=meter.status if meter is not None else None,
+            target=meter.target if meter is not None else None,
             **work,
         )
 
@@ -1363,7 +1367,7 @@ def _step_action(reply: Message, extend: bool) -> str:
 
 
 def _outcome(reason: str | None) -> str:
-    """``ok`` or ``error`` — the one word a tool line's outcome field can carry."""
+    """``ok``, or ``error`` for a refusal the engine names itself (a tool's own verdict is its own)."""
     return "ok" if reason is None else "error"
 
 

@@ -48,7 +48,7 @@ from basecradle import BaseCradleError
 
 from basecradle_harness._governance import _resolve_user, _UserNotFound
 from basecradle_harness._idempotency import MESSAGE
-from basecradle_harness._observability import RED, head, kv, tool_failed
+from basecradle_harness._observability import RED, head, kv, tool_failed, tool_target
 from basecradle_harness._platform import PlatformTool, explain
 
 _log = logging.getLogger("basecradle_harness")
@@ -288,6 +288,7 @@ class MessagesTool(PlatformTool):
         client = self.context.client
         # The SDK filter is lazy and paginating; islice pulls one past the cap so
         # "there may be more" is only said when a (limit + 1)th message truly exists.
+        tool_target("timeline", timeline)
         messages = list(
             itertools.islice(client.messages.filter(timeline=timeline), DEFAULT_LIST_LIMIT + 1)
         )
@@ -301,6 +302,7 @@ class MessagesTool(PlatformTool):
     # --- read ----------------------------------------------------------------
 
     def _read(self, uuid: str) -> str:
+        tool_target("message", uuid)
         message = self.context.client.messages.get(uuid)
         return _message_line(message, preview=False)
 
@@ -333,6 +335,7 @@ class MessagesTool(PlatformTool):
         second one. It is the difference between a peer being answered once and being answered
         twice by an agent that cannot remember doing it.
         """
+        tool_target("timeline", timeline)
         message = self.context.client.timelines.get(timeline).messages.create(
             body=body, idempotency_key=key
         )

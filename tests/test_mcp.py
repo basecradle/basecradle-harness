@@ -10,6 +10,7 @@ policy filter, and the brief's safety section.
 
 import base64
 import json
+import logging
 import os
 import shlex
 import stat
@@ -158,6 +159,30 @@ def test_no_mcp_dir_yields_no_configs(tmp_path):
 
 
 # --- stdio end-to-end (the proof case) ----------------------------------------
+
+
+def test_an_active_server_is_named_for_wake_start_and_is_never_a_standing_warning(tmp_path, caplog):
+    """A fact true on every wake is not a warning on every wake (issue #892).
+
+    The per-server line was a WARNING on every wake, 116 of one run's 140, burying the warnings
+    that meant something. The fact stays on the record — the server, by its tools' sanitized prefix,
+    for the `wake start` line's `mcp_servers` — and its INFO line keeps the tool count.
+    """
+    script = _write_server_script(tmp_path)
+    _drop_config(tmp_path, "my fetch", {"command": sys.executable, "args": [str(script)]})
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        resolution = load_mcp_tools(tmp_path, timeout=10)
+    try:
+        assert resolution.servers == ["my_fetch"]  # the prefix of `my_fetch__echo`: no `,` inside
+        assert [t.name for t in resolution.tools] == ["my_fetch__echo"]
+        (active,) = [r for r in caplog.records if "active: 1 tool(s) loaded" in r.getMessage()]
+        assert active.levelname == "INFO"
+        assert "beyond the safe-by-default tool set" in active.getMessage()
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    finally:
+        for client in resolution.clients:
+            client.close()
 
 
 def test_stdio_server_tools_activate_and_call_round_trips(tmp_path):
@@ -1478,6 +1503,7 @@ def test_merge_mcp_tools_extends_set_and_carries_notices():
         images = McpImageStore()
         withheld = {"s__risky": "s__risky is withheld from you: because."}
         about = ["MCP server 's': about it"]
+        servers = ["s"]
 
     fake = _FakeMcpResolution()
     out = _merge_mcp_tools(base, fake)
@@ -1489,6 +1515,8 @@ def test_merge_mcp_tools_extends_set_and_carries_notices():
     # So are the withheld tools and each server's self-description (issue #553).
     assert out.withheld == fake.withheld
     assert out.mcp_about == fake.about
+    # And the active servers, which the `wake start` line names (issue #892).
+    assert out.mcp_servers == ["s"]
 
 
 def test_merge_mcp_tools_empty_is_noop():
@@ -1499,6 +1527,7 @@ def test_merge_mcp_tools_empty_is_noop():
         manifest = []
         skipped = []
         notices = []
+        servers = []
 
     assert _merge_mcp_tools(base, _Empty()) is base
 

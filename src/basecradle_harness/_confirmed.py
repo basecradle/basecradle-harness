@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 
 from basecradle import BaseCradleError
 
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import tool_failed, tool_target
 from basecradle_harness._platform import PlatformTool, explain
 
 if TYPE_CHECKING:
@@ -95,6 +95,7 @@ class ConfirmedTimelineAction(PlatformTool):
         if confirm != target:
             return self._refuse(target, confirm)
         try:
+            tool_target("timeline", target)
             subject = self.context.client.timelines.get(target)
             self._perform(subject)
         except BaseCradleError as error:
@@ -113,6 +114,7 @@ class ConfirmedTimelineAction(PlatformTool):
         still naming the consequence and the uuid to confirm with.
         """
         try:
+            tool_target("timeline", target)
             subject = self.context.client.timelines.get(target)
         except BaseCradleError as error:
             return tool_failed(
