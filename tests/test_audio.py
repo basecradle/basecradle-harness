@@ -17,6 +17,7 @@ import respx
 from basecradle import BaseCradle
 
 from basecradle_harness import AssetsTool, PlatformContext, PlatformError, Transcriber
+from tests._line_expectations import assert_priced_fee
 from tests.conftest import run_through_engine, tool_lines
 
 BC_URL = "https://basecradle.com"
@@ -345,6 +346,22 @@ def test_a_transcription_on_openai_is_priced_per_minute_of_audio(client, caplog)
     line = tool_lines(caplog)[0]
     assert line.endswith(" cost=0.00675 cost_basis=computed"), line
     assert "cost_gap" not in line  # a priced call names no gap (issue #880)
+
+
+def test_a_priced_transcription_meters_its_fee_with_no_gap():
+    """The meter the engine writes the run's `tool` line from: the shape the live gate reads a real
+    transcription with (issue #904)."""
+    from basecradle_harness._observability import tool_meter
+
+    base = "https://api.openai.com/v1"
+    body = {"text": TRANSCRIPT, "usage": {"type": "duration", "seconds": 90}}
+    with respx.mock(assert_all_called=True) as mock, tool_meter() as meter:
+        mock.post(f"{base}/audio/transcriptions").mock(return_value=httpx.Response(200, json=body))
+        Transcriber(api_key=FAKE_KEY, base_url=base).transcribe(
+            MP3_BYTES, "clip.mp3", "audio/mpeg", FAKE_KEY
+        )
+    fields = assert_priced_fee(meter.fields(), provider="openai", kind="audio.transcribe")
+    assert fields["cost"] == pytest.approx(90 / 60 * 0.0045)
 
 
 def test_the_default_listen_states_a_gap_once_per_wake(client, caplog, monkeypatch):

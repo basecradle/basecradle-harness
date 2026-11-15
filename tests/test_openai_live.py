@@ -55,6 +55,12 @@ import os
 import pytest
 
 from basecradle_harness import Message, OpenAIProvider
+from tests._line_expectations import (
+    assert_direct_call,
+    assert_priced_fee,
+    assert_server_tool_line,
+    fields_of,
+)
 
 pytestmark = pytest.mark.live
 
@@ -123,7 +129,7 @@ def test_the_live_line_names_the_call_by_openais_own_id(surface, prefix, caplog)
         line = next(
             r.getMessage() for r in caplog.records if r.getMessage().startswith("llm provider=")
         )
-        generation = _field(line, "generation_id") or ""
+        generation = fields_of(line).get("generation_id", "")
         assert generation.startswith(prefix), line
         if surface == "responses":
             assert provider._client.responses.retrieve(generation).id == generation
@@ -148,13 +154,6 @@ def _line(caplog, head):
     return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith(head))
 
 
-def _field(line, name):
-    for token in line.split():
-        if token.startswith(f"{name}="):
-            return token.split("=", 1)[1]
-    return None
-
-
 @pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
 def test_a_fleet_model_turn_logs_the_tables_arithmetic_as_its_cost(caplog):
     from basecradle_harness._observability import _money, capture_llm_call
@@ -173,9 +172,10 @@ def test_a_fleet_model_turn_logs_the_tables_arithmetic_as_its_cost(caplog):
     assert usage is not None and usage.input > 0 and usage.output > 0
     expected = call_cost(FLEET_MODEL, usage)
     assert expected is not None and _money(call.cost) == _money(expected)
-    line = _line(caplog, "llm provider=")
-    assert _field(line, "cost") is not None and _field(line, "cost_basis") == "computed", line
-    assert _field(line, "cost_gap") is None, line  # issue #878: a priced call names no gap
+    # The contract's shape of a priced direct call (`tests/_line_expectations.py`, issue #904).
+    assert_direct_call(
+        _line(caplog, "llm provider="), provider="openai", model=FLEET_MODEL, cost="computed"
+    )
 
 
 @pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
@@ -195,15 +195,21 @@ def test_a_web_search_logs_one_priced_line_per_search_call(caplog):
     finally:
         provider.close()
 
-    line = _line(caplog, "tool name=web_search executor=server provider=openai kind=search.web")
-    uses = int(_field(line, "count"))
-    assert uses >= 1
+    line = _line(caplog, "tool name=web_search ")
+    fields = assert_server_tool_line(
+        line,
+        name="web_search",
+        provider="openai",
+        model=FLEET_MODEL,
+        kind="search.web",
+        joins=fields_of(_line(caplog, "llm "))["generation_id"],
+        cost="computed",
+    )
     # $10 per 1,000 *search* actions; a page read (``open_page``) is a use and not a billed search.
-    searches = float(_field(line, "cost")) / 0.01
-    assert searches == pytest.approx(round(searches)) and 1 <= round(searches) <= uses, line
-    assert _field(line, "cost_basis") == "computed"
-    assert _field(line, "cost_gap") is None, line  # issue #880: a priced search names no gap
-    assert _field(line, "generation_id") == _field(_line(caplog, "llm "), "generation_id")
+    searches = float(fields["cost"]) / 0.01
+    assert searches == pytest.approx(round(searches)) and 1 <= round(searches) <= int(
+        fields["count"]
+    ), line
 
 
 @pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
@@ -262,8 +268,7 @@ def test_a_transcription_reports_the_duration_its_price_reads():
     # (issue #880).
     with tool_meter() as meter:
         Transcriber(api_key=KEY).transcribe(buffer.getvalue(), "tone.wav", "audio/wav", KEY)
-    fields = meter.fields()
-    assert fields["cost"] is not None and fields["cost_gap"] is None, fields
+    assert_priced_fee(meter.fields(), provider="openai", kind="audio.transcribe")
 
 
 @pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")

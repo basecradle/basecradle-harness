@@ -41,7 +41,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import uuid
 from pathlib import Path
 
@@ -50,6 +49,7 @@ from xai_sdk.chat import tool as xai_tool
 from xai_sdk.chat import user as xai_user
 
 from basecradle_harness import Message, ProviderToolSchemaError, ToolSpec, XaiSdkProvider
+from tests._line_expectations import fields_of
 
 pytestmark = pytest.mark.live
 
@@ -168,8 +168,8 @@ def test_a_bound_conversation_earns_the_per_server_cache_hit():
 
     llm = [line for line in records if line.startswith("llm ")]
     assert len(llm) == 2, llm
-    cached = int(re.search(r"cached_tokens=(\d+)", llm[1]).group(1))
-    tokens_in = int(re.search(r"tokens_in=(\d+)", llm[1]).group(1))
+    warm = fields_of(llm[1])
+    cached, tokens_in = int(warm.get("cached_tokens", 0)), int(warm["tokens_in"])
     # Not "> 0" — a scattered call gets that by luck. Affinity means most of the prefix comes back.
     assert cached > tokens_in * 0.5, f"cached={cached} of tokens_in={tokens_in}: {llm[1]}"
 
@@ -254,7 +254,6 @@ def test_the_live_line_names_the_call_by_xais_own_response_id(caplog):
     line = next(
         r.getMessage() for r in caplog.records if r.getMessage().startswith("llm provider=")
     )
-    found = re.search(r"\bgeneration_id=(\S+)", line)
-    assert found, line
-    generation = found.group(1)
+    generation = fields_of(line).get("generation_id")
+    assert generation, line
     assert str(uuid.UUID(generation)) == generation, line

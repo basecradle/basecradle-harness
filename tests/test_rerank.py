@@ -49,6 +49,7 @@ from basecradle_harness._rerank import (
     validated_picks,
 )
 from basecradle_harness._retry import RETRY_BUDGET_SECONDS
+from tests._line_expectations import assert_failed_call, assert_rerank_call
 from tests.conftest import is_retry
 
 # A fabricated OpenRouter endpoint and a correctly-shaped fake key — never a real credential.
@@ -588,6 +589,8 @@ def test_the_rerank_line_is_the_shared_llm_line_carrying_purpose_memory(router, 
     assert "purpose=memory" in message and "kind=rerank" in message
     assert "purpose=mempalace" not in message  # the software is never a category
     assert "reason=" not in message  # a clean call names no fault
+    # The contract's shape of the line, which the live gate reads the router's own with (#904).
+    assert_rerank_call(message, provider="openrouter", model=MODEL, pool=20, picked=8)
     # The head, byte-for-byte as the dashboard anchors on it. Asserted against the **rendered**
     # record, because the NOC's gate carries a leading space that only the level prefix supplies —
     # a test reading `record.getMessage()` would pass on a line the dashboard cannot see.
@@ -815,6 +818,14 @@ def test_a_provider_fault_is_classified_and_logged_at_its_class(
 
     assert [hit["text"] for hit in chosen] == ["memory 1", "memory 2"]  # always falls back
     assert _reason_of(caplog.records) == (level, reason)
+    assert_failed_call(
+        llm_lines(caplog.records)[0].getMessage(),
+        provider="openrouter",
+        purpose="memory",
+        kind="rerank",
+        model=MODEL,
+        reason=reason,
+    )
 
 
 def test_a_timeout_is_distinguished_from_a_transport_failure(router, caplog):

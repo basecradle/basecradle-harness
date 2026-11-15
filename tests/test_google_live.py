@@ -43,7 +43,8 @@ from basecradle_harness import (
 from basecradle_harness._describer import VIDEO_PART_LABELS, describer_from_env
 from basecradle_harness._google import GoogleProvider
 from basecradle_harness._google_rates import Usage, call_cost
-from basecradle_harness._observability import ComputedCost, _money, tool_meter
+from basecradle_harness._observability import _money, tool_meter
+from tests._line_expectations import assert_direct_call, assert_priced_fee
 
 pytestmark = pytest.mark.live
 
@@ -79,10 +80,6 @@ def _llm_line(caplog) -> str:
     return lines[-1]
 
 
-def _field(line: str, key: str) -> str | None:
-    return next((f.split("=", 1)[1] for f in line.split() if f.startswith(f"{key}=")), None)
-
-
 @needs_key
 def test_a_real_turn_answers_and_its_line_says_what_happened(caplog):
     with _provider() as provider, caplog.at_level(logging.INFO, logger="basecradle_harness"):
@@ -90,16 +87,14 @@ def test_a_real_turn_answers_and_its_line_says_what_happened(caplog):
             [Message.system("Answer in one short sentence."), Message.user("Say hello.")]
         )
     assert reply.role == "assistant" and reply.content
-    line = _llm_line(caplog)
-    assert _field(line, "provider") == "google"
-    # `residency` is where Vertex ran the call; `endpoint` is a router's serving upstream only, so
-    # a direct call carries none (docs/telemetry.md → `llm`; the move landed in 0.168.0, #759).
-    assert _field(line, "residency") == LOCATION, line
-    assert _field(line, "endpoint") is None, line
-    assert _field(line, "model") == MODEL
-    assert int(_field(line, "tokens_in")) > 0 and int(_field(line, "tokens_out")) > 0
-    assert _field(line, "generation_id")
-    assert provider.last_tokens_in == int(_field(line, "tokens_in"))
+    # The contract's shape (`tests/_line_expectations.py`, issue #904): `residency` is where Vertex
+    # ran the call, and a direct call names no `endpoint`.
+    fields = assert_direct_call(
+        _llm_line(caplog), provider="google", model=MODEL, residency=LOCATION, cost="computed"
+    )
+    assert int(fields["tokens_in"]) > 0 and int(fields["tokens_out"]) > 0, fields
+    assert fields.get("generation_id"), fields  # Vertex names the call it answered
+    assert provider.last_tokens_in == int(fields["tokens_in"])
 
 
 @needs_key
@@ -110,17 +105,16 @@ def test_the_cost_is_the_tables_arithmetic_over_what_vertex_reported(caplog):
     with _provider() as provider, caplog.at_level(logging.INFO, logger="basecradle_harness"):
         provider.chat([Message.user("Name one colour.")])
     line = _llm_line(caplog)
-    cost = _field(line, "cost")
-    assert cost is not None, line
-    tokens_in, tokens_out = int(_field(line, "tokens_in")), int(_field(line, "tokens_out"))
-    cached = int(_field(line, "cached_tokens") or 0)
+    fields = assert_direct_call(
+        line, provider="google", model=MODEL, residency=LOCATION, cost="computed"
+    )
+    tokens_in, tokens_out = int(fields["tokens_in"]), int(fields["tokens_out"])
+    cached = int(fields.get("cached_tokens", 0))
     expected = call_cost(MODEL, LOCATION, Usage(prompt=tokens_in, cached=cached, output=tokens_out))
     # Compared as the line renders it (`_money`: eight decimals, trailing zeros trimmed), never as
     # an unrounded float — a sub-cent call's figure is rounded on the line, so `approx` against the
     # raw arithmetic failed on exactly the cheap calls this model makes (found running #655's gate).
-    assert expected is not None and cost == _money(expected), line
-    assert _field(line, "cost_basis") == "computed", line
-    assert _field(line, "cost_gap") is None, line  # issue #878: a priced call names no gap
+    assert expected is not None and fields["cost"] == _money(expected), line
 
 
 @needs_key
@@ -322,15 +316,17 @@ def test_a_search_is_grounded_cited_and_priced(caplog):
     ):
         answer = provider.search("Who won the most recent FIFA World Cup final?")
     assert "\n\nSources:\n- " in answer, answer
-    llm = _llm_line(caplog)
-    assert _field(llm, "purpose") == "helper" and _field(llm, "kind") == "search.grounding", llm
-    assert _field(llm, "cost") is not None and _field(llm, "cost_basis") == "computed", llm
-    assert _field(llm, "cost_gap") is None, llm  # issue #878: a priced call names no gap
+    assert_direct_call(
+        _llm_line(caplog),
+        provider="google",
+        model=MODEL,
+        residency=LOCATION,
+        purpose="helper",
+        kind="search.grounding",
+        cost="computed",
+    )
     # The fee rides the `web_search` tool's own line, through the meter the engine opens (#758).
-    fee = meter.fields()
-    assert (fee["provider"], fee["kind"]) == ("google", "search.grounding"), fee
+    fee = assert_priced_fee(meter.fields(), provider="google", kind="search.grounding")
     queries = fee["count"]
-    assert queries >= 1, fee
+    assert queries >= 1, fee  # a grounded answer ran at least one query
     assert fee["cost"] == pytest.approx(queries * 0.014), fee
-    assert isinstance(fee["cost"], ComputedCost), fee
-    assert fee["cost_gap"] is None, fee  # a priced search names no gap (issue #880)

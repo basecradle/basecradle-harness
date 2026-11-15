@@ -44,6 +44,8 @@ from basecradle_harness import (
 from basecradle_harness._engine import _TRANSIENT
 from basecradle_harness._openrouter import _diagnostics, _pinned_slugs, _routable
 from basecradle_harness._retry import connection_reason
+from tests._line_expectations import assert_routed_call, assert_server_tool_line
+from tests.conftest import tool_lines
 
 # A fabricated OpenRouter endpoint + a correctly-shaped fake key. The SDK posts to
 # ``<server_url>/chat/completions`` — verified against the real 0.11.3 SDK.
@@ -838,6 +840,34 @@ def test_the_line_names_the_upstream_that_actually_served_the_call(router, caplo
     assert "endpoint=StreamLake" in line
     assert "cached_tokens=238277" in line  # the cache is working, or it isn't — no more inferring
     assert "cost=0.0445" in line  # OpenRouter's own figure, not harness arithmetic
+
+
+def test_a_routed_call_and_its_search_are_the_contracts_shapes(router, caplog):
+    """A routed call whose router also ran a web search: the `llm` line names the serving upstream
+    and the router's own cost, and the search is a counted `tool` line joined to it by its id. The
+    shapes the live gate reads OpenRouter's own lines with (issue #904)."""
+    import logging
+
+    body = completion(content="Hi.")
+    body["openrouter_metadata"] = _routing_metadata("StreamLake", "Novita")
+    body["usage"] |= {"cost": 0.0445, "server_tool_use_details": {"web_search_requests": 2}}
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider(builtin_tools=["web_search"]).chat([Message.user("news?")])
+
+    fields = assert_routed_call(_llm_line(caplog), provider="openrouter", model=MODEL)
+    assert (fields["endpoint"], fields["cost"]) == ("StreamLake", "0.0445")
+    (search,) = tool_lines(caplog)
+    assert_server_tool_line(
+        search,
+        name="web_search",
+        provider="openrouter",
+        model=MODEL,
+        kind="search.web",
+        joins=fields["generation_id"],
+        cost=None,  # the router folds the searches' fee into its `usage.cost`
+    )
 
 
 def test_a_byok_call_logs_the_upstream_cost_through_the_typed_sdk(router, caplog):

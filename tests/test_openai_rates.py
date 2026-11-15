@@ -30,6 +30,7 @@ from basecradle_harness._openai_rates import (
     usage_of,
     web_search_cost,
 )
+from tests._line_expectations import assert_direct_call, assert_server_tool_line, fields_of
 from tests.conftest import (
     FAKE_KEY,
     out_code_interpreter_call,
@@ -262,6 +263,8 @@ def test_a_gpt_6_sol_brain_call_logs_a_computed_cost(router, sol, caplog):
         r"generation_id=resp-fake0001",
         plain(line),
     ), line
+    # The contract's shape of the line, which the live gate reads OpenAI's own with (#904).
+    assert_direct_call(line, provider="openai", model="gpt-6-sol", cost="computed")
     assert not tool_lines(caplog)
 
 
@@ -276,6 +279,16 @@ def test_a_web_search_is_a_server_tool_line_carrying_its_fee(router, sol, caplog
             "count=2 outcome=ok cost=0.02 cost_basis=computed generation_id=resp-fake0001"
         )
     ]
+    (llm,) = _lines(caplog, "llm ")
+    assert_server_tool_line(
+        tool_lines(caplog)[0],
+        name="web_search",
+        provider="openai",
+        model="gpt-6-sol",
+        kind="search.web",
+        joins=fields_of(llm)["generation_id"],
+        cost="computed",
+    )
 
 
 def test_a_page_read_is_a_use_and_not_a_billed_search(router, sol, caplog):

@@ -60,6 +60,7 @@ from basecradle_harness._refuseless_pricing import usage_of as listed_usage
 from basecradle_harness._resolve import resolve_stems
 from basecradle_harness._wake import _cost_report
 
+from ._line_expectations import assert_direct_call
 from .conftest import completion, out_message, plain
 
 VENDOR = "refuseless"
@@ -574,6 +575,9 @@ def test_a_wake_sends_the_call_and_one_list_read_with_the_agents_key_and_nothing
             assert field not in body
     llm = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
     assert all("cost=0.00022" in line and "cost_basis=computed" in line for line in llm)
+    # The contract's shape of each line, which the live gate reads the vendor's own with (#904).
+    for line in llm:
+        assert_direct_call(line, provider=VENDOR, model=MODEL, cost="computed")
 
 
 def test_a_responses_wake_sends_the_responses_call_and_nothing_vendor_specific(
@@ -616,6 +620,8 @@ def test_a_responses_wake_sends_the_responses_call_and_nothing_vendor_specific(
     llm = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
     assert len(llm) == 2
     assert all("cost=0.00000968" in line and "cost_basis=computed" in line for line in llm)
+    for line in llm:
+        assert_direct_call(line, provider=VENDOR, model=MODEL, cost="computed")
 
 
 # --- one list per credential per wake, however many adapters read it -----------------------------

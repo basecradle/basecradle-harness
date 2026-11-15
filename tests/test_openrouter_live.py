@@ -58,6 +58,13 @@ import pytest
 
 from basecradle_harness import Message, OpenRouterProvider
 
+from ._line_expectations import (
+    assert_failed_call,
+    assert_rerank_call,
+    assert_routed_call,
+    assert_server_tool_line,
+    fields_of,
+)
 from .conftest import is_retry, plain
 
 pytestmark = pytest.mark.live
@@ -119,10 +126,6 @@ def _llm_line(caplog) -> str:
     )
 
 
-def _field(line: str, key: str) -> str | None:
-    return next((f.split("=", 1)[1] for f in line.split() if f.startswith(f"{key}=")), None)
-
-
 def _live_pool(provider: OpenRouterProvider) -> set[str]:
     """Every upstream that actually serves this model, straight from OpenRouter's endpoints API."""
     author, _, slug = MODEL.partition("/")
@@ -155,14 +158,13 @@ def test_the_live_endpoint_is_a_real_member_of_the_models_pool(caplog):
     finally:
         provider.close()
 
-    line = _llm_line(caplog)
-    endpoint = _field(line, "endpoint")
-    assert endpoint, f"the live response named no serving upstream: {line}"
+    # The contract's shape (`tests/_line_expectations.py`, issue #904): a serving upstream named,
+    # and the router's own cost stated.
+    endpoint = assert_routed_call(_llm_line(caplog), provider="openrouter", model=MODEL)["endpoint"]
     assert endpoint in pool, (
         f"endpoint={endpoint!r} serves no {MODEL} endpoint — a fabricated routing datum, the exact "
         f"defect of issue #280. Real pool: {sorted(pool)}"
     )
-    assert "cost=" in line, f"the live usage block reported no cost: {line}"
 
 
 @pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
@@ -198,7 +200,8 @@ def test_the_live_endpoint_stays_real_when_a_server_side_search_runs(caplog):
     finally:
         provider.close()
 
-    endpoint = _field(_llm_line(caplog), "endpoint")
+    llm = assert_routed_call(_llm_line(caplog), provider="openrouter", model=MODEL)
+    endpoint = llm["endpoint"]
     assert endpoint in pool, (
         f"endpoint={endpoint!r} with a server-side search active — issue #280 exactly: the search "
         f"tool's upstream logged as the model's. Real pool: {sorted(pool)}"
@@ -206,12 +209,18 @@ def test_the_live_endpoint_stays_real_when_a_server_side_search_runs(caplog):
     # The searches OpenRouter reports running (``server_tool_use_details``) are a `tool` line beside
     # the call's `llm` line, joined to it by the call's id (issue #758) — checked against the wire.
     tools = [
-        m
-        for m in (r.getMessage() for r in caplog.records)
-        if m.startswith("tool name=web_search executor=server provider=openrouter ")
+        m for m in (r.getMessage() for r in caplog.records) if m.startswith("tool name=web_search ")
     ]
-    assert len(tools) == 1 and int(_field(tools[0], "count")) >= 1, tools
-    assert _field(tools[0], "generation_id") == _field(_llm_line(caplog), "generation_id")
+    assert len(tools) == 1, tools
+    assert_server_tool_line(
+        tools[0],
+        name="web_search",
+        provider="openrouter",
+        model=MODEL,
+        kind="search.web",
+        joins=llm["generation_id"],
+        cost=None,  # the router folds the searches' fee into its `usage.cost`
+    )
 
 
 def _generation(provider: OpenRouterProvider, generation: str):
@@ -252,16 +261,16 @@ def test_the_live_generation_id_is_the_one_openrouter_looks_the_call_up_by(caplo
     try:
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
             provider.chat([Message.user("Say hi.")])
-        line = _llm_line(caplog)
-        generation = _field(line, "generation_id")
-        assert generation and generation.startswith("gen-"), line
+        line = assert_routed_call(_llm_line(caplog), provider="openrouter", model=MODEL)
+        generation = line.get("generation_id", "")
+        assert generation.startswith("gen-"), line
         record = _generation(provider, generation)
     finally:
         provider.close()
 
     assert record.id == generation
     assert record.model.startswith(MODEL), record.model
-    assert record.provider_name == _field(line, "endpoint"), (record.provider_name, line)
+    assert record.provider_name == line["endpoint"], (record.provider_name, line)
 
 
 @pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
@@ -374,18 +383,17 @@ def test_the_live_reranker_picks_and_reports_what_it_cost(caplog):
         reranker.close()
 
     line = _rerank_line(caplog)
-    assert _field(line, "outcome") == "ok", f"the live rerank fell back: {line}"
+    assert fields_of(line)["outcome"] == "ok", f"the live rerank fell back: {line}"
+    # The contract's shape (`tests/_line_expectations.py`, issue #904): `purpose=memory
+    # kind=rerank`, the pool it was shown and what it picked, a serving upstream, a stated cost.
+    # The routing pin was honored: `only` is the hard restriction (`allow_fallbacks: true` lets
+    # OpenRouter retry *inside* this list, issue #468, never outside it), so a served call is a
+    # call one of these endpoints served.
+    fields = assert_rerank_call(line, provider="openrouter", model=RERANK_MODEL, pool=5, picked=1)
     # The ranking, not the plumbing: the answer is the fourth candidate, below a top-3 cut.
     assert chosen[0]["text"].endswith("api.staging.example.com"), line
-    assert _field(line, "picked") == "1"
-    assert _field(line, "pool") == "5"
     # A *value*, not a presence: a cost field that renders `0` is a spend series that reads free.
-    cost = _field(line, "cost")
-    assert cost and float(cost) > 0, f"the live usage block reported no cost: {line}"
-    # The routing pin was honored. `only` is the hard restriction — `allow_fallbacks: true` lets
-    # OpenRouter retry *inside* this list (issue #468), never outside it — so a served call is a
-    # call one of these endpoints served.
-    assert _field(line, "endpoint"), f"the live response named no serving upstream: {line}"
+    assert float(fields["cost"]) > 0, f"the live usage block reported no cost: {line}"
 
 
 @pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
@@ -417,10 +425,14 @@ def test_a_live_rerank_against_a_nonexistent_model_is_config_class(caplog):
     assert [hit["text"] for hit in chosen] == ["a", "b"]
     record = _rerank_record(caplog)
     assert record.levelno == logging.ERROR, record.getMessage()
-    assert _field(
+    fields = assert_failed_call(
         record.getMessage(),
-        "reason",
-    ).startswith("config:"), record.getMessage()
+        provider="openrouter",
+        purpose="memory",
+        kind="rerank",
+        model="z-ai/glm-does-not-exist-5.3",
+    )
+    assert fields["reason"].startswith("config:"), record.getMessage()
 
 
 #: A regional host for the one refusal only a regional host can give. The configured one when it is
@@ -473,8 +485,13 @@ def test_a_live_provider_list_the_pool_cannot_serve_names_its_cause(caplog):
         caplog, model=RERANK_MODEL, providers=("no-such-endpoint",), base_url=BASE_URL
     )
     assert record.levelno == logging.ERROR, record.getMessage()
-    assert _field(plain(record.getMessage()), "reason") == "config:no_allowed_providers", (
-        record.getMessage()
+    assert_failed_call(
+        record.getMessage(),
+        provider="openrouter",
+        purpose="memory",
+        kind="rerank",
+        model=RERANK_MODEL,
+        reason="config:no_allowed_providers",
     )
 
 
@@ -492,10 +509,17 @@ def test_a_live_model_with_no_endpoint_in_the_region_names_its_cause(caplog):
         caplog, model=OUT_OF_REGION_MODEL, providers=("alibaba",), base_url=REGIONAL_BASE_URL
     )
     message = plain(record.getMessage())
-    assert _field(message, "outcome") == "failed", (
+    assert fields_of(message)["outcome"] == "failed", (
         f"{OUT_OF_REGION_MODEL} was served at {REGIONAL_BASE_URL}: it has gained an endpoint in "
         f"the region, so pick a model that has none. {message}"
     )
     assert record.levelno == logging.ERROR, message
-    assert _field(message, "reason") == "config:no_region_endpoint", message
+    assert_failed_call(
+        message,
+        provider="openrouter",
+        purpose="memory",
+        kind="rerank",
+        model=OUT_OF_REGION_MODEL,
+        reason="config:no_region_endpoint",
+    )
     assert not [r for r in caplog.records if is_retry(r.getMessage())]
