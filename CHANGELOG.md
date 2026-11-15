@@ -7,6 +7,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.197.0] - 2026-11-15
+
+### Added: `--resolved-config` reports the step limit, `max_steps` (issue #908)
+
+- **`max_steps`** is the operator's `HARNESS_MAX_STEPS` override as an integer, or `null` when it is unset or blank (the agent then runs the shipped 24), reported the way `max_context_tokens` is. The override and not the effective budget, so the NOC, which now writes the step limit per agent, compares what it wrote against what the box reads without restating the harness's default. Before, the value was written and never audited: a hand edit on a box, or a render that silently stopped, read green.
+- **A malformed or non-positive value fails the report** as it fails a wake, with the same words: the wake and the report share one parse (`_max_steps_override_from_env`).
+
 ## [0.196.0] - 2026-11-15
 
 ### Changed: The `google-genai` extra admits 3.x, and the Vertex API version is the adapter's own (issue #901)

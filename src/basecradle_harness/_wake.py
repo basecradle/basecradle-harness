@@ -113,6 +113,7 @@ from basecradle_harness._basecradle import (
     _max_context_tokens_from_env,
     _max_output_tokens_from_env,
     _max_steps_from_env,
+    _max_steps_override_from_env,
     _messages_since,
     _onboard_from_env,
     _parse_created_at,
@@ -6026,6 +6027,11 @@ def resolved_config() -> dict[str, object]:
       would be a guess — and a guessed field in the file the drift audit trusts is worse than an
       absent one. The wake logs the resolved limit and its source (``context limit limit=… limit_source=…``)
       on the run that actually resolves it.
+    - ``max_steps`` — the operator's per-turn step-budget override (`HARNESS_MAX_STEPS`; issue
+      #908) as an integer, or ``null`` when unset or blank, when the engine runs the shipped
+      `DEFAULT_MAX_STEPS`. The override and not the effective budget, so the NOC compares what it
+      wrote against what the box reads without restating the harness's default. A malformed or
+      non-positive value fails this report as it fails a wake, with the wake's own words.
     - ``max_output_tokens`` — the most one brain attempt may write (issue #788): the cap in
       ``model_params.json`` when it names one (at the top level or in ``extra_body``), else
       `HARNESS_MAX_OUTPUT_TOKENS`, else the shipped 32,768. ``null`` only when the operator's own
@@ -6079,6 +6085,7 @@ def resolved_config() -> dict[str, object]:
         **_cost_report(provider_name, sdk, os.environ.get("AI_MODEL") or ""),
         "active_profile": profile_name,
         "max_context_tokens": _max_context_tokens_from_env(),
+        "max_steps": _max_steps_override_from_env(),
         "max_output_tokens": _reported_output_cap(model_params),
         "wake_breaker_max": breaker_max,
         "wake_breaker_window": breaker_window if breaker_max > 0 else None,
