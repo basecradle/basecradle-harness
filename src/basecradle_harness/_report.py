@@ -83,14 +83,23 @@ _PAYLOAD_TOO_LARGE = "payload_too_large"
 _CONTEXT_LENGTH = "context_length"
 _OUT_OF_FUNDS = "out_of_funds"
 
-#: How a raw provider label (``AI_PROVIDER`` / the adapter's ``provider``) reads in a peer-facing
-#: notice. An unknown label passes through unchanged rather than being mangled.
+#: Every Provider's display name, keyed by the slug its log lines carry (issue #889, @origin's ruling
+#: of 2026-11-14): the vendor's own casing (``xAI``, ``OpenAI``, ``Refuseless``), never a lowercase
+#: slug and never forced Title Case. The slug stays the machine identifier on every line; this is
+#: how a person reads it — in a peer-facing notice here, and on the NOC's by-Provider charts, whose
+#: label map is a copy of this table. ``tests/test_telemetry_contract.py`` fails when a slug the
+#: harness can put on a line has no entry, so a new Provider lands with its name in the same change.
+#: The slugs with none, and why, are that test's ``NO_DISPLAY_NAME``. A generic vendor (any other
+#: ``AI_PROVIDER`` slug) has no entry by construction, because the harness knows nothing about it,
+#: and passes through unchanged rather than being mangled.
 _PROVIDER_LABELS = {
     "xai": "xAI",
     "openai": "OpenAI",
     "openrouter": "OpenRouter",
     "google": "Google",
     "anthropic": "Anthropic",
+    "refuseless": "Refuseless",
+    "mempalace": "MemPalace",
 }
 
 

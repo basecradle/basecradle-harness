@@ -15,6 +15,13 @@ The invariants live in `CLAUDE.md` → "Architecture — The Spine" (decision 3)
 
 **The surface contract** (issue #163) — one SDK can speak a provider in more than one wire surface, so each adapter declares its own `SURFACES` + `DEFAULT_SURFACE` (`openai` → `("responses","chat")`/`responses`; `xai-sdk` → `("native",)`/`native`). `AI_SDK_SURFACE` **omitted → the active adapter's `DEFAULT_SURFACE`**; **provided → validated against its `SURFACES`, hard-fail otherwise** (`_resolve_surface`) — one rule catching both a typo and a surface set on a single-surface SDK. Single-surface SDKs never set it.
 
+**A new Provider lands with its slug and its display name in the same change** (issue #889, @origin's ruling of 2026-11-14). This is a step of adding any adapter, known vendor, or tool or charge that names a vendor, and it has two halves that are never merged:
+
+- **The slug** is the machine identifier every consumer joins on: lowercase, `^[a-z0-9._-]+$` (`_basecradle._PROVIDER_SLUG`, `docs/telemetry.md` → Identifiers), on every `provider=` the harness writes. A configured value outside it, capitals included, is refused by `normalize_provider`, never folded.
+- **The display name** is the vendor's own casing (`xAI`, `OpenAI`, `Refuseless`), never the slug and never forced Title Case, in `_report._PROVIDER_LABELS`. The NOC's by-Provider charts copy that table, so a missing entry puts the slug on a chart.
+
+`tests/test_telemetry_contract.py` assembles every slug the harness can write (`KNOWN_PROVIDERS`, every slug the code spells, every rendered line's) and fails when one has neither an entry nor a stated reason in `NO_DISPLAY_NAME`; run it before opening the PR. A generic vendor has no display name by construction, because the harness knows nothing about it.
+
 **xAI has two supported cells.** `AI_PROVIDER=xai` + `AI_SDK=xai-sdk` is the native gRPC path (the end-state brain of the Home Fleet's Grok-brained members — `@eddie-murphy`, `@pinky`, `@the-brain`). `AI_PROVIDER=xai` + `AI_SDK=openai` reaches `grok-4.3` through the real `openai` SDK pointed at `api.x.ai`, over the `responses` *or* `chat` surface — a permanent matrix option, not a shim (the old hand-rolled `httpx` `OpenAIResponsesProvider` is **deleted**). **web_search wiring diverges by endpoint vendor:** OpenAI's Responses runs it from a `tools:[{type:"web_search"}]` entry; xAI runs Live Search from a top-level **`search_parameters`** body field and rejects the OpenAI entry — so under `AI_PROVIDER=xai` the active `web_search`/`x_search` built-ins translate to `search_parameters` (native → a proto; openai-at-xAI → `extra_body`). Build history: `docs/harness-internals.md`.
 
 

@@ -46,8 +46,8 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 
 | Field | Meaning |
 |---|---|
-| `provider` | Who did the work. On a model call or a tool, the vendor that bills it (`AI_PROVIDER`'s value for the brain); on a memory line, the memory system's software (`mempalace`). Software never names a head (issue #485); it appears only here. |
-| `model` | The vendor's model id the work ran on, exactly as configured. |
+| `provider` | Who did the work. On a model call or a tool, the vendor that bills it (`AI_PROVIDER`'s value for the brain); on a memory line, the memory system's software (`mempalace`). Software never names a head (issue #485); it appears only here. Always a lowercase slug, `^[a-z0-9._-]+$`, and never a display name (see [Identifiers](#identifiers)). |
+| `model` | The vendor's model id the work ran on, exactly as configured. No grammar of the harness's own (see [Identifiers](#identifiers)). |
 | `timeline` | The uuid of the BaseCradle timeline the work is for. |
 | `item` | The uuid of the message or task a wake is working. |
 | `delivery` | The router's delivery id that spawned the wake (`BASECRADLE_DELIVERY_ID`); absent when the wake was not spawned by a router. |
@@ -67,6 +67,17 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 | `threshold` | The configured level the head's decision compares against. |
 | `limit` | The model's context ceiling in tokens. |
 | `held` | How long something was held, in seconds. |
+
+### Identifiers
+
+Three values are identifiers a consumer joins on: a price table, a label map, a NOC column. Each has a grammar the harness guarantees, or the page says it has none. An identifier is a machine token and never a display name; how a person reads one is a layer of its own (@origin, 2026-11-14, issue #889).
+
+| Identifier | What It Is | What a Consumer May Rely On |
+|---|---|---|
+| `provider` | The vendor that bills the work, or the memory software (Common Fields). The brain's value is `AI_PROVIDER`; a describer's own stack's is `HARNESS_DESCRIBER_PROVIDER`; every other value is a slug in the harness's code. | Always a lowercase slug, `^[a-z0-9._-]+$`. A configured value outside it, capitals included, is refused wherever the configuration is read to run or resolve the agent (`_basecradle.normalize_provider`: a wake, `--resolved-config` and `basecradle-harness-resolve` exit nonzero, a describer is `config:invalid_provider`), never folded and never run. The installer and `basecradle-harness-verify` still fold case when they compare a provider against the overlay's declaration; neither runs the agent. Every value the harness writes itself is held to it by `tests/test_telemetry_contract.py`. |
+| Provider display name | How a person reads a `provider`: the vendor's own casing (`xAI`, `OpenAI`, `OpenRouter`, `Refuseless`, `MemPalace`), never a lowercase slug and never forced Title Case. | One table, `_report._PROVIDER_LABELS`, keyed by slug. It never appears on a line. Every slug the harness can write has an entry or a stated reason it has none (`tests/test_telemetry_contract.py`'s `NO_DISPLAY_NAME`), so a new Provider lands with its name in the same change. A generic vendor (an `AI_PROVIDER` the harness does not know) has no entry, because the harness knows nothing about it, and reads as its slug. |
+| `model` | The vendor's own id for the model, passed through exactly as configured (`AI_MODEL`, or a second model's own setting). The harness never rewrites it. | It is the id the vendor was sent, byte for byte, so it joins against the vendor's own model list and the harness's rate tables. **No grammar is guaranteed**: the namespace is the vendor's, and some vendors publish ids with capitals or a `:` variant suffix. Every id in the fleet's inventory today (2026-11-15) is lowercase `[a-z0-9._/-]`; that is an observation, not a rule this harness enforces. |
+| A tool's `name` | The name the agent was offered the tool under: a harness tool's own name (`messages`, `web_fetch`), the harness name of a vendor's server-side capability, or an MCP tool's `<server>__<tool>`, built from the server's name in the agent's configuration (`mcp/<server>.json`, or the key of its `mcpServers` wrapper) and the tool name the server reports. | `^[A-Za-z0-9_-]{1,64}$`, the function-name grammar the model vendors require, for every tool the harness ships (tested) and every MCP tool, which is sanitized and cut to it by construction (`_mcp.mcp_tool_name`) with the server's own case kept, so it is not guaranteed lowercase. A tool an operator drops into `tools/` names itself: the harness does not check it, and a vendor refuses a name outside the grammar. On an `unknown_tool` refusal the `name` is whatever the model called, so it has no grammar there. An MCP server's name has no field of its own; it reaches a line only inside a tool's `name`. |
 
 ### Credential Scrubbing
 
@@ -282,7 +293,7 @@ The describer answering again from its once-per-wake memo instead of calling a m
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
-| `name` | The tool's name as the agent knows it (`messages`, `generate_image`, `web_search`, `web_fetch`, `code_execution`, an MCP tool's name). A server-side tool carries the harness name of the capability, not the vendor's internal block type. | The engine; an adapter for a server-side tool. | Never. |
+| `name` | The tool's name as the agent knows it (`messages`, `generate_image`, `web_search`, `web_fetch`, `code_execution`, an MCP tool's name). A server-side tool carries the harness name of the capability, not the vendor's internal block type. Its grammar is in [Identifiers](#identifiers). | The engine; an adapter for a server-side tool. | Never. |
 | `executor` | Who ran it: `harness`, `mcp`, or `server` (the vendor, inside a model call). | The engine; the adapter. | Never. |
 | `provider` | The vendor that ran or billed the tool's work — the brain's vendor for a server-side tool; the media or search vendor a harness tool called. | Whoever knows the vendor. | The tool reaches no billed vendor (platform tools, memory). |
 | `kind` | The shape of the work, for metered media and search: `image.generate`, `image.edit`, `video.generate`, `audio.transcribe`, `search.web`, `search.grounding`. One dotted vocabulary with `charge`'s `kind`. | The tool or adapter. | Unmetered work. |

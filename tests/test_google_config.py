@@ -231,6 +231,11 @@ def test_a_google_brain_describer_still_needs_its_own_key_file(
             "config:invalid_provider",
         ),
         (
+            # Issue #889: a capital is refused, never folded into the vendor it resembles.
+            {"HARNESS_DESCRIBER_PROVIDER": "Google", "HARNESS_DESCRIBER_SDK": "google-genai"},
+            "config:invalid_provider",
+        ),
+        (
             {"HARNESS_DESCRIBER_PROVIDER": "google", "HARNESS_DESCRIBER_SDK": "google-genai"},
             "config:missing_credentials_file",
         ),
@@ -264,6 +269,7 @@ def test_a_google_brain_describer_still_needs_its_own_key_file(
         "sdk-without-provider",
         "unknown-vendor-on-a-native-sdk",
         "malformed-provider",
+        "capitalized-provider",
         "no-key-file",
         "no-location",
         "key-file-absent",

@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.194.0] - 2026-11-15
+
+### Changed: Every Provider has a display name, and `provider` is a lowercase slug the configuration must already be (issue #889)
+
+@origin ruled on 2026-11-14 that a Provider's display name is the vendor's own casing and that `provider` on a line is always a lowercase slug, never a display name.
+
+- **Refuseless has its display name.** `_report._PROVIDER_LABELS` gains `refuseless` → `Refuseless` (a Refuseless failure reported to a timeline named the vendor by its slug) and `mempalace` → `MemPalace`, the memory software's `provider`. The NOC's by-Provider label map is a copy of this table.
+- **A test fails when a Provider has no display name.** `tests/test_telemetry_contract.py` assembles every slug the harness can write (`KNOWN_PROVIDERS`, every slug the code spells, every rendered line's) and requires an entry for each, or a reason in `NO_DISPLAY_NAME` (`unknown`, `log_grammar_probe`). A generic vendor has none by construction.
+- **The grammar is stated and held.** `docs/telemetry.md` gains an Identifiers section: `provider` is `^[a-z0-9._-]+$` on every line (tested over every value the harness writes); `model` is the vendor's id as configured, with no grammar of the harness's own; a tool's `name` is `^[A-Za-z0-9_-]{1,64}$` for every tool the agent is offered.
+- **A capitalized provider is refused, never folded.** `AI_PROVIDER=OpenRouter` was lowercased and run; it is now a startup error naming the slug to write (`--resolved-config` and `basecradle-harness-resolve --provider` exit nonzero), and `HARNESS_DESCRIBER_PROVIDER=Google` is `config:invalid_provider`. The installer and `basecradle-harness-verify` still fold case when comparing a provider with the overlay's declaration; neither runs the agent. Every provider value in the fleet's inventory is already a lowercase slug, so no agent changes. Surrounding whitespace is still stripped.
+- **An MCP tool name is held to ASCII.** `_mcp._sanitize` kept any Unicode letter or digit (`str.isalnum`), so a non-ASCII server or tool name left the grammar the vendors refuse a function name outside; it now keeps only ASCII ones. Every MCP name in use is ASCII, so none changes.
+- The `provider-adapters` skill gains the step: a new Provider lands with its slug and its display name in the same change.
+
 ## [0.193.1] - 2026-11-12
 
 ### Fixed: The telemetry contract no longer says a failed or retried attempt is never billed (issue #882)

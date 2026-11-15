@@ -158,9 +158,26 @@ def _build():
 # --- the slug -------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("raw", ["wiro", "WIRO", " wiro ", "together.ai", "my_vendor-2"])
+@pytest.mark.parametrize("raw", ["wiro", " wiro ", "together.ai", "my_vendor-2"])
 def test_a_well_formed_slug_is_a_provider(raw):
-    assert normalize_provider(raw) == raw.strip().lower()
+    assert normalize_provider(raw) == raw.strip()
+
+
+@pytest.mark.parametrize(
+    ("raw", "slug"),
+    [("WIRO", "wiro"), ("Wiro", "wiro"), ("OpenRouter", "openrouter"), ("xAI", "xai")],
+)
+def test_a_capitalized_provider_is_refused_never_folded(raw, slug):
+    """Issue #889: `provider` is a lowercase slug, so a capital is refused, naming the slug."""
+    with pytest.raises(ValueError, match="never folded") as refused:
+        normalize_provider(raw)
+    assert f"Write it as {slug!r}." in str(refused.value)
+
+
+def test_a_malformed_token_names_no_slug_it_could_be():
+    with pytest.raises(ValueError) as refused:
+        normalize_provider("Wiro.AI/")
+    assert "Write it as" not in str(refused.value)
 
 
 @pytest.mark.parametrize("raw", ["Wiro.AI/", "wi ro", "wiro:prod", "   "])
@@ -511,6 +528,18 @@ def test_resolved_config_states_no_cost_basis_for_a_generic_vendor(generic_env, 
     assert main(["--resolved-config"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert (report["cost_basis"], report["cost_rates_source"]) == (None, None)
+
+
+def test_resolved_config_refuses_a_capitalized_provider(generic_env, tmp_path, capsys):
+    """The wake's own read refuses it, so the probe exits nonzero rather than reading green."""
+    from basecradle_harness._wake import main
+
+    generic_env.setenv("AI_PROVIDER", "Wiro")
+    generic_env.setenv("AI_BASE_URL", "https://llm.example.com/v1")
+    generic_env.setenv("HARNESS_HOME", str(tmp_path))
+
+    assert main(["--resolved-config"]) == 1
+    assert "Write it as 'wiro'." in capsys.readouterr().err
 
 
 def test_resolved_config_refuses_a_builtin_a_generic_wake_would_refuse(

@@ -47,9 +47,11 @@ from basecradle_harness import (
 )
 from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._audio import Transcriber
+from basecradle_harness._basecradle import _PROVIDER_SLUG, KNOWN_PROVIDERS
 from basecradle_harness._describer import Describer
 from basecradle_harness._engine import _REASONS, Engine, _reason
 from basecradle_harness._exceptions import ProviderResponseError, ProviderServerError
+from basecradle_harness._mcp import mcp_tool_name
 from basecradle_harness._observability import (
     _VERDICT_VALUES,
     BLUE,
@@ -61,10 +63,12 @@ from basecradle_harness._observability import (
     YELLOW,
     ComputedCost,
     at_step,
+    describe_provider,
     in_wake,
     kv,
     metered,
 )
+from basecradle_harness._report import _PROVIDER_LABELS
 from basecradle_harness._retry import fault_slug
 from basecradle_harness._tools import Tool, ToolRegistry
 from tests.conftest import FAKE_KEY as OPENAI_KEY
@@ -2084,3 +2088,218 @@ def test_a_stopped_wake_is_the_operators_choice_never_a_failure():
     _, outcomes = _palette()
 
     assert outcomes["stopped"] == "Operator's Choice"
+
+
+# === identifiers: the provider slug, its display name, a tool's name (issue #889) ===============
+
+#: The `provider` values the harness can write that have no display name, each with why. Anything
+#: else the harness can write is a Provider, and a Provider has a name in `_PROVIDER_LABELS`.
+NO_DISPLAY_NAME = {
+    "unknown": (
+        "`describe_provider`'s stand-in for a third-party adapter that names no vendor: the absence "
+        "of a Provider, never one"
+    ),
+    "log_grammar_probe": (
+        "the log-grammar probe's synthetic value, on `PROBE` lines stamped `source=probe`, which "
+        "every production chart filters out"
+    ),
+}
+
+#: The doc's spelling of each grammar, read back so the page and the code cannot drift apart.
+_STATED_GRAMMAR = re.compile(r"`\^(?P<pattern>[^`]+)\$`")
+
+
+def _string_constants(tree: ast.Module) -> dict[str, str]:
+    """Module-level string constants, an alias of an earlier one included (``PROVIDER = REASON``)."""
+    found: dict[str, str] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        value = _literal(node.value, found)
+        for target in targets:
+            if isinstance(target, ast.Name) and value is not None:
+                found[target.id] = value
+    return found
+
+
+def written_providers(source: Path = SRC) -> dict[str, str]:
+    """Every `provider` value the package spells in its code, with the first place it is spelled.
+
+    Three kinds of site, and together they are where a slug enters a line. A ``provider=`` keyword
+    on any call (`kv`, `metered`, an emitter), a module-level ``PROVIDER`` constant (each native
+    adapter's own), and a class-level ``provider = "…"`` — each resolved through the module's own
+    string constants and then the package's, because a slug is often imported (``_MEMPALACE``).
+    An expression that resolves to no literal (``self.provider``, a variable) carries a value read
+    from configuration, which `KNOWN_PROVIDERS` and the rendered lines cover.
+    """
+    modules = [
+        (path.name, ast.parse(path.read_text(encoding="utf-8"))) for path in source.glob("*.py")
+    ]
+    package: dict[str, set[str]] = {}
+    local = {}
+    for name, tree in modules:
+        local[name] = _string_constants(tree)
+        for constant, value in local[name].items():
+            package.setdefault(constant, set()).add(value)
+    shared = {constant: next(iter(vs)) for constant, vs in package.items() if len(vs) == 1}
+
+    found: dict[str, str] = {}
+    for name, tree in sorted(modules):
+        constants = {**shared, **local[name]}
+        candidates: list[ast.AST] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                candidates += [kw.value for kw in node.keywords if kw.arg == "provider"]
+            elif isinstance(node, ast.ClassDef):
+                candidates += [
+                    stmt.value
+                    for stmt in node.body
+                    if isinstance(stmt, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "provider" for t in stmt.targets)
+                ]
+        candidates += [
+            stmt.value
+            for stmt in tree.body
+            if isinstance(stmt, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "PROVIDER" for t in stmt.targets)
+        ]
+        for value in candidates:
+            slug = _literal(value, constants)
+            if slug is not None:
+                found.setdefault(slug, f"{name}:{value.lineno}")
+    return found
+
+
+@pytest.fixture(scope="module")
+def emittable() -> dict[str, str]:
+    """Every `provider` the harness can write, by where it comes from — rendered lines added below."""
+    found = {provider: "KNOWN_PROVIDERS" for provider in KNOWN_PROVIDERS}
+    # The bookends' stand-in for a third-party adapter that names no vendor, built at run time.
+    found[describe_provider(object())[0]] = "describe_provider, a third-party adapter"
+    for slug, where in written_providers().items():
+        found.setdefault(slug, where)
+    return found
+
+
+def _rendered_providers(rendered: Rendered) -> dict[str, str]:
+    return {
+        line.fields["provider"]: f"scenario {scenario}"
+        for scenario, lines in rendered.lines.items()
+        for line in lines
+        if "provider" in line.fields
+    }
+
+
+def test_the_provider_scan_finds_every_kind_of_site():
+    """A scan that silently stopped resolving would make both checks below vacuous."""
+    written = written_providers()
+
+    assert {"openai", "xai"} <= written.keys()  # `metered(provider="…")` literals
+    assert {"anthropic", "google", "openrouter"} <= written.keys()  # module-level `PROVIDER`
+    assert "mempalace" in written  # `kv(provider=_MEMPALACE)`, imported from another module
+    assert "log_grammar_probe" in written  # `PROVIDER = REASON`, an alias
+
+
+def test_every_provider_the_harness_can_write_has_a_display_name(emittable, rendered):
+    """`@origin`'s ruling (issue #889): every Provider has a display name from the day it is added.
+
+    The list of what the harness can write is assembled, never typed: `KNOWN_PROVIDERS` (every
+    vendor a brain or a second model can be configured on with conventions), every slug the code
+    spells (`written_providers`), and every `provider` a rendered line carries. A new adapter
+    reaches all three, so it cannot land without its name in `_PROVIDER_LABELS`. A generic vendor
+    is the one Provider with none, and it is never in this list: the harness never spells it.
+    """
+    providers = {**emittable, **_rendered_providers(rendered)}
+    missing = sorted(
+        f"{slug} ({where})"
+        for slug, where in providers.items()
+        if slug not in _PROVIDER_LABELS and slug not in NO_DISPLAY_NAME
+    )
+    assert not missing, (
+        f"Providers with no display name: {missing}. Add each to `_report._PROVIDER_LABELS` in the "
+        "vendor's own casing, or to NO_DISPLAY_NAME with why it is not a Provider."
+    )
+    assert NO_DISPLAY_NAME.keys() <= providers.keys(), "a NO_DISPLAY_NAME entry nothing writes"
+    assert not NO_DISPLAY_NAME.keys() & _PROVIDER_LABELS.keys()
+    assert set(_PROVIDER_LABELS) <= providers.keys(), "a display name for a slug nothing writes"
+
+
+def test_every_display_name_is_the_vendors_own_casing_never_its_slug():
+    for slug, label in _PROVIDER_LABELS.items():
+        assert label != slug and label.lower() == slug.lower().replace("-", " "), (slug, label)
+
+
+def test_every_provider_the_harness_writes_is_a_lowercase_slug(emittable, rendered):
+    providers = {**emittable, **_rendered_providers(rendered)}
+    stray = sorted(f"{p} ({w})" for p, w in providers.items() if not _PROVIDER_SLUG.fullmatch(p))
+    assert not stray, f"provider values outside ^[a-z0-9._-]+$: {stray}"
+
+
+def _stated(identifier: str) -> str:
+    """The grammar the page's Identifiers table states for `identifier`, as a regex pattern."""
+    section = DOC.read_text(encoding="utf-8").partition("\n### Identifiers\n")[2]
+    section = section.partition("\n### ")[0]
+    (row,) = [line for line in section.splitlines() if line.startswith(f"| {identifier} |")]
+    (pattern,) = _STATED_GRAMMAR.findall(row)
+    return pattern
+
+
+def test_the_pages_provider_grammar_is_the_one_the_configuration_is_read_with(contract):
+    assert _stated("`provider`") == _PROVIDER_SLUG.pattern
+    common = DOC.read_text(encoding="utf-8").partition("\n### Common Fields\n")[2]
+    common = common.partition("\n### ")[0]
+    (row,) = [line for line in common.splitlines() if line.startswith("| `provider` |")]
+    assert f"`^{_PROVIDER_SLUG.pattern}$`" in row
+
+
+_TOOL_NAME = re.compile(_stated("A tool's `name`"))
+
+
+def _harness_tool_names() -> dict[str, str]:
+    """Every harness tool's own ``name = "…"``, declared on its class, with where."""
+    found: dict[str, str] = {}
+    for path in sorted(SRC.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for stmt in node.body:
+                target = stmt.target if isinstance(stmt, ast.AnnAssign) else None
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                    target = stmt.targets[0]
+                value = getattr(stmt, "value", None)
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == "name"
+                    and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                ):
+                    found[value.value] = f"{path.name}:{stmt.lineno}"
+    return found
+
+
+def test_every_harness_tool_name_is_in_the_stated_grammar():
+    names = _harness_tool_names()
+    assert {"messages", "web_fetch", "memory", "shell"} <= names.keys()  # the scan reads classes
+    stray = sorted(f"{n} ({w})" for n, w in names.items() if not _TOOL_NAME.fullmatch(n))
+    assert not stray, stray
+
+
+@pytest.mark.parametrize(
+    ("server", "tool"),
+    [
+        ("workmail", "send_email"),
+        ("brave-search", "brave_web_search"),
+        ("my server", "do.thing/now"),
+        ("x", "Ünïcode tool ✓"),
+        ("", ""),
+        ("s" * 40, "t" * 40),
+    ],
+)
+def test_every_mcp_tool_name_is_in_the_stated_grammar_by_construction(server, tool):
+    assert _TOOL_NAME.fullmatch(mcp_tool_name(server, tool))
+
+
+def test_an_mcp_tool_name_keeps_the_servers_own_case():
+    # Stated on the page: the grammar admits capitals, because renaming a server's tool is not ours.
+    assert mcp_tool_name("x_mcp", "searchPosts") == "x_mcp__searchPosts"
