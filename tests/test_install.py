@@ -30,9 +30,11 @@ from basecradle_harness._install import (
     RETIRED,
     REVOKED,
     UNCHANGED,
+    active_provider_from_env,
     charter_from_config,
     charter_from_env,
     main,
+    overlay_provider,
     plugin_opts_in,
     plugin_relevant_to,
     plugin_source_providers,
@@ -1329,6 +1331,59 @@ def test_cli_provider_flag_overrides_the_env(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     assert _XAI_DEFAULTS <= _tool_files(home)
     assert _OPENAI_DEFAULTS.isdisjoint(_tool_files(home))
+
+
+# --- a provider is a slug, never folded (issue #891) --------------------------
+
+
+def test_a_capitalised_env_provider_is_refused_in_the_wakes_words(tmp_path, monkeypatch, capsys):
+    # The installer filters a vendor's tranche by the provider, so folding `OpenRouter` would lay
+    # down an overlay for a spelling the wake refuses. It refuses before writing anything.
+    monkeypatch.setenv("AI_PROVIDER", "OpenRouter")
+    home = tmp_path / "cfg"
+
+    with pytest.raises(ValueError, match=r"AI_PROVIDER='OpenRouter' is not a provider slug"):
+        active_provider_from_env()
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--config-home", str(home)])
+
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "AI_PROVIDER='OpenRouter' is not a provider slug" in err
+    assert "Write it as 'openrouter'." in err
+    assert not home.exists()
+
+
+def test_a_capitalised_provider_flag_is_refused_naming_the_flag(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    home = tmp_path / "cfg"
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--config-home", str(home), "--provider", "XAI"])
+
+    assert exit_info.value.code == 2
+    assert "--provider='XAI' is not a provider slug" in capsys.readouterr().err
+    assert not home.exists()
+
+
+def test_the_library_install_refuses_a_capitalised_provider_before_writing(tmp_path):
+    home = tmp_path / "cfg"
+
+    with pytest.raises(ValueError, match=r"provider='Google' is not a provider slug"):
+        install(home, provider="Google")
+
+    assert not home.exists()
+
+
+def test_the_recorded_overlay_provider_is_read_as_written(tmp_path):
+    # An installer before 0.195.0 took `--provider` as given, so a declaration can hold a
+    # capitalised value; read as written, it differs from the agent's slug, as its overlay does.
+    home = tmp_path / "cfg"
+    install(home, provider="openrouter")
+    path = home / ".declared.json"
+    path.write_text(path.read_text().replace('"openrouter"', '"OpenRouter"'))
+
+    assert overlay_provider(home) == "OpenRouter"
 
 
 # --- a pruned overlay survives an upgrade (issue #352) -----------------------

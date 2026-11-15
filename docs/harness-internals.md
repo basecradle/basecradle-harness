@@ -999,9 +999,10 @@ its brief that it ran on OpenAI.
 The founder's ruling (@origin, 2026-10-12): the token is the biller, the set opens, the dialect is
 derived from the vendor. The shape of the change:
 
-- **One reader of the token's shape** (`_basecradle.normalize_provider`): strip, lowercase, and a
-  slug `[a-z0-9._-]+` — the NOC's own extraction, so a legal token is one the chart reads whole.
-  The wake, the off-box resolver and the describer's own stack all call it.
+- **One reader of the token's shape** (`_basecradle.normalize_provider`): strip, and a slug
+  `[a-z0-9._-]+` — the NOC's own extraction, so a legal token is one the chart reads whole. A value
+  outside it is refused, never folded (issue #889). The wake, the off-box resolver, the describer's
+  own stack, the installer and `basecradle-harness-verify` all call it (issue #891).
 - **One place for the generic profile's preconditions** (`_require_generic_profile`): `AI_SDK=openai`
   and a host. Run by `_config_from_env` (so startup refuses and `--resolved-config` exits nonzero
   instead of reading green on a box whose every wake would fail) and by `_provider_from_config` (a

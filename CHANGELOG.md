@@ -20,6 +20,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `tool_answered`, `tool_cut` and `tool_target` are exported beside `tool_failed`.
 - A test that let `web_fetch` resolve `example.com` through the real resolver now resolves it offline.
 
+### Fixed: The installer and `basecradle-harness-verify` no longer fold a provider's case (issue #891)
+
+0.194.0 refused a provider that is not a lowercase slug wherever the agent is run or resolved; three readers still folded it. Each now calls the one rule, `_basecradle.normalize_provider`, which gains a `provider_var` argument so its refusal names the setting it was read from.
+
+- **`basecradle-harness-install`** refuses `AI_PROVIDER=OpenRouter` or `--provider OpenRouter` before writing anything (exit 2, the wake's message), where it folded the env value and recorded `--provider` as given. `install(provider=…)` raises `ValueError` the same way.
+- **`basecradle-harness-verify`** reports a provider that is not a slug, from the argument, the environment or `agent.env`, as a new finding, `provider-invalid`, instead of folding it into a match; and it compares the overlay's recorded provider as written, so a declaration an older installer recorded from a capitalised `--provider` is a `provider-mismatch` until re-installed. `--resolved-config`'s `overlay_provider` reads it as written too.
+- **`describer_required_env`** read `HARNESS_DESCRIBER_PROVIDER=Google` as a key-based vendor and named the API-key variable in `tool_env`; it now raises in the wake's words, so `--resolved-config` exits nonzero on a describer that is refused at configuration.
+
+Every provider value in the fleet's inventory is already a lowercase slug, so no agent changes.
+
 ## [0.194.0] - 2026-11-15
 
 ### Changed: Every Provider has a display name, and `provider` is a lowercase slug the configuration must already be (issue #889)

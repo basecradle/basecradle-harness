@@ -415,9 +415,12 @@ def test_the_installer_keeps_only_the_vendor_neutral_defaults_for_a_generic_vend
 
 
 def test_verify_passes_a_generic_token_through(tmp_path, monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER", "Wiro")
+    monkeypatch.setenv("AI_PROVIDER", "wiro")
     assert _active_provider(tmp_path, None) == ("wiro", "environment")
     assert _active_provider(tmp_path, "wiro") == ("wiro", "argument")
+    # Read as written, never folded (issue #891): `verify` refuses `Wiro` as `provider-invalid`.
+    monkeypatch.setenv("AI_PROVIDER", "Wiro")
+    assert _active_provider(tmp_path, None) == ("Wiro", "environment")
 
 
 # --- the report -----------------------------------------------------------------------------------

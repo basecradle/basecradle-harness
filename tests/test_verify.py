@@ -348,6 +348,51 @@ def test_an_assumed_provider_says_so_in_the_finding(tmp_path, monkeypatch):
     assert "agent.env" in report.findings[0].detail  # names why it had to assume
 
 
+@pytest.mark.parametrize(
+    ("where", "var"),
+    [
+        ("environment", "AI_PROVIDER"),
+        ("argument", "--provider"),
+        ("agent.env", "AI_PROVIDER in agent.env"),
+    ],
+)
+def test_a_capitalised_provider_is_refused_in_the_wakes_words(converged, monkeypatch, where, var):
+    # The wake refuses `OpenRouter` (issue #889); a prover that folded it would compare a spelling
+    # the agent cannot run (issue #891). One finding, naming where it was read — never a second
+    # mismatch about the same typo.
+    _verifying(monkeypatch)
+    monkeypatch.delenv("AI_PROVIDER", raising=False)
+    provider = None
+    if where == "environment":
+        monkeypatch.setenv("AI_PROVIDER", "OpenRouter")
+    elif where == "argument":
+        provider = "OpenRouter"
+    else:
+        (converged / "agent.env").write_text("AI_PROVIDER=OpenRouter\n")
+
+    report = verify(converged, provider=provider)
+
+    assert checks(report) == ["provider-invalid"]
+    finding = report.findings[0]
+    assert finding.subject == var
+    assert finding.detail.startswith(f"{var.split()[0]}='OpenRouter' is not a provider slug")
+    assert "Write it as 'openrouter'." in finding.detail
+    assert report.active_provider == "OpenRouter"  # reported as written
+
+
+def test_a_capitalised_declared_provider_is_compared_as_written(converged, monkeypatch):
+    # An installer before 0.195.0 recorded `--provider` as given. Folded, `OpenRouter` would match
+    # an `openrouter` agent and hide that the overlay was filtered for a spelling it never ran.
+    _verifying(monkeypatch)
+    path = converged / ".declared.json"
+    path.write_text(path.read_text().replace('"openai"', '"OpenAI"'))
+
+    report = verify(converged, provider="openai")
+
+    assert report.declared_provider == "OpenAI"
+    assert checks(report) == ["provider-mismatch"]
+
+
 def test_an_all_providers_install_matches_every_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(_install, "_packaged_defaults", lambda: dict(V1))
     home = tmp_path / "cfg"

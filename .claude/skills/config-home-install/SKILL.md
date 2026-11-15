@@ -29,7 +29,9 @@ basecradle-harness-install --config-home <dir>   # scaffold or upgrade
 **Provider filtering.** The installer lays down and prunes each vendor's tool tranche by provider:
 `--provider <slug>`, defaulting to `$AI_PROVIDER` and then to `openai`. Run it without the agent's
 `AI_PROVIDER` and it filters for `openai`, pruning every other vendor's tools — always run it with
-the agent's environment. `--all-providers` lays down every default regardless of provider.
+the agent's environment. `--all-providers` lays down every default regardless of provider. A
+provider that is not a lowercase slug (`OpenRouter`) is refused before anything is written, in the
+wake's words (`_basecradle.normalize_provider`), never folded into the slug it would be.
 
 ## Conffile upgrade logic (per shipped default)
 

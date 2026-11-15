@@ -64,6 +64,7 @@ from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
 
+from basecradle_harness._basecradle import normalize_provider
 from basecradle_harness._install import (
     DECLARATION_CONTRACT,
     _hash,
@@ -261,7 +262,7 @@ def _provider_from_agent_env(root: Path) -> str | None:
         # same reason the **last** assignment wins rather than the first — that is what systemd's
         # `EnvironmentFile=` does, and an operator who switched provider by appending a line must
         # not have this prover reading the value their agent no longer runs under.
-        cleaned = value.strip().strip("\"'").strip().lower()
+        cleaned = value.strip().strip("\"'").strip()
         if cleaned:
             found = cleaned
     return found
@@ -274,12 +275,15 @@ def _active_provider(root: Path, explicit: str | None) -> tuple[str, str]:
     mismatch against a provider read from the agent's own environment is a real finding about the
     box, while one against the bare default may be a finding about how the probe was launched. A
     prover that cannot say which of those it is asking a human to chase down is half a prover.
+
+    The value is returned as written, never folded (issue #891): `verify` judges its shape by the
+    wake's rule, so a spelling the wake refuses is a finding here, not a provider this compares.
     """
     if explicit:
-        return explicit.strip().lower(), "argument"
+        return explicit.strip(), "argument"
     from_env = os.environ.get("AI_PROVIDER", "").strip()
     if from_env:
-        return from_env.lower(), "environment"
+        return from_env, "environment"
     from_file = _provider_from_agent_env(root)
     if from_file:
         return from_file, _AGENT_ENV_NAME
@@ -313,6 +317,7 @@ def verify(
     shipped_all = _packaged_defaults() if defaults is None else defaults
     findings: list[Finding] = []
     dist = _distribution_version()
+    provider_valid = _check_provider_slug(findings, active, provider_source)
 
     report = VerifyReport(
         config_home=root,
@@ -354,7 +359,8 @@ def verify(
     report.declared_files = sorted(declared_files(declaration))
     report.granted = sorted(declared_opt_in(declaration))
 
-    _check_provider(findings, report.declared_provider, active, provider_source)
+    if provider_valid:
+        _check_provider(findings, report.declared_provider, active, provider_source)
 
     # The default set the *last reconcile* filtered for — read off the declaration, never
     # re-derived from the live env. If the two disagree that is itself a finding (above), and the
@@ -468,9 +474,42 @@ def _check_declaration(
 
 
 def _declared_provider(declaration: Mapping[str, object]) -> str | None:
-    """The provider the last reconcile filtered for — ``None`` for an unfiltered install."""
+    """The provider the last reconcile filtered for, as recorded — ``None`` for an unfiltered install.
+
+    Never folded (issue #891): a value an installer before 0.195.0 recorded from a capitalised
+    ``--provider`` reads as written, so it mismatches the agent's slug and the remedy re-installs.
+    """
     value = declaration.get("provider")
-    return value.strip().lower() if isinstance(value, str) and value.strip() else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+#: The setting each source of the active provider was read from, as the refusal names it.
+_PROVIDER_VARS = {"argument": "--provider"}
+
+
+def _check_provider_slug(findings: list[Finding], active: str, source: str) -> bool:
+    """The active provider must be a slug the wake would run on — else a finding, and ``False``.
+
+    The wake's own rule, read through the one function that decides it
+    (`_basecradle.normalize_provider`, issue #891), so this prover and the wake cannot disagree on
+    which spelling is legal. A refused value is not compared against the declaration: a mismatch
+    against a value the agent cannot run would be a second finding about the same typo.
+    """
+    var = _PROVIDER_VARS.get(source, "AI_PROVIDER")
+    try:
+        normalize_provider(active, provider_var=var)
+    except ValueError as error:
+        where = f"{var} in {source}" if source == _AGENT_ENV_NAME else var
+        findings.append(
+            Finding(
+                check="provider-invalid",
+                subject=where,
+                detail=str(error),
+                remedy=f"write {where} as the provider's slug, then re-run basecradle-harness-verify",
+            )
+        )
+        return False
+    return True
 
 
 def _check_provider(

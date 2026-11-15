@@ -1021,13 +1021,22 @@ def describer_required_env(env: Any = None) -> frozenset[str]:
     ``false`` there is exactly a describer that cannot do its job, so the set names what *this*
     describer's provider takes — the key on a key-based vendor, the credential file and location on
     Vertex — and nothing it does not.
+
+    The provider is read by the wake's rule (`_basecradle.normalize_provider`, issue #891): a value
+    that is not a slug raises ``ValueError`` naming the variable it was read from, so
+    ``--resolved-config`` exits nonzero on a describer that is refused at configuration rather than
+    naming a credential for a vendor this read guessed at.
     """
+    from basecradle_harness._basecradle import normalize_provider  # deferred: a cycle via _engine
+
     source = env if env is not None else os.environ
     if not describer_model_from_env(source):
         return frozenset()
-    provider, _sdk = describer_stack_from_env(source)
-    if provider is None:
-        provider = (source.get("AI_PROVIDER") or "openai").strip().lower()
+    own, _sdk = describer_stack_from_env(source)
+    if own is None:
+        provider = normalize_provider(source.get("AI_PROVIDER"))
+    else:
+        provider = normalize_provider(own, provider_var=DESCRIBER_PROVIDER_VAR)
     if provider == _VERTEX_PROVIDER:
         return frozenset({DESCRIBER_CREDENTIALS_FILE_VAR, DESCRIBER_LOCATION_VAR})
     return frozenset({DESCRIBER_API_KEY_VAR})
