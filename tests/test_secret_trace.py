@@ -74,12 +74,19 @@ def heartbeat_script() -> str:
     return "\n".join(line[width:] for line in body) + "\n"
 
 
-def run_heartbeat(tmp_path: Path, script: str) -> tuple[subprocess.CompletedProcess[str], Path]:
-    """Run the step under ``bash -x`` with ``curl`` and ``jq`` stubbed, as the runner would."""
+def run_heartbeat(
+    tmp_path: Path, script: str
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    """Run the step under ``bash -x`` with ``curl`` and ``jq`` stubbed, as the runner would.
+
+    The ``curl`` stub records its argv and its stdin apart, so a test can tell a URL handed over
+    on the command line, which other processes can read, from one read off stdin (issue #906).
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     called = tmp_path / "curl-args"
-    (bin_dir / "curl").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{called}"\n')
+    fed = tmp_path / "curl-stdin"
+    (bin_dir / "curl").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{called}"\ncat > "{fed}"\n')
     (bin_dir / "jq").write_text("#!/bin/sh\necho clean\n")
     for stub in bin_dir.iterdir():
         stub.chmod(0o755)
@@ -99,7 +106,7 @@ def run_heartbeat(tmp_path: Path, script: str) -> tuple[subprocess.CompletedProc
             "RUNNER_TEMP": str(tmp_path),
         },
     )
-    return done, called
+    return done, called, fed
 
 
 def test_the_skill_spells_the_recipe_one_way_and_every_copy_is_guarded():
@@ -140,18 +147,28 @@ def test_a_failed_mint_still_stops_the_call(tmp_path):
 
 
 def test_the_heartbeat_step_prints_no_url_under_a_trace(tmp_path):
-    done, called = run_heartbeat(tmp_path, heartbeat_script())
+    done, _, fed = run_heartbeat(tmp_path, heartbeat_script())
 
     assert done.returncode == 0, done.stderr
     assert FAKE_URL not in done.stderr
-    assert FAKE_URL in called.read_text(), "the guard must not cost the ping"
+    assert f'url = "{FAKE_URL}"' in fed.read_text(), "the guard must not cost the ping"
+
+
+def test_the_heartbeat_url_reaches_curl_on_stdin_never_on_its_command_line(tmp_path):
+    done, called, _ = run_heartbeat(tmp_path, heartbeat_script())
+
+    assert done.returncode == 0, done.stderr
+    argv = called.read_text().splitlines()
+    assert FAKE_URL not in "\n".join(argv)
+    assert argv[0] == "-q", "curl honors -q only as its first argument"
+    assert argv[-2:] == ["--config", "-"]
 
 
 def test_the_heartbeat_step_without_its_guard_does_print_the_url(tmp_path):
     script = heartbeat_script()
     assert "set +x\n" in script
 
-    done, _ = run_heartbeat(tmp_path, script.replace("set +x\n", "", 1))
+    done, _, _ = run_heartbeat(tmp_path, script.replace("set +x\n", "", 1))
 
     assert FAKE_URL in done.stderr
 
