@@ -6047,7 +6047,7 @@ def resolved_config() -> dict[str, object]:
       A disabled breaker (max ``0`` or below) reports ``null`` for the other two: they mean nothing
       then, and are not validated.
 
-    A malformed ``model_params.json`` or breaker tunable makes this raise `ValueError` — the same
+    A malformed ``model_params.json``, step limit or breaker tunable makes this raise `ValueError` — the same
     failure a wake would hit, surfaced here at verify time (the caller turns it into a clean
     non-zero exit).
     """
