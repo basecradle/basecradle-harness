@@ -20,6 +20,15 @@ Two disciplines make this safe and useful:
   oversized body is truncated with a note, and a non-text (binary) response is
   *described*, not dumped into the model's context. HTML is reduced to readable text
   (a stdlib parser — no new dependency), so the model reads prose, not markup.
+
+**An answer is not a tool error** (issue #892). A fetch that got an HTTP response did its work,
+whatever the status says, and so did one whose host DNS answered does not exist: both are the far
+end's answer to the URL the model chose. So each is ``outcome=ok`` on the `tool` line, carrying the
+answer as ``status`` (``404``, ``503``, ``nxdomain``), and writes no WARNING — a run of agents
+guessing URLs stays countable without reading as a broken tool. ``outcome=error`` is kept for a
+fetch that got no answer (a timeout, a refused connection, a TLS failure, a resolver that could not
+be reached) and for a URL the harness itself refused (not https, a non-public address, a redirect
+loop). What the model is told is the same in every case.
 """
 
 from __future__ import annotations
@@ -32,7 +41,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from basecradle_harness._assets import _is_text, _media_type
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import tool_answered, tool_failed
 from basecradle_harness._tools import Tool
 
 # The largest body to read, mirroring the assets tool's inline cap: 256 KiB is
@@ -56,9 +65,28 @@ _USER_AGENT = "basecradle-harness/web_fetch"
 # textual (plain text, JSON, CSV, …) is returned as-is; non-text is described.
 _HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 
+# The resolver's codes for "this name has no address": ``EAI_NONAME`` (no such name) and, where the
+# platform defines it, ``EAI_NODATA`` (the name exists with no address record, glibc). Either is
+# DNS's answer about the URL. Every other code (``EAI_AGAIN``, ``EAI_FAIL``, …) means the resolver
+# could not answer, which stays a failure. One residual is stated: macOS reports a host with no
+# network at all as ``EAI_NONAME`` too; the fleet's Linux reports it as ``EAI_AGAIN``.
+_NO_SUCH_NAME = frozenset(
+    code
+    for code in (getattr(socket, "EAI_NONAME", None), getattr(socket, "EAI_NODATA", None))
+    if code is not None
+)
+
 
 class WebFetchError(Exception):
     """A fetch was refused or could not complete, with a model-readable `reason`."""
+
+
+class UnresolvedHostError(WebFetchError):
+    """DNS answered that the host name does not exist: the far end's answer, not a failure.
+
+    Told apart from a resolver that could not answer at all (``EAI_AGAIN``, a temporary failure),
+    which stays a failure, by the resolver's own code (`_NO_SUCH_NAME`).
+    """
 
 
 class WebFetchTool(Tool):
@@ -120,6 +148,8 @@ class WebFetchTool(Tool):
                     return self._render(response)
                 finally:
                     response.close()
+        except UnresolvedHostError as exc:
+            return tool_answered(f"Couldn't fetch {url!r}: {exc}", status="nxdomain")
         except WebFetchError as exc:
             return tool_failed(f"Couldn't fetch {url!r}: {exc}", reason="fetch_failed")
         except httpx.RequestError as exc:
@@ -154,12 +184,19 @@ class WebFetchTool(Tool):
     # --- rendering the final response ----------------------------------------
 
     def _render(self, response: httpx.Response) -> str:
-        """Turn the final response into model-readable text, capped and type-aware."""
+        """Turn the final response into model-readable text, capped and type-aware.
+
+        Every response here is an answer, so its status is recorded for the `tool` line and the
+        run is ``outcome=ok`` whatever the status is (issue #892).
+        """
+        return tool_answered(self._read(response), status=response.status_code)
+
+    def _read(self, response: httpx.Response) -> str:
+        """The model-readable text of one response, whatever its status."""
         if response.status_code >= 400:
-            return tool_failed(
+            return (
                 f"The server returned HTTP {response.status_code} for "
-                f"{response.url}. Nothing to read.",
-                reason="fetch_failed",
+                f"{response.url}. Nothing to read."
             )
 
         content_type = response.headers.get("content-type", "")
@@ -209,8 +246,9 @@ def _validate_url(url: str) -> None:
 
     try:
         infos = socket.getaddrinfo(host, parsed.port or 443, proto=socket.IPPROTO_TCP)
-    except socket.gaierror:
-        raise WebFetchError(f"could not resolve host {host!r}.") from None
+    except socket.gaierror as exc:
+        error = UnresolvedHostError if exc.errno in _NO_SUCH_NAME else WebFetchError
+        raise error(f"could not resolve host {host!r}.") from None
 
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])

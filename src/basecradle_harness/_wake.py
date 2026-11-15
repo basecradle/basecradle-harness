@@ -1583,6 +1583,7 @@ class WakeAgent:
         max_builds: int = _DEFAULT_PACE_MAX_BUILDS,
         code_bridge: CodeExecutionBridge | None = None,
         mcp_images: McpImageStore | None = None,
+        mcp_servers: list[str] | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -1607,6 +1608,8 @@ class WakeAgent:
         # What each active MCP server says about itself (its ``initialize`` instructions) and the
         # operator's note on it, shown in the brief's own fenced ``mcp`` part (issue #553).
         self.mcp_about = mcp_about
+        # The active MCP servers, named on every `wake start` line (issue #892).
+        self.mcp_servers = list(mcp_servers or [])
         # Broken-shipped-default defect notices surfaced into the brief under their own loud
         # heading (issue #160), so a capability silently disabled by a stale overlay or a
         # packaging bug is impossible to miss — empty when every shipped default loaded.
@@ -1885,6 +1888,9 @@ class WakeAgent:
             # The per-wake MCP image store (issue #318), so the assets ``post_image`` action can
             # post a screenshot an MCP tool returned. ``None`` unless an MCP server's tools loaded.
             mcp_images=resolved.mcp_images,
+            # The active MCP servers (issue #892), named on the `wake start` line: the journal's one
+            # record, per wake, that this agent runs beyond the safe-by-default tool set.
+            mcp_servers=resolved.mcp_servers,
         )
 
     def wake(
@@ -1967,6 +1973,7 @@ class WakeAgent:
                 provider=provider,
                 model=model,
                 delivery=delivery,
+                mcp_servers=",".join(self.mcp_servers) or None,
             ),
         )
         # `posted` is what the *harness* put on the timeline (today: NOC probe acks). What the

@@ -96,6 +96,7 @@ from basecradle_harness._observability import (
     GapLedger,
     metered,
     tool_failed,
+    tool_target,
 )
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._openai_rates import image_cost, image_known, priced_host
@@ -629,6 +630,7 @@ class EditImageTool(_ImageTool):
         download failure) raises `_SourceError`, whose message the caller relays to the model.
         """
         try:
+            tool_target("asset", uuid)
             asset = self.context.client.assets.get(uuid)
             file = asset.content.file
             data = _download(file.url)

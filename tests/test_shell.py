@@ -345,7 +345,7 @@ def test_a_finite_command_over_the_cap_is_truncated_with_a_marker(tmp_path):
     tool = ShellTool(workdir=str(tmp_path), max_output=10)
     result = tool.run(command="printf 'abcdefghijklmnop'")
     assert "abcdefghij" in result
-    assert "output truncated at 10 characters" in result
+    assert "[output cut at 10 characters]" in result
     assert "[exit code: 0]" in result
 
 
@@ -358,7 +358,8 @@ def test_a_flooding_producer_is_capped_and_killed_without_hanging_or_ooming(tmp_
     """
     tool = ShellTool(workdir=str(tmp_path), max_output=200, drain_timeout=2)
     result = tool.run(command="yes", timeout=30)
-    assert "output exceeded the 200-character limit" in result
+    assert result.startswith("y\ny\n")  # the head is returned, never nothing (issue #892)
+    assert "[output cut at 200 characters: the command was still writing" in result
     assert "timed out" not in result  # capped, not timed out
     assert "[exit code:" not in result  # killed, no clean exit
     assert len(result) < 400  # bounded, not gigabytes

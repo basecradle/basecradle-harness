@@ -42,7 +42,7 @@ import re
 
 from basecradle import BaseCradleError, User
 
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import tool_failed, tool_target
 from basecradle_harness._platform import PlatformTool, explain
 
 # How many timelines one `list` returns before eliding — the same defensive cap the
@@ -181,6 +181,7 @@ class TimelinesTool(PlatformTool):
 
     def _read(self, target: str) -> str:
         """One timeline: its owner, participants, lock state, and item count."""
+        tool_target("timeline", target)
         timeline = self.context.client.timelines.get(target)
         participants = ", ".join(f"@{p.handle}" for p in timeline.participants) or "none"
         return (
@@ -207,11 +208,13 @@ class TimelinesTool(PlatformTool):
         return "Timelines you can see (newest first):\n" + "\n".join(lines)
 
     def _add_participant(self, target: str, user: User) -> str:
+        tool_target("timeline", target)
         timeline = self.context.client.timelines.get(target)
         timeline.add_participant(user)
         return f"Added @{user.handle} to timeline {timeline.name!r} (uuid={timeline.uuid})."
 
     def _remove_participant(self, target: str, user: User) -> str:
+        tool_target("timeline", target)
         timeline = self.context.client.timelines.get(target)
         timeline.remove_participant(user)
         return f"Removed @{user.handle} from timeline {timeline.name!r} (uuid={timeline.uuid})."
@@ -324,6 +327,7 @@ def _resolve_user(client, reference: str) -> User:
     handle — a clean, model-readable miss rather than a confusing API error.
     """
     ref = reference.strip()
+    tool_target("user", ref)
     if _UUID_RE.match(ref):
         return client.users.get(ref)
     handle = ref.lstrip("@").lower()

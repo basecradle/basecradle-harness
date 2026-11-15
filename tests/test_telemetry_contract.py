@@ -26,11 +26,13 @@ import ast
 import logging
 import os
 import re
+import socket
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -41,6 +43,7 @@ from basecradle_harness import (
     ImageContent,
     Message,
     OpenAIProvider,
+    Policy,
     ProviderError,
     XaiSdkProvider,
     _openai,
@@ -51,7 +54,7 @@ from basecradle_harness._basecradle import _PROVIDER_SLUG, KNOWN_PROVIDERS
 from basecradle_harness._describer import Describer
 from basecradle_harness._engine import _REASONS, Engine, _reason
 from basecradle_harness._exceptions import ProviderResponseError, ProviderServerError
-from basecradle_harness._mcp import mcp_tool_name
+from basecradle_harness._mcp import _sanitize, mcp_tool_name
 from basecradle_harness._observability import (
     _VERDICT_VALUES,
     BLUE,
@@ -71,6 +74,7 @@ from basecradle_harness._observability import (
 from basecradle_harness._report import _PROVIDER_LABELS
 from basecradle_harness._retry import fault_slug
 from basecradle_harness._tools import Tool, ToolRegistry
+from basecradle_harness._webfetch import WebFetchTool
 from tests.conftest import FAKE_KEY as OPENAI_KEY
 from tests.conftest import (
     out_code_interpreter_call,
@@ -1081,6 +1085,49 @@ def harness_and_mcp_tools(**_):
     engine._run_tool("no_such_tool", {})
 
 
+#: The uuid a failed platform read asked for, which its companion line must name (issue #892).
+MISSING_MESSAGE = "019a4e2c-8d22-7c6f-8b53-2e3f4a5b6c7d"
+
+
+def _public_dns(host, port, *args, **kwargs):
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", port))]
+
+
+@scenario
+def answered_cut_and_targeted_tools(router, **_):
+    """The four lines issue #892 changed: a fetch the server answered 404, a host DNS says does not
+    exist, a shell command past its output cap, and a platform read of a uuid that is not there."""
+    from basecradle import BaseCradleError
+
+    from basecradle_harness._platform import PlatformContext
+    from basecradle_harness._reads import MessagesTool
+    from basecradle_harness._shell import ShellTool
+
+    def missing(uuid):
+        raise BaseCradleError("No record exists for the given UUID.")
+
+    def no_such_name(host, port, *args, **kwargs):
+        raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+    messages = MessagesTool()
+    messages.bind(
+        PlatformContext(
+            client=SimpleNamespace(messages=SimpleNamespace(get=missing)), timeline=WAKE_TIMELINE
+        )
+    )
+    registry = ToolRegistry(policy=Policy.unlocked())
+    for tool in (WebFetchTool(), ShellTool(max_output=10, drain_timeout=2), messages):
+        registry.register(tool)
+    engine = Engine(provider=None, tools=registry)  # type: ignore[arg-type]
+    router.get("https://example.com/guessed").mock(return_value=httpx.Response(404))
+    with patch.object(socket, "getaddrinfo", _public_dns):
+        engine._run_tool("web_fetch", {"url": "https://example.com/guessed"})
+    with patch.object(socket, "getaddrinfo", no_such_name):
+        engine._run_tool("web_fetch", {"url": "https://no-such-host.example/"})
+    engine._run_tool("shell", {"command": "yes", "timeout": 30})
+    engine._run_tool("messages", {"action": "read", "uuid": MISSING_MESSAGE})
+
+
 #: A host whose price is not OpenAI's table — a proxy the transcriber is aimed at.
 PROXY_HOST = "https://llm-proxy.example.com/v1"
 
@@ -1429,6 +1476,11 @@ EXPECTED_TOOLS = {
         ("no_such_tool", "harness", "error"),
     },
     "unpriced_media_tools": {("assets", "harness", "ok")},
+    "answered_cut_and_targeted_tools": {
+        ("web_fetch", "harness", "ok"),
+        ("shell", "harness", "ok"),
+        ("messages", "harness", "error"),
+    },
 }
 
 
@@ -1447,9 +1499,70 @@ def test_every_executor_writes_the_one_tool_line(rendered):
                 assert line.fields["provider"] == rendered.llm(name).fields["provider"]
             else:
                 assert "duration" in line.fields and "generation_id" not in line.fields, line
-            assert ("reason" in line.fields) == (line.fields["outcome"] == "error"), line
+            assert ("reason" in line.fields) == (line.fields["outcome"] != "ok"), line
     # No other scenario writes a tool line it was not expected to.
     assert {n for n in rendered.lines if rendered.heads(n, "tool")} == set(EXPECTED_TOOLS)
+
+
+def _tool_lines(rendered: Rendered, scenario: str) -> tuple[list[Line], list[Line]]:
+    """A scenario's `tool` lines, split into the verdict lines and the WARNING companions."""
+    lines = rendered.heads(scenario, "tool")
+    return [l for l in lines if "outcome" in l.fields], [l for l in lines if "error" in l.fields]
+
+
+def test_an_answer_is_not_a_tool_error_and_carries_its_status(rendered):
+    """Issue #892, change 1: a fetch the far end answered is `ok` with the answer on the line, and
+    writes no companion — 16 guessed URLs in one red-team run must stay countable, not read as a
+    broken tool. The page states the vocabulary; the line speaks it."""
+    verdicts, companions = _tool_lines(rendered, "answered_cut_and_targeted_tools")
+    fetches = [l.fields for l in verdicts if l.fields["name"] == "web_fetch"]
+    assert [(f["outcome"], f["status"]) for f in fetches] == [("ok", "404"), ("ok", "nxdomain")]
+    assert not any("reason" in f for f in fetches)
+    assert not [c for c in companions if c.fields["name"] == "web_fetch"]
+
+
+def test_a_cut_shell_output_is_ok_and_says_where_it_was_cut(rendered):
+    """Issue #892, change 4: past the output cap the work was done and the agent got the head, so
+    the line is `ok` with `cut_at` — never `degraded`, which pages @origin through the NOC's *Tool
+    Outcome Degraded* — and nothing failed, so there is no WARNING."""
+    verdicts, companions = _tool_lines(rendered, "answered_cut_and_targeted_tools")
+    (shell,) = [l.fields for l in verdicts if l.fields["name"] == "shell"]
+    assert (shell["outcome"], shell["cut_at"]) == ("ok", "10")
+    assert "reason" not in shell
+    assert not [c for c in companions if c.fields["name"] == "shell"]
+
+
+def test_no_harness_tool_line_is_degraded(rendered):
+    """`degraded` pages a person (basecradle-noc's *Tool Outcome Degraded*), so no `tool` line the
+    harness renders carries it, and no helper the package ships writes it (issue #892)."""
+    import basecradle_harness
+
+    for name in rendered.lines:
+        assert not [
+            l for l in rendered.heads(name, "tool") if l.fields.get("outcome") == "degraded"
+        ]
+    assert not hasattr(basecradle_harness, "tool_degraded")
+
+
+def test_a_failed_platform_read_names_its_target_on_the_companion(rendered):
+    """Issue #892, change 3: the platform's text does not say which uuid it could not find, so the
+    companion says it, as `<kind>:<identifier>`; the verdict line does not carry it."""
+    verdicts, companions = _tool_lines(rendered, "answered_cut_and_targeted_tools")
+    (read,) = [l.fields for l in verdicts if l.fields["name"] == "messages"]
+    assert (read["outcome"], read["reason"]) == ("error", "platform_error")
+    assert "target" not in read
+    (companion,) = [c.fields for c in companions if c.fields["name"] == "messages"]
+    assert companion["target"] == f"message:{MISSING_MESSAGE}"
+
+
+def test_the_mcp_servers_list_has_a_grammar_a_comma_can_split(contract):
+    """Issue #892, change 2: `wake start` names the active MCP servers, comma-separated, each by its
+    tools' sanitized prefix — so the list always splits back into the servers it names, whatever
+    an operator called the file, and each joins the `<server>__` of that server's tool names."""
+    assert "mcp_servers" in contract.heads["wake start"]
+    for name in ("fetch", "my,server", "Ünïcode mcp", "a b,c", ""):
+        assert re.fullmatch(r"[A-Za-z0-9_-]+", _sanitize(name)), name
+        assert mcp_tool_name(name, "tool").startswith(f"{_sanitize(name)}__")
 
 
 def test_a_tool_fee_rides_its_tool_line_and_never_the_llm_line(rendered):

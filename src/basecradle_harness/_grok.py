@@ -81,7 +81,7 @@ from basecradle_harness._media import (
     sniff_media_ext,
     uuid_list,
 )
-from basecradle_harness._observability import metered, tool_failed
+from basecradle_harness._observability import metered, tool_failed, tool_target
 from basecradle_harness._platform import PlatformTool, explain
 from basecradle_harness._secret import reveal, secret
 
@@ -217,6 +217,7 @@ class _GrokMediaTool(PlatformTool):
         relay, so the AI learns *why* a source couldn't be read rather than seeing a crash.
         """
         try:
+            tool_target("asset", uuid)
             return self.context.client.assets.get(uuid).content.file
         except BaseCradleError as error:
             raise ProviderError(

@@ -2063,7 +2063,7 @@ def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedToo
     With ``mcp/`` empty the `McpResolution` is empty and this returns ``resolved`` unchanged.
     """
     # A withheld tool or a server's self-description implies a server loaded, so its notice is here.
-    if not mcp.tools and not mcp.skipped and not mcp.notices:
+    if not mcp.tools and not mcp.skipped and not mcp.notices and not mcp.servers:
         return resolved
     existing = {tool.name for tool in resolved.tools}
     added = [tool for tool in mcp.tools if tool.name not in existing]
@@ -2082,6 +2082,7 @@ def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedToo
         # brief's ``mcp`` part carries the self-descriptions.
         withheld={**resolved.withheld, **mcp.withheld},
         mcp_about=resolved.mcp_about + mcp.about,
+        mcp_servers=resolved.mcp_servers + mcp.servers,
     )
 
 

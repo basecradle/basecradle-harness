@@ -105,7 +105,12 @@ from basecradle_harness._messages import (
     ToolSpec,
     VideoContent,
 )
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import (
+    tool_answered,
+    tool_cut,
+    tool_failed,
+    tool_target,
+)
 from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._openrouter import OpenRouterProvider
 from basecradle_harness._openrouter_account import OpenRouterAccountBalanceTool, OpenRouterKeyHeld
@@ -229,6 +234,9 @@ __all__ = [
     "Tool",
     "ToolRegistry",
     "tool_failed",
+    "tool_cut",
+    "tool_answered",
+    "tool_target",
     "Secret",
     "MemoryTool",
     "WebFetchTool",

@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.195.0] - 2026-11-15
+
+### Changed: Four log fixes from the first red-team run (issue #892)
+
+@origin and the capital read the journal of the first red-team advice run (2026-11-14 21:38Z to 2026-11-15 00:05Z, three agents, 37 wakes) and @origin approved four changes on 2026-11-15. Each is about what a tool call or a wake writes to the log; `docs/telemetry.md` changes with each.
+
+- **An HTTP answer is not a tool error.** A `web_fetch` that got an HTTP response, whatever its status, is now `outcome=ok` and carries the answer as a new `tool` field, `status` (`status=404`), with no WARNING companion; before, a 404 was `outcome=error reason=fetch_failed` plus a WARNING, 16 of them in the run. A host DNS answers does not exist (`EAI_NONAME`, or glibc's `EAI_NODATA`) is an answer too, `status=nxdomain`; a resolver that could not answer stays `outcome=error reason=fetch_failed`, as does a URL the SSRF fence refuses; a timeout stays `reason=timeout`, and a refused connection or a TLS failure `reason=transport`. A 5xx is an answer like any other status. What the model reads does not change. A tool records an answer with the new `tool_answered(text, status=…)`.
+- **The standing MCP notice is no longer a warning on every wake.** `MCP server '<name>' active: N tool(s) loaded — this agent has extended beyond the safe-by-default tool set` was a WARNING per server per wake, 116 of the run's 140 warnings. The fact moves onto `wake start` as a new field, `mcp_servers=fetch,playwright,steel` (each server by its tools' sanitized prefix, so the comma always splits it), absent when no server is active, and the per-server line, which keeps the tool count, is now INFO.
+- **A failed platform call names what it asked for.** The WARNING companion of a failed tool run carries a new field, `target=<kind>:<identifier>`, the last thing the run asked the platform for (on a run that read an asset and then failed at a media vendor, that asset) (`target=message:019a…`), because the platform's own sentence (`No record exists for the given UUID.`) does not say which. Every platform tool records it with the new `tool_target(kind, identifier)` just before each call (`timeline`, `message`, `asset`, `task`, `user`, `webhook_endpoint`, `webhook_event`), so a platform error a tool lets escape (`reason=exception`) names it too. It is never written on a run that succeeds.
+- **Past the shell output limit the run is `ok`, and the line says it was cut.** The agent already got the head of the output with a marker (the issue's report that it got nothing back did not match the tool; a test now pins the head); what was wrong was the verdict. A command past the 30,000-character cap is now `outcome=ok` carrying a new `tool` field, `cut_at=30000`, with no WARNING, where it was `outcome=error reason=output_limit`, and the marker says where the output was cut (`[output cut at 30000 characters: …]`). Not `degraded`, which the issue first asked for: the NOC pages @origin on any `degraded` tool line, and a long output is not a page (the capital, on the issue). A command still writing past the cap is still killed, since nothing reads its pipe any more. One that had already exited was `outcome=ok` with a truncated result and nothing on the line, and which of the two a command got was a race with the reader; both are now the one line. A tool records a cut with the new `tool_cut(text, at=…)`.
+- `tool_answered`, `tool_cut` and `tool_target` are exported beside `tool_failed`.
+- A test that let `web_fetch` resolve `example.com` through the real resolver now resolves it offline.
+
 ## [0.194.0] - 2026-11-15
 
 ### Changed: Every Provider has a display name, and `provider` is a lowercase slug the configuration must already be (issue #889)

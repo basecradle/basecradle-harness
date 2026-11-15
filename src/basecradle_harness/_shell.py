@@ -77,7 +77,7 @@ import signal
 import subprocess
 import threading
 
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import tool_cut, tool_failed
 from basecradle_harness._policy import SHELL
 from basecradle_harness._tools import Tool
 from basecradle_harness._venv import path_preamble, with_interpreter_bin
@@ -234,8 +234,9 @@ class ShellTool(Tool):
 
         A non-zero exit is *reported* (in the ``[exit code: N]`` footer), never raised —
         a failing command is a normal result the model reads and reacts to, not a tool
-        error. A command that outruns its timeout, or floods more than the output cap, is
-        killed by its process group (children included) and reported as such.
+        error. A command that outruns its timeout is killed by its process group (children
+        included) and reported as such. One that writes more than the output cap returns its
+        head, marked as cut, and is killed when it is still writing (``outcome=ok cut_at=<cap>``).
         """
         # Defense-in-depth privilege backstop: even a tool constructed and invoked
         # directly (bypassing the registry's load-time refusal) must never hand the
@@ -288,20 +289,23 @@ class ShellTool(Tool):
                 error=f"the command ran past its {seconds}s timeout and was killed",
             )
 
+        # Past the output cap the agent still gets the head, marked as cut and at what size, and the
+        # line stays `ok` with `cut_at=` (issue #892): the work was done and what came back is usable,
+        # and `degraded` would page a person. Whether the command was still running (killed, since
+        # nothing reads the pipe any more and the kill is what keeps a flood from holding the box
+        # until the timeout) or had already
+        # exited is a race between it and the reader, so both are the one verdict. (A background child
+        # left writing by a shell that exited is not killed here; that is unchanged.)
         if pump.capped and proc.poll() is None:
-            # Still producing after passing the output cap → over budget; stop it.
             _kill_group(proc)
             self._reap(proc)
-            return tool_failed(
-                self._format(pump.text(), over_cap=True),
-                reason="output_limit",
-                error=f"the command passed the {self._max_output}-character output limit and was killed",
-            )
+            return tool_cut(self._format(pump.text(), over_cap=True), at=self._max_output)
 
-        # Finished on its own (or produced more than the cap but already exited). A nonzero exit
-        # is the command's answer, which the tool delivered: `outcome=ok`, never a tool failure.
+        # Finished on its own. A nonzero exit is the command's answer, which the tool delivered:
+        # `outcome=ok`, never a tool failure.
         self._reap(proc)
-        return self._format(pump.text(), returncode=proc.returncode)
+        result = self._format(pump.text(), returncode=proc.returncode)
+        return tool_cut(result, at=self._max_output) if pump.capped else result
 
     def _resolve_timeout(self, timeout: int | None) -> int:
         """The effective timeout: the (clamped) default when unset/invalid, else clamped."""
@@ -342,10 +346,13 @@ class ShellTool(Tool):
         body = body.rstrip()  # drop the command's trailing newline so the footer sits flush
         lines = [body] if body else ["(no output)"]
         if over_cap:
-            lines.append(f"[killed: output exceeded the {self._max_output}-character limit]")
+            lines.append(
+                f"[output cut at {self._max_output} characters: the command was still writing "
+                "past the limit and was killed]"
+            )
         else:
             if truncated:
-                lines.append(f"[output truncated at {self._max_output} characters]")
+                lines.append(f"[output cut at {self._max_output} characters]")
             if timed_out is not None:
                 lines.append(f"[timed out after {timed_out}s and was killed]")
             else:

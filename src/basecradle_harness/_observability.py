@@ -1289,6 +1289,9 @@ def log_tool(
     cost: float | None = None,
     cost_gap: str | None = None,
     generation_id: str | None = None,
+    status: int | str | None = None,
+    target: tuple[str, str] | None = None,
+    cut_at: int | None = None,
 ) -> None:
     """**The** `tool` line — one per tool use, whoever executed it (issue #758).
 
@@ -1312,6 +1315,15 @@ def log_tool(
     foreign text to show, ``error`` writes it on a second, WARNING ``tool`` line carrying only
     ``name`` and ``error``, as before. A server-side failure has a vendor code and no text, so it has
     no companion and is itself written at WARNING, where a severity filter still sees it.
+
+    ``status`` is what the far end answered the tool's request with, in its protocol's own
+    vocabulary (an HTTP status code, or ``nxdomain``), recorded by `tool_answered`: a fetch that got
+    a 404 did its work, so it is ``outcome=ok`` with the 404 on the line, never an error (issue
+    #892). ``target`` is what the call asked the platform for, ``(kind, identifier)``, recorded by
+    `tool_target`; it rides the WARNING companion only, as ``target=<kind>:<identifier>``, because
+    it is the half of a failure's explanation the error text does not carry. ``cut_at`` is the
+    length, in characters, a result was cut at, recorded by `tool_cut`: the work was done and the
+    agent got the head, so the line stays ``outcome=ok`` and the cut is still countable.
     """
     failed_server = executor == SERVER_EXECUTOR and outcome == "error"
     _log.log(
@@ -1327,6 +1339,8 @@ def log_tool(
             duration=None if seconds is None else _secs(seconds),
             outcome=outcome,
             reason=reason,
+            status=status,
+            cut_at=cut_at,
             cost=_money(cost),
             cost_basis=cost_basis(cost),
             cost_gap=cost_gap if _money(cost) is None else None,
@@ -1334,7 +1348,8 @@ def log_tool(
         ),
     )
     if error is not None:
-        _log.warning("tool %s", kv(name=name, error=error))
+        asked = None if target is None else f"{target[0]}:{target[1]}"
+        _log.warning("tool %s", kv(name=name, target=asked, error=error))
 
 
 def log_server_tool(
@@ -1520,13 +1535,19 @@ class ToolMeter:
     count that is not a positive ``int`` likewise.
     """
 
-    __slots__ = ("_units", "failure", "verdict")
+    __slots__ = ("_units", "cut_at", "failure", "status", "target", "verdict")
 
     def __init__(self) -> None:
         self._units: list[tuple[str, str, str, int | None, float | None, bool, str | None]] = []
         self.failure: Exception | None = None
         #: ``(reason, error)`` from `tool_failed`: this run failed, with no vendor work to blame.
         self.verdict: tuple[str, str] | None = None
+        #: The length, in characters, the run's result was cut at, from `tool_cut` (issue #892).
+        self.cut_at: int | None = None
+        #: What the far end answered with, from `tool_answered` (issue #892).
+        self.status: int | str | None = None
+        #: ``(kind, identifier)`` the run last asked the platform for, from `tool_target`.
+        self.target: tuple[str, str] | None = None
 
     def record(
         self,
@@ -1637,6 +1658,52 @@ def tool_failed(text: str, *, reason: str, error: str | None = None) -> str:
     if meter is not None:
         meter.verdict = (reason, text.removeprefix("Error: ") if error is None else error)
     return text
+
+
+def tool_cut(text: str, *, at: int) -> str:
+    """Record that the running tool's result was cut at ``at`` characters, and hand back ``text``.
+
+    The work was done and the agent got the head, marked as cut, so the line stays ``outcome=ok``
+    and carries ``cut_at=<at>`` (issue #892): a long shell output is countable, and it is not a
+    shortfall a person should be paged for, which is what ``degraded`` means to the fleet's alerts.
+    ``text`` is returned unchanged. A no-op outside a tool run.
+    """
+    meter = _METER.get()
+    if meter is not None:
+        meter.cut_at = at
+    return text
+
+
+def tool_answered(text: str, *, status: int | str) -> str:
+    """Record what the far end answered the running tool's request with, and hand back ``text``.
+
+    ``status`` is in the answering protocol's own vocabulary: an HTTP status code (``404``), or
+    ``nxdomain`` when DNS answered that the host name does not exist. An answer is the tool's work
+    done, whatever it says, so the line stays ``outcome=ok`` and carries the answer as ``status``
+    (issue #892): a run of agents guessing URLs is counted by it, not hidden in a failure rate, and
+    it writes no WARNING. ``text`` is returned unchanged. A no-op outside a tool run.
+    """
+    meter = _METER.get()
+    if meter is not None:
+        meter.status = status
+    return text
+
+
+def tool_target(kind: str, identifier: str) -> None:
+    """Record what the running tool is about to ask the platform for, named by its kind.
+
+    Called just before the platform call, with the kind of thing asked for (``timeline``,
+    ``message``, ``asset``, ``task``, ``user``, ``webhook_endpoint``, ``webhook_event``) and the
+    identifier the call carries, exactly as the model gave it. It is written only if the run fails,
+    on the WARNING companion as ``target=<kind>:<identifier>``, because the platform's own text
+    (``No record exists for the given UUID.``) does not say which one it could not find (issue
+    #892). An identifier is not a secret; the value is scrubbed like every other. A later call in
+    the same run replaces an earlier one, so the line names the request that failed. A no-op
+    outside a tool run.
+    """
+    meter = _METER.get()
+    if meter is not None:
+        meter.target = (kind, identifier)
 
 
 class MeteredCall:

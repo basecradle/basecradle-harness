@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any
 from basecradle_harness._assets import _describe, _download, _upload
 from basecradle_harness._media import media_filename, sniff_media_ext
 from basecradle_harness._messages import CodeExecutionTrace, Message
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import tool_failed, tool_target
 from basecradle_harness._openai import require_openai_sdk
 from basecradle_harness._platform import PlatformTool, explain
 
@@ -128,6 +128,7 @@ class CodeExecutionBridge:
         bad uuid is something the model can see and correct.
         """
         try:
+            tool_target("asset", asset_uuid)
             asset = self.context.client.assets.get(asset_uuid)
             file = asset.content.file
             data = _download(file.url)

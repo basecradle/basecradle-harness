@@ -1205,6 +1205,9 @@ class Engine:
             seconds=elapsed,
             reason=reason,
             error=error,
+            status=meter.status if meter is not None else None,
+            target=meter.target if meter is not None else None,
+            cut_at=meter.cut_at if meter is not None else None,
             **work,
         )
 

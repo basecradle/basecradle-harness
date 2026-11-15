@@ -513,6 +513,8 @@ class ResolvedTools:
             names are reported on their own (``--resolved-config`` → ``mcp_withheld_tools``).
         mcp_about: What each active MCP server says about itself and its operator's note on it
             (issue #553), one block per server that has either — the brief's ``mcp`` part.
+        mcp_servers: The name of every active MCP server, in load order (issue #892), for the
+            ``wake start`` line's ``mcp_servers``. Empty with ``mcp/`` empty.
     """
 
     tools: list[Tool] = field(default_factory=list)
@@ -538,6 +540,8 @@ class ResolvedTools:
     withheld: dict[str, str] = field(default_factory=dict)
     #: Each active MCP server's self-description and operator note, for the brief (issue #553).
     mcp_about: list[str] = field(default_factory=list)
+    #: Every active MCP server's name, for the ``wake start`` line (issue #892).
+    mcp_servers: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Hold `skipped`'s one invariant: it never names a tool this config actually got.
