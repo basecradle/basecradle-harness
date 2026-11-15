@@ -112,11 +112,11 @@ def _llm(
     if model is not None:
         assert fields["model"] == model, message
     if outcome in BILLED:
-        # A billed call these shapes describe stated its usage, so its counts are on the line, and
-        # each part the page names is a part of the count it belongs to (`llm` → `tokens_*`).
+        # A billed call these shapes describe stated its usage, so its counts are on the line (the
+        # page drops them only for a usage block of nothing but zeros), and each part the page
+        # names is a part of the count it belongs to (`llm` → `tokens_*`).
         assert {"tokens_in", "tokens_out", "tokens_total"} <= set(fields), message
         tokens_in, tokens_out = int(fields["tokens_in"]), int(fields["tokens_out"])
-        assert tokens_in > 0 and tokens_out > 0, message
         assert int(fields["tokens_total"]) == tokens_in + tokens_out, message
         read = int(fields.get("cached_tokens", 0))
         written = int(fields.get("cache_write_tokens", 0))
@@ -131,13 +131,19 @@ def _llm(
 Cost = Literal["computed", "stated"] | None
 
 
-def _cost(fields: Mapping[str, str], cost: Cost, message: str) -> None:
+def _cost(fields: Mapping[str, str], cost: Cost, message: str, *, required: bool = True) -> None:
+    """``required=False`` for a line whose fee may legitimately be absent: a server-side tool whose
+    uses outnumbered the units the vendor billed (`tool` → `count`), which may have billed none."""
     if cost is None:
         assert "cost" not in fields and "cost_basis" not in fields, message
-    else:
+    elif required or "cost" in fields:
         assert "cost" in fields, message
         assert fields.get("cost_basis") == ("computed" if cost == "computed" else None), message
-    assert "cost_gap" not in fields, message  # a priced call names no gap (#878, #880)
+    else:
+        assert "cost_basis" not in fields, message
+    # Nothing these shapes describe is unpriced: a priced call, or a fee nobody charges apart
+    # (a router's searches), names no gap (#878, #880).
+    assert "cost_gap" not in fields, message
 
 
 class _Reported:
@@ -247,8 +253,9 @@ def assert_server_tool_line(
     Its uses are always counted, it carries no ``duration`` (the call's `llm` line timed the work),
     and its ``generation_id`` joins it to that call: ``joins`` is the id, or the ids, of the `llm`
     lines it may join (`tool` → `count`, `duration`, `generation_id`). A use the vendor reports as
-    failed makes the line ``outcome=error`` with the vendor's code as its ``reason``, and is not
-    billed, so ``cost`` binds an `ok` line in full and an `error` line only in what it carries.
+    failed makes the line ``outcome=error`` with the vendor's code as its ``reason``. A use is not
+    always a billed unit (a failed search, a page read), so ``cost`` binds the fee the line carries
+    and never demands one: a caller that needs the figure reads ``cost`` itself.
     """
     fields = _parsed(message, "tool").fields
     assert (fields.get("name"), fields.get("executor")) == (name, "server"), message
@@ -261,10 +268,7 @@ def assert_server_tool_line(
     )
     assert fields.get("outcome") in {"ok", "error"}, message
     assert ("reason" in fields) == (fields["outcome"] == "error"), message  # Tool Outcomes
-    if fields["outcome"] == "ok" or "cost" in fields:
-        _cost(fields, cost, message)
-    else:
-        assert "cost_basis" not in fields and "cost_gap" not in fields, message
+    _cost(fields, cost, message, required=False)
     return fields
 
 

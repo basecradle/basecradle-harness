@@ -75,7 +75,7 @@ from basecradle_harness._report import _PROVIDER_LABELS
 from basecradle_harness._retry import fault_slug
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._webfetch import WebFetchTool
-from tests._line_expectations import LLM_ALWAYS, Line, parse_line
+from tests._line_expectations import DOC, LLM_ALWAYS, Line, parse_line
 from tests._line_expectations import outcomes as _outcomes
 from tests.conftest import FAKE_KEY as OPENAI_KEY
 from tests.conftest import (
@@ -114,7 +114,6 @@ from tests.test_rerank import hits, picks, reranker
 from tests.test_xai_sdk import _FakeClient
 
 ROOT = Path(__file__).resolve().parent.parent
-DOC = ROOT / "docs" / "telemetry.md"
 SRC = ROOT / "src" / "basecradle_harness"
 
 OPENAI_HOST = "https://api.openai.com/v1"

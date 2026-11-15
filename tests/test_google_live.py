@@ -92,6 +92,7 @@ def test_a_real_turn_answers_and_its_line_says_what_happened(caplog):
     fields = assert_direct_call(
         _llm_line(caplog), provider="google", model=MODEL, residency=LOCATION, cost="computed"
     )
+    assert int(fields["tokens_in"]) > 0 and int(fields["tokens_out"]) > 0, fields
     assert fields.get("generation_id"), fields  # Vertex names the call it answered
     assert provider.last_tokens_in == int(fields["tokens_in"])
 

@@ -256,20 +256,8 @@ def test_a_web_search_runs_server_side_and_its_fee_is_logged(caplog):
         answer = adapter.chat(
             [Message.user("Search the web: what is the current stable version of Python? Cite it.")]
         )
-    calls = {fields_of(line)["generation_id"] for line in _lines(caplog, "llm provider=")}
     # One line per call that searched, joined to that call's `llm` line by its id (issue #758).
-    tools = [
-        assert_server_tool_line(
-            line,
-            name="web_search",
-            provider="anthropic",
-            model=MODEL,
-            kind="search.web",
-            joins=calls,
-            cost="computed",
-        )
-        for line in _lines(caplog, "tool name=web_search ")
-    ]
+    tools = _server_tool_lines(caplog, "web_search")
     uses = sum(int(fields["count"]) for fields in tools)
     assert uses >= 1, tools
     # The fee is $10 per 1,000 *billed* searches; a failed use is counted and not billed.
@@ -287,14 +275,37 @@ def test_a_web_search_runs_server_side_and_its_fee_is_logged(caplog):
 
 
 @needs_key
+def _server_tool_lines(caplog, builtin: str) -> list[dict[str, str]]:
+    """Every `tool` line `builtin` wrote, read through the contract's shape, joined to a call.
+
+    A failed use is ``outcome=error`` on its own line (since 0.167.0, #758); the prose ``server tool
+    failed`` warning these tests once searched for no longer exists, so its absence proved nothing.
+    """
+    calls = {fields_of(line)["generation_id"] for line in _lines(caplog, "llm provider=")}
+    return [
+        assert_server_tool_line(
+            line,
+            name=builtin,
+            provider="anthropic",
+            model=MODEL,
+            kind="search.web" if builtin == "web_search" else None,
+            joins=calls,
+            cost="computed" if builtin == "web_search" else None,
+        )
+        for line in _lines(caplog, f"tool name={builtin} ")
+    ]
+
+
+@needs_key
 def test_a_web_fetch_reads_a_url_given_in_the_user_turn(caplog):
     adapter = _provider(builtin_tools=["web_fetch"])
-    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         answer = adapter.chat(
             [Message.user("Fetch https://example.com and tell me the page's exact title.")]
         )
     assert "example domain" in (answer.content or "").lower()
-    assert "server tool failed" not in caplog.text
+    fetches = _server_tool_lines(caplog, "web_fetch")
+    assert fetches and all(fields["outcome"] == "ok" for fields in fetches), fetches
     kept = next(iter(adapter._replies.values()))[1]
     assert any(block.get("type") == "web_fetch_tool_result" for block in kept)
 
@@ -320,9 +331,10 @@ def test_a_web_tool_called_directly_runs(caplog, builtin, prompt, result_type):
     unforced direct call arrives with wrapped arguments and fails ``invalid_tool_input``.
     """
     adapter = _provider(builtin_tools=[builtin], tool_choice={"type": "tool", "name": builtin})
-    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         adapter.chat([Message.user(prompt)])
-    assert "server tool failed" not in caplog.text
+    uses = _server_tool_lines(caplog, builtin)
+    assert uses and all(fields["outcome"] == "ok" for fields in uses), uses
     kept = next(iter(adapter._replies.values()))[1]
     results = [block for block in kept if block.get("type") == result_type]
     # The forced call is direct; the model may follow it with one from the sandbox, which is fine.
