@@ -21,6 +21,7 @@ from basecradle_harness._exceptions import ProviderError, ProviderServerError
 from basecradle_harness._observability import (
     _HEARTBEAT_RUN,
     MAX_VALUE,
+    REDACTED_VALUE,
     _heartbeat,
     _value,
     bounded,
@@ -218,7 +219,10 @@ BOX_RULE_SAMPLES = {
 def test_the_harness_redacts_every_shape_the_box_redacts(rule):
     sample = BOX_RULE_SAMPLES[rule]
     rendered = _value(f"failed with {sample} attached")
-    assert "[redacted]" in rendered, rendered
+    # A credential-named assignment keeps its name and loses its value to the router's marker
+    # (issue #918); every other shape becomes `[redacted]`.
+    marker = REDACTED_VALUE if rule == "api key assignment" else "[redacted]"
+    assert marker in rendered, rendered
     secret = sample.split("=", 1)[-1] if rule == "api key assignment" else sample[-8:]
     if rule.startswith("basecradle"):
         secret = sample  # the box's minimum is one character, so the whole token is the check
@@ -562,7 +566,7 @@ def test_a_literal_rule_after_a_prefix_run_still_redacts_its_value(text, value):
     The literal rules run first."""
     rendered = scrub(f"failed: {text} rejected")
     assert value not in rendered, rendered
-    assert "[redacted]" in rendered
+    assert "[redacted]" in rendered or REDACTED_VALUE in rendered  # a credential name's: #918
     assert rendered.startswith("failed: ") and rendered.endswith(" rejected"), rendered
 
 
@@ -733,12 +737,16 @@ def test_the_header_rule_is_linear():
 @pytest.mark.parametrize(
     ("text", "scrubbed"),
     [
-        ('config API_KEY="wk9f8e7d6c5b4a3f2e1d0c9b8a" set', 'config [redacted]" set'),
+        # A credential-named assignment keeps its name, and its quoted value goes whole (#918).
+        (
+            'config API_KEY="wk9f8e7d6c5b4a3f2e1d0c9b8a" set',
+            "config API_KEY='<a redacted value>' set",
+        ),
         ("api_key='wk9f8e7d6c5b'", "[redacted]"),
         ("api_key=KBearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0 sent", "[redacted] sent"),
         ("GET /v1?token=KBearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0&x=1", "GET /v1[redacted]&x=1"),
         ("GET /v1?api_key=wk9f8e7d6c5b&x=1", "GET /v1[redacted]&x=1"),
-        ("OPENAI_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9", "OPENAI_[redacted]"),
+        ("OPENAI_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9", "OPENAI_API_KEY='<a redacted value>'"),
     ],
 )
 def test_an_assignments_value_is_redacted_however_it_opens_and_whatever_is_glued_to_it(

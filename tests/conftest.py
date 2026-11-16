@@ -38,6 +38,21 @@ def plain(text: str) -> str:
     return _ANSI.sub("", text)
 
 
+#: The NOC's log-store canary rule `credential_assignment`, byte for byte as basecradle-noc spells it
+#: (`observability/log-canary.json`, read at 6ac34236a74554b050a0d65e5b47aca85befb240, 2026-11-16;
+#: `docs/observability.md` §10), and as basecradle-router holds it in its own `tests/conftest.py`.
+#: The scrub's definition of a credential's name (`_observability.CREDENTIAL_NAME`, issue #918) is
+#: held to these bytes, and every credential-assignment test uses this pattern as its oracle. Moving
+#: it is a change to the NOC's rule: move it here with it.
+NOC_CREDENTIAL_ASSIGNMENT = r'[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=[^ ",}]{8,}'
+
+
+@pytest.fixture
+def canary() -> re.Pattern[str]:
+    """The NOC's `credential_assignment` rule: the oracle no scrubbed text may match."""
+    return re.compile(NOC_CREDENTIAL_ASSIGNMENT)
+
+
 # A fabricated OpenAI-compatible endpoint and a correctly-shaped fake key.
 BASE_URL = "https://api.openai.test/v1"
 CHAT_URL = f"{BASE_URL}/chat/completions"
