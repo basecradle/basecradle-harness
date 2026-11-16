@@ -122,8 +122,10 @@ def scan_of(*advisories: Advisory, errors: dict[str, str] | None = None) -> Depe
     return DependencySecurityScan(advisories=advisories, errors=errors or {}, **context())
 
 
-# How `gh issue list --json author` names the basecradle-ai App's bot.
-SCAN_BOT = {"is_bot": True, "login": "app/basecradle-ai"}
+# How `gh issue list --json author` names this repository's own bot, which the scan runs as
+# (basecradle#870), and the capital's, which it ran as before.
+SCAN_BOT = {"is_bot": True, "login": "app/basecradle-harness-ai"}
+CAPITAL_BOT = {"is_bot": True, "login": "app/basecradle-ai"}
 STRANGER = {"id": "U_kgDOC0ffee", "is_bot": False, "login": "john"}
 
 
@@ -605,6 +607,34 @@ def test_an_issue_the_scan_did_not_write_is_never_read_or_touched() -> None:
     plans = scan_of(advisory).plans([forged, forged_error])
 
     assert [(p.action, p.number, p.labels) for p in plans] == [("create", None, ["needs-human"])]
+
+
+@pytest.mark.parametrize("author", [SCAN_BOT, CAPITAL_BOT], ids=["own-bot", "capital-bot"])
+def test_an_issue_either_scan_identity_filed_is_the_scans(author: dict[str, Any]) -> None:
+    # The scan moved from the capital's bot to this repository's own (basecradle#870): an
+    # issue either one filed is updated in place, never duplicated by a fresh one beside it.
+    advisory = pypi("httpx", "GHSA-1111-2222-3333", "critical")
+    standing = open_issue(sole(scan_of(advisory).plans([])), author=author)
+
+    assert scan_of(advisory).plans([standing]) == []
+    assert sole(scan_of().plans([standing])).action == "update"
+
+    # And the could-not-run issue: the run that recovers closes it, whoever filed it.
+    stuck = open_issue(sole(scan_of(errors={"pypi": "x"}).plans([])), author=author)
+    recovered = sole(scan_of().plans([stuck]))
+    assert (recovered.action, recovered.number) == ("close", stuck["number"])
+
+
+def test_an_issue_a_sibling_bot_filed_is_not_the_scans() -> None:
+    advisory = pypi("httpx", "GHSA-1111-2222-3333", "critical")
+    sibling = {"is_bot": True, "login": "app/basecradle-python-ai"}
+    issue = open_issue(sole(scan_of(advisory).plans([])), author=sibling)
+
+    assert sole(scan_of(advisory).plans([issue])).action == "create"
+
+    # Nor its could-not-run issue: a recovering run leaves it alone rather than closing it.
+    stuck = open_issue(sole(scan_of(errors={"pypi": "x"}).plans([])), author=sibling)
+    assert scan_of().plans([stuck]) == []
 
 
 def test_an_issue_with_no_author_is_not_the_scans() -> None:

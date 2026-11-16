@@ -51,12 +51,18 @@ INBOX_LABEL = "needs-capital"
 SEVERITY_ORDER = ("critical", "high", "medium", "moderate", "low", "none", "unknown")
 ECOSYSTEM_NAMES = {"pypi": "Python package"}
 
-# The only author whose issues are the scan's own. This repository is public, so anyone
+# The only authors whose issues are the scan's own. This repository is public, so anyone
 # can open an issue with the scan's title and a marker of their choosing; one the scan did
 # not write is never read as what it knows, and never edited, labelled or closed by it.
 # (The capital's repository is private, so its scan can go by title alone.) `gh issue list`
 # names a GitHub App's bot as `app/<slug>`.
-SCAN_AUTHOR = "app/basecradle-ai"
+#
+# Two, because the scan's identity moved (basecradle#870): it runs as this repository's
+# own bot, basecradle-harness-ai[bot], and ran as the capital's basecradle-ai[bot] before.
+# An issue either one filed is the scan's, so an issue still open from before the move is
+# updated and closed by the new author, never duplicated beside it. The capital's entry
+# leaves once no open issue here carries the scan's title under the capital's bot.
+SCAN_AUTHORS = frozenset({"app/basecradle-harness-ai", "app/basecradle-ai"})
 
 # Each issue body carries the state it was written for, so the next run can tell a
 # standing finding (say nothing) from a changed one.
@@ -360,7 +366,7 @@ class DependencySecurityScan:
     def plans(self, open_issues: list[dict[str, Any]]) -> list[Plan]:
         """open_issues: the repository's open issues, as ``gh issue list --json
         number,title,body,author`` returns them."""
-        own = [issue for issue in open_issues if _author_of(issue) == SCAN_AUTHOR]
+        own = [issue for issue in open_issues if _author_of(issue) in SCAN_AUTHORS]
         candidates = (self._advisories_plan(own), self._error_plan(own))
         return [plan for plan in candidates if plan is not None]
 
