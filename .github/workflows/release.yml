@@ -8,10 +8,11 @@
 # Every action here is pinned to a full commit SHA, its release in a comment beside it (issue
 # #914). A tag or a branch is a pointer its owner can move, and the publish jobs hold
 # `id-token: write`: whatever a moved ref pointed at would run with the power to publish this
-# package under our name on the next tag (`release/v1` is a branch). The build and checkout
-# actions are pinned too, because the wheel they produce is what gets published. Dependabot's
-# github-actions entry moves each SHA and its comment together, and
-# tests/test_workflow_pins.py fails the build on any third-party action not pinned this way.
+# package under our name on the next tag (the publish action was once named by `release/v1`,
+# a branch). The build and checkout actions are pinned too, because the wheel they produce is
+# what gets published. Dependabot's github-actions entry moves each SHA and its comment
+# together, and tests/test_workflow_pins.py, in CI's test job, fails a pull request that names
+# a third-party action any other way.
 name: Release
 
 on:

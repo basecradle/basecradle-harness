@@ -28,7 +28,15 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-WORKFLOWS = sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
+GITHUB = ROOT / ".github"
+# Every file the runner reads a `uses:` from: the workflows, and any composite action.
+WORKFLOWS = sorted(
+    [*(GITHUB / "workflows").glob("*.y*ml"), *(GITHUB / "actions").glob("**/action.y*ml")]
+)
+
+# Any spelling of the key YAML accepts, quoted or with a space before the colon, so a line the
+# parser below cannot read fails the build instead of being skipped.
+MENTIONS_USES = re.compile(r"""\buses["']?\s*:""")
 
 USES = re.compile(r"^\s*(?:-\s+)?uses:\s*(?P<ref>\S+)(?P<rest>.*)$")
 PINNED = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/\S*)?@[0-9a-f]{40}$")
@@ -41,11 +49,11 @@ def references() -> list[tuple[str, int, str, str]]:
     found = []
     for path in WORKFLOWS:
         for number, line in enumerate(path.read_text().splitlines(), start=1):
-            if "uses:" not in line or line.lstrip().startswith("#"):
+            if not MENTIONS_USES.search(line) or line.lstrip().startswith("#"):
                 continue
             match = USES.match(line)
             assert match, f"{path.name}:{number}: a `uses:` line this guard cannot read: {line!r}"
-            found.append((path.name, number, match["ref"], match["rest"]))
+            found.append((str(path.relative_to(GITHUB)), number, match["ref"], match["rest"]))
     return found
 
 
@@ -55,7 +63,7 @@ def third_party() -> list[tuple[str, int, str, str]]:
 
 def test_the_guard_sees_the_publish_jobs() -> None:
     """A scan that matched nothing would pass every rule below, so it must find what it guards."""
-    refs = {ref for name, _, ref, _ in third_party() if name == "release.yml"}
+    refs = {ref for name, _, ref, _ in third_party() if name == "workflows/release.yml"}
     assert any(ref.startswith("pypa/gh-action-pypi-publish@") for ref in refs)
     assert len(third_party()) >= 10
 
@@ -77,6 +85,14 @@ def test_every_pin_names_its_release(name: str, number: int, ref: str, rest: str
     assert VERSION_COMMENT.match(rest), (
         f"{name}:{number}: `{ref}` carries no `# vX.Y.Z` comment naming the release it pins."
     )
+
+
+def test_one_sha_names_one_release() -> None:
+    """A hand edit that moved a SHA in one place and not its comment leaves two names for it."""
+    releases: dict[str, set[str]] = {}
+    for _, _, ref, rest in third_party():
+        releases.setdefault(ref, set()).add(rest.strip())
+    assert {ref: names for ref, names in releases.items() if len(names) > 1} == {}
 
 
 def test_the_exemptions_cover_only_what_they_name() -> None:
