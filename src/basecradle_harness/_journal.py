@@ -29,13 +29,21 @@ Three things are stated rather than hidden:
 - **Order across the two paths is not exact.** A pipe is read on its own thread, so an output line
   can land a few milliseconds after a harness record written later.
 - **Output after the wake is raw.** `owned_streams` hands descriptors 1 and 2 back when it exits, so
-  a write during interpreter shutdown goes out as written. It follows ``wake end``, the stream ends
-  after it, and so it can glue onto nothing. The two shutdown writers the harness knows of are routed
+  a write during interpreter shutdown goes out as written. It follows ``wake end``, so the only
+  record it could be glued to is a crash report written after it. The two shutdown writers the harness knows of are routed
   through the handler instead (`route_crashes`): Python's report of an exception nothing caught, in
-  the main thread or another, and of one raised where Python can only ignore it.
+  the main thread or another, and of one raised where Python can only ignore it. A
+  ``KeyboardInterrupt`` keeps Python's own report, which only a person at a terminal sees.
 - **A descendant that outlives the wake** keeps the pipe open, so `owned_streams` waits a bounded
-  time for the reader and then lets the process end without it; what the descendant writes later is
-  lost rather than glued.
+  time for the readers (`DRAIN_SECONDS`, in all) and then lets the process end without them; what
+  the descendant writes later is lost rather than glued.
+- **Only stderr is checked.** Descriptor 1 is taken whatever it is, so a wake run with stdout sent
+  to a file sends it to the journal instead. A wake's stdout carries nothing of its own.
+
+An output line is logged at its descriptor's level, ``INFO`` or ``WARNING``, so ``HARNESS_LOG_LEVEL``
+governs it as it governs every other record. The handler's report of its own failure is one line on
+the journal (`_observability.JournalHandler`), never a write to ``sys.stderr``: that is the pipe, and
+the reader waiting on the handler's lock would never drain it.
 
 Installed only by the wake entrypoint, only when it configured logging itself
 (`_basecradle._configure_logging`), and only while ``sys.stderr`` is descriptor 2: an embedding
@@ -48,8 +56,10 @@ import contextlib
 import io
 import logging
 import os
+import signal
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from types import TracebackType
 from typing import Any
@@ -63,13 +73,15 @@ _log = logging.getLogger("basecradle_harness")
 #: (the formatter splits any record over `_observability.RECORD_BYTES`), and reading carries on.
 PENDING_BYTES = 64 * 1024
 
-#: How long the wake's end waits for each reader to log what its pipe still holds. Ample for a pipe's
-#: whole buffer; a descendant holding the pipe open makes the wait the whole of it, never longer.
-DRAIN_SECONDS = 5.0
+#: How long the wake's end waits, in all, for the readers to log what their pipes still hold. Ample
+#: for a pipe's whole buffer; a descendant holding a pipe open makes the wait the whole of it, never
+#: longer, and short enough that a stopped wake still dies by its signal before ``runuser`` kills it.
+DRAIN_SECONDS = 1.0
 
 #: The record name every output line is logged under — the harness's, so the formatter treats the
 #: record as its own, its quoted line a `Rendered` argument.
 _LOGGER = "basecradle_harness.output"
+_output_log = logging.getLogger("basecradle_harness.output")
 
 
 @contextlib.contextmanager
@@ -115,13 +127,29 @@ def owned_streams(handler: logging.StreamHandler) -> Iterator[None]:
             readers.append(reader)
         yield
     finally:
-        for stream in (sys.stdout, sys.stderr):
-            _flush(stream)
-        for fd, original in saved:
-            os.dup2(original, fd)
-            os.close(original)
-        for reader in readers:
-            reader.join(DRAIN_SECONDS)
+        # A SIGTERM landing here would raise out of a half-restored pair, so it waits until both
+        # descriptors are back and the readers have drained; it is then raised as the wake's stop.
+        blocked = _block_term()
+        try:
+            for stream in (sys.stdout, sys.stderr):
+                _flush(stream)
+            for fd, original in saved:
+                os.dup2(original, fd)
+                os.close(original)
+            deadline = time.monotonic() + DRAIN_SECONDS
+            for reader in readers:
+                reader.join(max(0.0, deadline - time.monotonic()))
+        finally:
+            if blocked:
+                signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
+
+
+def _block_term() -> bool:
+    """Hold SIGTERM back from this thread, when this is the thread that takes it."""
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    return True
 
 
 def _is_descriptor(stream: Any, fd: int) -> bool:
@@ -156,7 +184,7 @@ def _pump(fd: int, name: str, level: int, handler: logging.Handler) -> None:
 
 def _emit(line: bytes, name: str, level: int, handler: logging.Handler) -> None:
     text = line.decode("utf-8", errors="replace")
-    if not text.strip():
+    if not text.strip() or not _output_log.isEnabledFor(level):
         return
     record = logging.LogRecord(
         _LOGGER, level, __file__, 0, f"{name}: %s", (Rendered(_full_value(text)),), None

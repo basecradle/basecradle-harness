@@ -333,11 +333,10 @@ class _StructuredLineGuard(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         from basecradle_harness._observability import (
-            _CLOSING_QUOTE,
             RECORD_BYTES,
             ScrubbingFormatter,
             _is_harness,
-            scrub,
+            scrub_line,
         )
         from tests._line_expectations import parse_line
 
@@ -353,7 +352,7 @@ class _StructuredLineGuard(logging.Handler):
             {**record.__dict__, "exc_info": None, "exc_text": None, "stack_info": None}
         )
         rendered = ScrubbingFormatter("%(message)s").format(copy)
-        expected = '"'.join(scrub(part) for part in _CLOSING_QUOTE.split(raw))
+        expected = scrub_line(raw)
         if len(expected.encode()) > RECORD_BYTES:
             return  # split under the record budget on purpose (`test_one_line_records.py`)
         if rendered != expected:

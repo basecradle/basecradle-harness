@@ -47,12 +47,14 @@ model still receives the full text as its tool result, and the transcript keeps 
 
 from __future__ import annotations
 
+import contextlib
 import getpass
 import logging
 import math
 import numbers
 import os
 import re
+import sys
 import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -435,11 +437,11 @@ class ScrubbingFormatter(logging.Formatter):
     vendor's 401 body can echo the key it rejected. So the whole record is scrubbed here — message,
     traceback and stack, a future prose site and another library's line included. A `kv` line is
     scrubbed a second time, which changes nothing a value already lost, and **never across a value's
-    closing quote** (`_CLOSING_QUOTE`): a quoted value ending in ``/heartbeat/`` or ``?token=`` holds
-    no secret, and on the whole line the rule that follows it would take the quote and leave the line
-    unparseable. No rule's legitimate match holds a ``"`` followed by the next field or the line's
-    end. One over-redaction is stated: a bare value ending in ``bearer`` beside a next field of eight
-    or more characters goes with it, as it does on the box.
+    closing quote** (`scrub_line`): a quoted value ending in ``/heartbeat/`` or ``?token=`` holds no
+    secret, and on the whole line the rule that follows it would take the quote and leave foreign
+    text outside it. The traceback and stack are scrubbed apart from the message, by `_full_value`,
+    for the same reason. One over-redaction is stated: a bare value ending in ``bearer`` beside a
+    next field of eight or more characters goes with it, as it does on the box.
 
     **One line, and text the harness did not write never at a head's position** (issue #912). The
     fleet recognises a contract line by its head where the head stands — the record's start, after
@@ -469,15 +471,15 @@ class ScrubbingFormatter(logging.Formatter):
     """
 
     def format(self, record: logging.LogRecord) -> str:
-        line = '"'.join(scrub(part) for part in _CLOSING_QUOTE.split(self._line(record)))
-        return "\n".join(self._records(record, line))
+        return "\n".join(self._records(record, _encodable(self._line(record))))
 
     def _line(self, record: logging.LogRecord) -> str:
-        """The record as one line: its message in the envelope, then its traceback and stack."""
+        """The record as one line: its message in the envelope, scrubbed, then its traceback and
+        stack, each scrubbed on its own (`_full_value`) so no rule reaches between them."""
         record.message = self._message(record)
         if self.usesTime():
             record.asctime = self.formatTime(record, self.datefmt)
-        line = _one_line(self.formatMessage(record))
+        line = scrub_line(_one_line(self.formatMessage(record)))
         if record.exc_info and not record.exc_text:
             record.exc_text = self.formatException(record.exc_info)
         for text in (record.exc_text, record.stack_info and self.formatStack(record.stack_info)):
@@ -490,9 +492,13 @@ class ScrubbingFormatter(logging.Formatter):
         """The message: a harness record's template over its rendered arguments, or another library's
         logger name and its whole message, quoted."""
         if not _is_harness(record.name):
-            return f"{_one_line(record.name)}: {_full_value(record.getMessage())}"
+            return f"{_logger_name(record.name)}: {_full_value(record.getMessage())}"
         message = str(record.msg)
-        return message % _prose_args(record.args) if record.args else message
+        if not record.args:
+            return message
+        if isinstance(record.args, Mapping) and "%(" not in message:
+            return message % (_Foreign(record.args),)  # ``"%s" % mapping`` renders the mapping
+        return message % _prose_args(record.args)
 
     def _records(self, record: logging.LogRecord, line: str) -> list[str]:
         """`line` as the records journald will keep — itself, or split under `RECORD_BYTES`.
@@ -517,6 +523,43 @@ class ScrubbingFormatter(logging.Formatter):
             continuation.message = f"continued {index}/{len(pieces) + 1}: {quoted}"
             records.append(self.formatMessage(continuation))
         return records
+
+
+def scrub_line(line: str) -> str:
+    """`line` scrubbed between its values' closing quotes, never across one.
+
+    A ``"`` closes a value when it is the second, fourth, … in the line: every ``"`` a rendered
+    record holds is the harness's own, because `kv` and the foreign renderers turn the text's own
+    into ``'``. So a rule's match ends at a closing quote, and an opening quote stays with the text
+    after it, where ``api_key="…`` is still read whole."""
+    parts, start = [], 0
+    for count, match in enumerate(re.finditer('"', line), start=1):
+        if count % 2 == 0:
+            parts.append(line[start : match.start()])
+            start = match.start() + 1
+    parts.append(line[start:])
+    return '"'.join(scrub(part) for part in parts)
+
+
+def _encodable(line: str) -> str:
+    """`line` with any lone surrogate as the ``\\udXXX`` text the stream would write for it, so the
+    record can be measured in UTF-8 bytes and cut (`_records`). A lone surrogate is legal in a
+    Python string (``json.loads`` makes one of ``"\\ud83d"``) and has no UTF-8 encoding."""
+    try:
+        line.encode()
+    except UnicodeEncodeError:
+        return line.encode("utf-8", "backslashreplace").decode()
+    return line
+
+
+#: A logger name that is one token, which stands at a record's head as it is. Any other name is
+#: quoted, because a logger is named by the code that makes it and can be named from data.
+_LOGGER_NAME = re.compile(r"[A-Za-z0-9_.:-]+")
+
+
+def _logger_name(name: str) -> str:
+    name = _flatten(name)
+    return name if _LOGGER_NAME.fullmatch(name) else '"' + name.replace('"', "'") + '"'
 
 
 #: The logger hierarchy whose records are the harness's own. Every other logger's record is another
@@ -609,14 +652,6 @@ def _cut(text: str, budget: int) -> tuple[str, str]:
     return head, text[len(head) :]
 
 
-#: A ``kv`` value's closing quote: a ``"`` followed by the next ``key=`` (colored, when it is a
-#: verdict pair), by the reset closing a colored pair, or by the line's end. The formatter scrubs
-#: between them (`ScrubbingFormatter`), so no rule reaches across one.
-_CLOSING_QUOTE = re.compile(
-    r'"(?=[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|\x1b\[0m|[ \t]*(?:\n|\Z))'
-)
-
-
 def log_handler(fmt: str = LOG_FORMAT, stream: Any = None) -> logging.Handler:
     """The stderr handler every harness entrypoint logs through — `ScrubbingFormatter` over `fmt`.
 
@@ -624,9 +659,34 @@ def log_handler(fmt: str = LOG_FORMAT, stream: Any = None) -> logging.Handler:
     so no entrypoint can write an unscrubbed record; `tests/test_prose_scrub.py` holds every
     ``basicConfig`` call in the package to it.
     """
-    handler = logging.StreamHandler(stream)
+    handler = JournalHandler(stream)
     handler.setFormatter(ScrubbingFormatter(fmt))
     return handler
+
+
+class JournalHandler(logging.StreamHandler):
+    """A `logging.StreamHandler` whose report of its own failure is one line, on its own stream.
+
+    `logging.Handler.handleError` prints a traceback, the call stack and the record's whole message
+    and arguments to ``sys.stderr``, over many lines, **while the handler's lock is held**. In a wake
+    ``sys.stderr`` is a pipe the harness reads back through this very handler (`_journal`), so that
+    print waits on a reader that waits on the lock: the wake hangs, and a broken stream (``EPIPE``,
+    ``ENOSPC``) turns every record into another one (issue #912). So the report is one line,
+    ``ERROR A log record could not be written. "…"``, written to the handler's own stream, and when
+    that stream is what failed, nothing is written at all.
+    """
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        if not logging.raiseExceptions:
+            return
+        error = sys.exc_info()[1]
+        # The stream is what failed when this raises, and there is nowhere left to say so.
+        with contextlib.suppress(Exception):
+            self.stream.write(
+                f"ERROR A log record could not be written. {_full_value(repr(error))}"
+                + self.terminator
+            )
+            self.flush()
 
 
 def install_log_handler() -> None:

@@ -490,7 +490,10 @@ def _child(script: str, home: Path, *, ready_pipe: bool = False) -> subprocess.P
 
 
 def _await_ready(child: subprocess.Popen) -> None:
-    line = (getattr(child, "ready", None) or child.stdout).readline()
+    ready = getattr(child, "ready", None)
+    line = (ready or child.stdout).readline()
+    if ready is not None:
+        ready.close()
     assert line.strip() == "READY", child.communicate(timeout=30)
 
 

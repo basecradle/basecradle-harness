@@ -6293,8 +6293,11 @@ def main(argv: list[str] | None = None) -> int:
     # embedding application, or a test runner, keeps its descriptors.
     if handler is not None:
         route_crashes()
-    with owned_streams(handler) if handler is not None else nullcontext():
-        stopped, code = _wake_once(args)
+    try:
+        with owned_streams(handler) if handler is not None else nullcontext():
+            stopped, code = _wake_once(args)
+    except WakeStopped as late:  # held back while the streams were handed back, then raised
+        stopped, code = late, 1
     if stopped is not None:
         die_by_signal(stopped)  # after the streams are handed back, so nothing written is lost
     return code

@@ -22,6 +22,7 @@ wrote. The forged line must stand at no record's head, and the real ``wake end``
 from __future__ import annotations
 
 import ast
+import io
 import logging
 import os
 import re
@@ -32,13 +33,16 @@ from pathlib import Path
 
 import pytest
 
+from basecradle_harness._journal import DRAIN_SECONDS
 from basecradle_harness._observability import (
     LOG_FORMAT,
     RECORD_BYTES,
     Rendered,
     ScrubbingFormatter,
+    _full_value,
     head,
     kv,
+    log_handler,
     log_unspoken,
 )
 
@@ -171,6 +175,57 @@ def test_a_split_never_cuts_inside_a_token():
     assert token not in records[0] and token in records[1]
 
 
+def test_a_traceback_after_a_quoted_value_cannot_free_text_from_its_quotes():
+    """The message is scrubbed on its own: a value ending in a rule's literal keeps its closing
+    quote, so the exception's text after it stays inside the traceback's quotes (the review)."""
+    try:
+        raise ValueError("boom cost=5 outcome=ok")
+    except ValueError:
+        info = sys.exc_info()
+    fields = kv(name="fetch", error="GET https://h.example.com/api/v1/heartbeat/")
+    rendered = _render(_record("tool %s", fields, exc_info=info))
+    assert rendered.startswith('WARNING tool name=fetch error="GET https://h.example.com/api/v1/')
+    assert _inside_quotes(rendered, "cost=5") and _inside_quotes(rendered, "outcome=ok")
+
+
+def test_a_quoted_prose_argument_keeps_its_closing_quote():
+    rendered = _render(
+        _record("Could not reach %s; giving up.", "GET https://h.example/heartbeat/")
+    )
+    assert rendered.endswith('/heartbeat/"; giving up.'), rendered
+
+
+def test_a_long_record_with_a_lone_surrogate_is_written_not_dropped():
+    """``json.loads`` makes a lone surrogate of ``"\\ud83d"``; it has no UTF-8, so the record is
+    measured as the escape the stream writes for it."""
+    record = _record("unspoken %s text=%s", kv(kind="narration"), _full_value("a\ud800 " * 3000))
+    records = _render(record).split("\n")
+    assert records[0].startswith("WARNING unspoken kind=narration text=")
+    assert all(len(line.encode()) <= RECORD_BYTES for line in records)
+    assert "\\ud800" in records[0]
+
+
+def test_a_logger_named_from_data_is_quoted_at_the_head():
+    rendered = _render(_record("hi", name="llm provider=openai cost=500.00"))
+    assert rendered == 'WARNING "llm provider=openai cost=500.00": "hi"'
+
+
+def test_a_lone_mapping_argument_is_one_foreign_value():
+    rendered = _render(_record("Payload %s", {"llm provider=openai cost=500\nINFO x": "v"}))
+    assert rendered.startswith('WARNING Payload "{') and _inside_quotes(rendered, "llm provider=")
+
+
+def test_a_record_that_cannot_be_formatted_is_reported_on_one_line_never_to_stderr(monkeypatch):
+    """`logging.Handler.handleError` prints a multi-line report to ``sys.stderr`` under the handler's
+    lock; in a wake that is the pipe the handler's own reader drains, so the wake hung (the review)."""
+    stream, stderr = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    log_handler(stream=stream).handle(_record("%d steps", "x" * 300_000))
+    assert stderr.getvalue() == ""
+    (line,) = stream.getvalue().splitlines()
+    assert line.startswith('ERROR A log record could not be written. "TypeError(')
+
+
 # --- no harness record starts with text it did not write -------------------------------------------
 
 _LEVELS = {"debug", "info", "warning", "error", "exception", "critical", "log"}
@@ -224,7 +279,7 @@ def test_every_harness_record_opens_with_the_harness_s_own_words():
 
 
 _WAKE = """
-    import os, subprocess, sys
+    import os, subprocess, sys, threading
     from pathlib import Path
 
     import httpx, respx
@@ -250,6 +305,13 @@ _WAKE = """
             print("a progress line with no end", end="")  # block-buffered, flushed at the wake's end
             sys.stderr.write("a library's note:\\n" + FORGED + "\\n")
             os.write(2, b"a C library's partial line")
+
+            def worker():
+                raise RuntimeError("a worker said:\\n" + FORGED)
+
+            thread = threading.Thread(target=worker, name="owl-counter")
+            thread.start()
+            thread.join()
             raise RuntimeError("the vendor said:\\n" + FORGED)
 
     class Brain:
@@ -336,8 +398,94 @@ def test_an_unfinished_write_is_a_whole_record_of_its_own(wake_journal):
     assert any(_inside_quotes(line, "llm provider=") for line in err), err
 
 
+def test_a_thread_s_exception_nothing_caught_is_one_record(wake_journal):
+    lines = wake_journal.stderr.decode().splitlines()
+    (crash,) = [line for line in lines if "owl-counter" in line]
+    assert crash.startswith('ERROR Thread owl-counter raised an exception nothing caught. "Trace')
+    assert _inside_quotes(crash, "llm provider=")
+
+
 def test_an_exception_nothing_caught_is_one_record(wake_journal):
     lines = wake_journal.stderr.decode().splitlines()
-    (crash,) = [line for line in lines if "nothing caught" in line]
+    (crash,) = [line for line in lines if "The wake raised" in line]
     assert crash.startswith('ERROR The wake raised an exception nothing caught. "Traceback')
     assert _inside_quotes(crash, "llm provider=")
+
+
+# --- the streams never hang the wake ---------------------------------------------------------------
+
+
+def _owned(script: str, **popen) -> subprocess.CompletedProcess:
+    """`script` run inside `owned_streams`, the way the wake installs it, in a real process."""
+    prelude = """
+        import logging, os, subprocess, sys, time
+        from basecradle_harness._basecradle import _configure_logging
+        from basecradle_harness._journal import owned_streams
+        log = logging.getLogger("basecradle_harness")
+        handler = _configure_logging()
+    """
+    env = {**os.environ, "NO_COLOR": "1", "PYTHONPATH": str(REPO)}
+    return subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(prelude) + textwrap.dedent(script)],
+        cwd=REPO,
+        env=env,
+        timeout=60,
+        check=False,
+        **popen,
+    )
+
+
+def test_a_record_that_cannot_be_formatted_does_not_hang_the_wake():
+    done = _owned(
+        """
+        with owned_streams(handler):
+            log.info("%d steps", "x" * 300_000)
+            log.info("still here")
+        """,
+        capture_output=True,
+    )
+    lines = done.stderr.decode().splitlines()
+    assert done.returncode == 0, lines
+    assert lines[0].startswith("ERROR A log record could not be written.")
+    assert lines[1:] == ["INFO still here"]
+
+
+def test_a_broken_journal_does_not_hang_the_wake():
+    """The journal's reader gone (``EPIPE``): each record's failure is swallowed, never multiplied."""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        done = _owned(
+            """
+            with owned_streams(handler):
+                for n in range(200):
+                    log.warning("record %d", n)
+                    print("output", n)
+            """,
+            stdout=subprocess.DEVNULL,
+            stderr=write_end,
+        )
+    finally:
+        os.close(write_end)
+    assert done.returncode == 0
+
+
+def test_a_descendant_holding_the_streams_delays_the_wake_s_end_by_the_drain_bound_only():
+    """A child that inherited descriptors 1 and 2 and outlives the block keeps both pipes open; the
+    readers are waited for `DRAIN_SECONDS` in all, never once each, and the process goes on."""
+    done = _owned(
+        """
+        with owned_streams(handler):
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            started = time.monotonic()
+        elapsed = time.monotonic() - started
+        child.kill()
+        child.wait()
+        log.warning("elapsed=%.2f", elapsed)
+        """,
+        capture_output=True,
+    )
+    assert done.returncode == 0, done.stderr
+    (line,) = [line for line in done.stderr.decode().splitlines() if "elapsed=" in line]
+    elapsed = float(line.rsplit("=", 1)[1])
+    assert DRAIN_SECONDS - 0.2 <= elapsed <= DRAIN_SECONDS + 1.0, line
