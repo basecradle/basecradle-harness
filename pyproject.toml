@@ -181,6 +181,17 @@ dev = [
     "google-genai>=2.28.0,<4",
     "anthropic>=2.3.0,<3",
 ]
+# The toolchain that makes the published bytes (issue #916), held here so `uv.lock` pins every
+# version and hash of it and Dependabot's uv entry moves it as a reviewable diff. Nothing installs
+# this group: `uv sync` installs `dev` only. `uv` is read off the lock by `astral-sh/setup-uv`
+# (`version-file: uv.lock`, in CI and in the release alike), and the build backend is exported
+# from the lock as hashed constraints for `uv build` (`.github/actions/build-distributions`).
+# Every name in `[build-system].requires` is declared here with the same specifier, or it would
+# resolve fresh on every tag; `tests/test_publish_toolchain.py` fails the build otherwise.
+build = [
+    "uv>=0.13.8",
+    "hatchling>=1.27",
+]
 
 [build-system]
 requires = ["hatchling>=1.27"]

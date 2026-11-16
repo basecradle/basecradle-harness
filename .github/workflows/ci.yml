@@ -18,7 +18,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version-file: uv.lock
       - name: Install dependencies
         run: uv sync --locked
       - name: Lint
@@ -35,8 +39,11 @@ jobs:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
+          version-file: uv.lock
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: uv sync --locked
@@ -69,6 +76,7 @@ jobs:
         with:
           # The path check diffs the change's two ends, so both must be in the clone.
           fetch-depth: 0
+          persist-credentials: false
       - name: Does the change touch the real-palace suite?
         id: paths
         env:
@@ -107,6 +115,7 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         if: steps.paths.outputs.run == 'true'
         with:
+          version-file: uv.lock
           python-version: "3.12"
       - name: Install dependencies
         if: steps.paths.outputs.run == 'true'
@@ -167,8 +176,34 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Check release coherence
         run: python3 scripts/check_release.py repo
+
+  # The release's own build (`.github/actions/build-distributions`, issue #916), run on every
+  # change so that a bump to the build toolchain, which Dependabot opens against uv.lock, is
+  # proven buildable before it merges, and the release never builds with a toolchain CI has not.
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/build-distributions
+
+  # Each pinned action's `# vX.Y.Z` comment names the release its SHA is (issue #916). The pin
+  # guard in the test job checks the shape offline; whether the comment is true can only be read
+  # off each action's repository, so it is its own job, which the offline suite never needs.
+  pins:
+    name: pins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Every pin's comment names the release its SHA is
+        run: python3 scripts/check_action_pins.py
 
   # Fleet Bot Identity: a commit authored by this repo's bot carries no Co-Authored-By
   # trailer — the commit author already *is* the agent. Every session is handed an
@@ -187,6 +222,7 @@ jobs:
         with:
           # Walking base..head needs both ends present in the clone.
           fetch-depth: 0
+          persist-credentials: false
       - name: No Co-Authored-By on bot commits
         if: github.event_name == 'pull_request'
         env:
@@ -246,7 +282,7 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-latest
-    needs: [lint, test, mempalace, changelog, trailers]
+    needs: [lint, test, mempalace, build, pins, changelog, trailers]
     if: always()
     steps:
       - name: Fail unless every required job succeeded

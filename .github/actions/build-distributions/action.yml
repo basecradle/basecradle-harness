@@ -1,0 +1,41 @@
+# The one build of this package's wheel and sdist (issue #916): the release builds with it, and CI
+# builds with it on every pull request, so a bump to anything below is proven buildable before it
+# merges and the release can never build with a toolchain CI did not.
+#
+# Pinning the actions (issue #914) fixed which actions run, not what they fetch. Every link that
+# makes the published bytes is held by `uv.lock` here, so it moves only as a diff Dependabot opens:
+#
+#   * uv is the version the lock holds (the `build` group in pyproject.toml). Given no version,
+#     setup-uv installs the newest uv on the day of the tag, and given none but a pyproject.toml it
+#     reads the group's floor, which floats the same way; `version-file: uv.lock` is the exact one.
+#   * The build backend and everything it imports resolve inside `uv build`'s isolated
+#     environment, which reads only `[build-system].requires` (`hatchling>=1.27`) and would take
+#     the newest of each. The lock's versions and hashes are exported as build constraints, and
+#     `--require-hashes` refuses any build requirement without a trusted hash, a missing one
+#     included.
+#   * The interpreter is a uv-managed CPython (`--managed-python`), the newest release of the
+#     `.python-version` series the pinned uv knows and verified against the checksum built into
+#     it, never whatever the runner image ships.
+#
+# No cache: a restored cache would supply build requirements this run did not download, and the
+# point is that every byte here is fetched against a hash this repository holds.
+name: Build the Distributions
+description: Build the wheel and sdist into dist/ with the toolchain uv.lock pins.
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        version-file: uv.lock
+        enable-cache: false
+    - name: Export the locked build toolchain as hashed constraints
+      shell: bash
+      run: >-
+        uv export --locked --only-group build --no-emit-project --format requirements.txt
+        --output-file "$RUNNER_TEMP/build-constraints.txt"
+    - name: Build the wheel and sdist
+      shell: bash
+      run: >-
+        uv build --build-constraints "$RUNNER_TEMP/build-constraints.txt" --require-hashes
+        --managed-python --no-cache
