@@ -7,6 +7,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.198.0] - 2026-11-16
+
+### Fixed: Every journal record is one line, and text the harness did not write never stands at a head's position (issue #912, basecradle#868)
+
+The fleet now recognises a contract line by its head where the head stands, at a record's start after the severity (basecradle-noc#1518). journald starts a record at every newline of a wake's one stdout+stderr stream, so two doors let text the harness did not write decide what stood there: a line break in a foreign text (a vendor's error, a traceback, another library's message), and an unfinished write that the harness's next record was glued onto. The NOC found three real `wake end` lines stored that way, each glued onto a MemPalace mining progress write. None of this adds a head or a field to the telemetry contract: every new rendering is prose (`docs/telemetry.md` → One Line, Opened by the Harness).
+
+- **A harness prose line quotes its foreign arguments.** `ScrubbingFormatter` interpolates as written only what the harness composed: a head, a `kv` rendering, or a whole structured line (`_observability.Rendered`), and a number. Every other argument is flattened, scrubbed, and quoted when it holds a space, an `=` or a `"`, by `kv`'s value rule without its bound: `WARNING Memory provider observe() failed: "connection reset by peer"`. A bare token (a model slug, a uuid) reads as it did. The step ledger's action is quoted now (`step 1/24: "tools=survey" (0.03s)`), because a tool name is whatever the model emitted.
+- **A traceback or stack rides at the line's end as one quoted string**, never as the lines Python prints.
+- **Another library's record** reads as its logger's name and its whole message quoted: `WARNING openai._base_client: "Retrying request to /responses in 0.4 seconds"`.
+- **A wake owns its stdout and stderr** (`_journal.owned_streams`). Anything written to either one is read off the descriptor into a record of its own, `INFO stdout: "…"` or `WARNING stderr: "…"`: a child process's output, a C library's, a block-buffered `print`. An unfinished line waits for its newline or the wake's end, and is then a whole record. Python's reports of an exception nothing caught (in the main thread, another thread, or where it can only be ignored) go through the handler: `ERROR The wake raised an exception nothing caught. "Traceback …"`. It applies only when the wake configured logging itself, so an embedding application and a test runner keep their own descriptors.
+- **A record over 32 KiB is split by the formatter**, under journald's `LineMax` (48K by default), into a first record that keeps its head and `continued 2/3: "…"` records. An unspoken narration was the one unbounded value long enough to reach it, and journald would have started each later record with the narration's own text.
+- **A command's last word to stderr is one line.** `basecradle-harness-wake`, `-cleanup`, `-resolve`, `-claims`, `-scrub-palace`, `-log-grammar` and the palace check write an error's text through `_observability.last_word`: flattened, scrubbed, and quoted. The claims emitter's traceback is one line too.
+- **Four prose sites open with the harness's own words**, where a `%s` or a computed text stood first: the MCP server load failure, the cleanup summary, the OpenRouter routing-pin warning and the Anthropic anchor warning.
+- **Guards.** `tests/test_one_line_records.py` runs a real wake in a real process whose tool's child ends without a newline and whose tool raises a multi-line error whose second line is a well-formed `INFO llm provider=… cost=…`. It requires every record to open with a severity and a harness head, the forged line to sit only inside quoted values, and `wake end` to stand at its own head. It also holds every log template in the package to a literal opening. `tests/conftest._StructuredLineGuard` renders every structured line any test logs through the real formatter, so a line built from an unmarked string fails the suite.
+
 ## [0.197.0] - 2026-11-15
 
 ### Added: `--resolved-config` reports the step limit, `max_steps` (issue #908)

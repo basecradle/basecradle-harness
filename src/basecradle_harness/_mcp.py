@@ -1389,7 +1389,7 @@ def load_mcp_tools(
         except Exception as exc:  # noqa: BLE001 - a failed server self-excludes, never fatal
             reason = f"MCP server {config.name!r} did not load: {exc}"
             resolution.skipped.append((config.name, reason))
-            _log.warning(reason)
+            _log.warning("MCP server %r did not load: %s", config.name, exc)
             _safe_close(client)
             continue
         loaded = 0

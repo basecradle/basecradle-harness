@@ -80,7 +80,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
-from basecradle_harness._observability import GREEN, YELLOW, head, kv
+from basecradle_harness._observability import GREEN, YELLOW, Rendered, head, kv
 from basecradle_harness._report import probe_prefix
 
 # The generous safe defaults. A genuine cross-wake runaway fires continuously — many engaged wakes
@@ -334,7 +334,7 @@ def breaker_tripped_line(
         source=source,
         agent=agent,
     )
-    return probe_prefix(source) + line
+    return Rendered(probe_prefix(source) + line)
 
 
 def breaker_reset_line(*, timeline: str | None = None, held: float | None = None) -> str:
@@ -347,7 +347,7 @@ def breaker_reset_line(*, timeline: str | None = None, held: float | None = None
     journal shows a trip's whole span. No fleet column reads it today; it has one author for the
     day one does.
     """
-    return f"{head(RESET_HEAD, GREEN)} " + kv(timeline=timeline, held=_measured(held))
+    return Rendered(f"{head(RESET_HEAD, GREEN)} " + kv(timeline=timeline, held=_measured(held)))
 
 
 def breaker_settings_from_env() -> tuple[int, float, float]:

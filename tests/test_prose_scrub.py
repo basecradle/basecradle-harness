@@ -108,7 +108,7 @@ def _record(msg: str, *args, exc_info=None, name: str = "basecradle_harness") ->
 
 def test_a_prose_argument_is_scrubbed_once_rendered():
     rendered = ScrubbingFormatter(LOG_FORMAT).format(_record("Could not read it: %s", Leak()))
-    assert rendered.startswith("WARNING Could not read it: Error code: 401 - Invalid API key: ")
+    assert rendered.startswith('WARNING Could not read it: "Error code: 401 - Invalid API key: ')
     assert not any(secret in rendered for secret in SECRETS), rendered
 
 
@@ -127,7 +127,7 @@ def test_another_librarys_line_is_scrubbed_too():
     record = _record("HTTP Request: GET https://h.example.com/?api_key=%s", "Zx9", name="httpx")
     assert (
         ScrubbingFormatter(LOG_FORMAT).format(record)
-        == "WARNING HTTP Request: GET https://h.example.com/[redacted]"
+        == 'WARNING httpx: "HTTP Request: GET https://h.example.com/[redacted]"'
     )
 
 
@@ -306,6 +306,10 @@ def _bound_names(tree: ast.AST) -> set[str]:
     return {h.name for h in ast.walk(tree) if isinstance(h, ast.ExceptHandler) and h.name}
 
 
+#: The calls that scrub what they are given. For a direct write the scan asks for `last_word`, which
+#: also puts the text on one line (issue #912); `scrub` alone is enough for a log argument.
+_SCRUBS = {"scrub", "last_word"}
+
 #: Calls whose result is an exception's text: a traceback rendered to a string.
 _FOREIGN_CALLS = {"traceback.format_exc", "traceback.format_exception", "traceback.format_tb"}
 
@@ -316,7 +320,7 @@ def _texts_of(node: ast.AST, errors: set[str]) -> tuple[int, int]:
     ``type(error).__name__`` names the class, not its text, so it renders nothing foreign."""
     if isinstance(node, ast.Call) and ast.unparse(node.func) == "type":
         return 0, 0
-    if isinstance(node, ast.Call) and ast.unparse(node.func) == "scrub":
+    if isinstance(node, ast.Call) and ast.unparse(node.func) in _SCRUBS:
         rendered, _ = _texts_of(ast.Tuple(elts=node.args, ctx=ast.Load()), errors)
         rendered = max(rendered, 1)
         return rendered, rendered
@@ -346,6 +350,10 @@ def test_every_direct_write_of_an_error_scrubs_it():
             if isinstance(node, ast.Call) and ast.unparse(node.func) in _DIRECT_WRITES:
                 rendered, scrubbed = _texts_of(ast.Tuple(elts=node.args, ctx=ast.Load()), errors)
                 assert rendered == scrubbed, (path.name, node.lineno, ast.unparse(node))
+                assert not rendered or "last_word(" in ast.unparse(node), (
+                    f"{path.name}:{node.lineno}: an error's text written directly goes through "
+                    "`last_word`, so it is one line (issue #912)"
+                )
                 found += scrubbed
     # wake (two), cleanup, resolve, claims (its reason and its traceback), log grammar, both palace
     # tools

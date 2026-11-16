@@ -50,6 +50,7 @@ from __future__ import annotations
 import getpass
 import logging
 import math
+import numbers
 import os
 import re
 import unicodedata
@@ -392,22 +393,75 @@ def _is_word(match: re.Match[str]) -> bool:
 LOG_FORMAT = "%(levelname)s %(message)s"
 
 
+class Rendered(str):
+    """Text the harness composed for a record — a head, a `kv` rendering, a whole structured line.
+
+    The one mark `ScrubbingFormatter` trusts (issue #912): an argument of a harness record that is
+    `Rendered` (or a number) is interpolated as written, and **every other argument is foreign** —
+    flattened, scrubbed and quoted (`_Foreign`) — because that is the only way a formatter can tell
+    the harness's own ``kv(...)`` from a vendor's error text once both are strings. So the safe
+    default is the unmarked one: an argument nobody thought about is quoted, never trusted.
+
+    `head`, `kv` and `_full_value` return one, and so does every builder of a whole structured line
+    (`_report.billing_onset_line`, `_breaker.breaker_tripped_line`, …). Concatenating one with plain
+    text yields plain text, which is the point: ``"x " + kv(...)`` is no longer only the harness's
+    words, so a builder that composes a line wraps its result itself.
+    """
+
+    __slots__ = ()
+
+
+#: The bytes one journal record may hold (issue #912). journald splits a stream line longer than its
+#: ``LineMax=`` (48K by default) into several records, and every one after the first would begin
+#: with whatever text stood at the cut — an unspoken narration is never bounded, so a model could
+#: choose it. So a record longer than this is split by the formatter instead (`_records`), into a
+#: first record that keeps its own head and continuations that each carry one of the harness's
+#: (``continued 2/3: "…"``). Measured in UTF-8 bytes, the unit journald counts in, and set well under
+#: the default so a box that lowers ``LineMax`` by less than a third still splits nothing itself.
+RECORD_BYTES = 32 * 1024
+
+#: What one continuation record of a split may spend on its envelope — the severity, the
+#: ``continued i/n: `` head and the quotes — so its content can be sized before ``n`` is known.
+_CONTINUATION_RESERVE = 64
+
+
 class ScrubbingFormatter(logging.Formatter):
-    """A `logging.Formatter` whose every rendered record has been through `scrub` (issue #857).
+    """The formatter every harness entrypoint's handler writes through: one scrubbed line per record.
 
-    `kv` scrubs each value it renders, but a **prose** line interpolates its arguments itself
-    (``_log.warning("…: %s", exc)``), and an exception's text is foreign: a vendor's 401 body can echo
-    the key it rejected. So the scrub's floor is here, over the whole record as rendered — message,
-    traceback and stack — and every line a harness entrypoint's handler writes is covered, a future
-    prose site and another library's line included, with no rule for a call site to remember.
+    Two floors, each over the whole record as rendered, so no call site has a rule to remember.
 
-    A clean line renders byte for byte as `logging.Formatter` renders it. A `kv` line is scrubbed a
-    second time, which changes nothing a value already lost, and **never
-    across a value's closing quote** (`_CLOSING_QUOTE`): a quoted value ending in ``/heartbeat/`` or
-    ``?token=`` holds no secret, and on the whole line the rule that follows it would take the quote
-    and leave the line unparseable. No rule's legitimate match holds a ``"`` followed by the next
-    field or the line's end. One over-redaction is stated: a bare value ending in ``bearer`` beside a
-    next field of eight or more characters goes with it, as it does on the box.
+    **No credential** (issue #857). `kv` scrubs each value it renders, but a prose line interpolates
+    its arguments itself (``_log.warning("…: %s", exc)``), and an exception's text is foreign: a
+    vendor's 401 body can echo the key it rejected. So the whole record is scrubbed here — message,
+    traceback and stack, a future prose site and another library's line included. A `kv` line is
+    scrubbed a second time, which changes nothing a value already lost, and **never across a value's
+    closing quote** (`_CLOSING_QUOTE`): a quoted value ending in ``/heartbeat/`` or ``?token=`` holds
+    no secret, and on the whole line the rule that follows it would take the quote and leave the line
+    unparseable. No rule's legitimate match holds a ``"`` followed by the next field or the line's
+    end. One over-redaction is stated: a bare value ending in ``bearer`` beside a next field of eight
+    or more characters goes with it, as it does on the box.
+
+    **One line, and text the harness did not write never at a head's position** (issue #912). The
+    fleet recognises a contract line by its head where the head stands — the record's start, after
+    the severity (basecradle-noc#1518) — so whatever controls a record's start can forge one. Every
+    record is therefore rendered as exactly one line whose start is the harness's:
+
+    - **a harness record's arguments are foreign unless `Rendered`** (`_prose_args`): a vendor's
+      error text, a tool's output, a model-chosen name is flattened, scrubbed and quoted when it holds
+      a space, an ``=`` or a ``"`` — the value rule of `kv`, unbounded — so a newline in it cannot
+      start a record and a ``key=`` in it cannot read as a field. A bare token (a model slug, a uuid,
+      a count) reads as it did;
+    - **a traceback or stack rides at the line's end** as one quoted string (``… "Traceback (most
+      recent call last): …"``), never as the lines Python would print;
+    - **another library's record** is the library's logger name and its message, quoted
+      (``WARNING httpx: "HTTP Request: …"``), because its text may interpolate anything at all;
+    - **a line break that survives** (one in a harness template) becomes a space (`_one_line`);
+    - **a record longer than `RECORD_BYTES`** is split by the formatter into continuations that
+      each carry a harness head (`_records`), never by journald at a byte nobody chose.
+
+    None of this adds a head or a field to the telemetry contract: every new rendering is prose
+    (`docs/telemetry.md` → Prose Lines). A clean line — every argument `Rendered`, a number, or a
+    bare token — renders byte for byte as `logging.Formatter` renders it.
 
     It protects only a process whose handler the harness installed (`log_handler`): a library caller
     that configures its own handler gets `kv`'s scrub and the sites that scrub their own argument
@@ -415,7 +469,144 @@ class ScrubbingFormatter(logging.Formatter):
     """
 
     def format(self, record: logging.LogRecord) -> str:
-        return '"'.join(scrub(part) for part in _CLOSING_QUOTE.split(super().format(record)))
+        line = '"'.join(scrub(part) for part in _CLOSING_QUOTE.split(self._line(record)))
+        return "\n".join(self._records(record, line))
+
+    def _line(self, record: logging.LogRecord) -> str:
+        """The record as one line: its message in the envelope, then its traceback and stack."""
+        record.message = self._message(record)
+        if self.usesTime():
+            record.asctime = self.formatTime(record, self.datefmt)
+        line = _one_line(self.formatMessage(record))
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+        for text in (record.exc_text, record.stack_info and self.formatStack(record.stack_info)):
+            if text:
+                line += " " + _full_value(text)
+        return line
+
+    @staticmethod
+    def _message(record: logging.LogRecord) -> str:
+        """The message: a harness record's template over its rendered arguments, or another library's
+        logger name and its whole message, quoted."""
+        if not _is_harness(record.name):
+            return f"{_one_line(record.name)}: {_full_value(record.getMessage())}"
+        message = str(record.msg)
+        return message % _prose_args(record.args) if record.args else message
+
+    def _records(self, record: logging.LogRecord, line: str) -> list[str]:
+        """`line` as the records journald will keep — itself, or split under `RECORD_BYTES`.
+
+        The first record keeps the line's own head and is closed with a ``"`` when the cut fell
+        inside a quoted value, so a reader counting quotes stays in step; each continuation is
+        ``continued i/n: "…"`` in the record's own envelope, its piece quoted with its ``"`` turned
+        to ``'`` as `kv` turns them. A cut never falls inside a ``[A-Za-z0-9_-]`` run unless one run
+        is half the budget long (`_cut`), so a credential the box redacts by length reaches it whole.
+        """
+        if len(line) * 4 <= RECORD_BYTES or len(line.encode()) <= RECORD_BYTES:
+            return [line]
+        first, rest = _cut(line, RECORD_BYTES - 1)  # room for the quote that may close it
+        pieces = []
+        while rest:
+            piece, rest = _cut(rest, RECORD_BYTES - _CONTINUATION_RESERVE)
+            pieces.append(piece)
+        records = [first + '"' if first.count('"') % 2 else first]
+        for index, piece in enumerate(pieces, start=2):
+            continuation = logging.makeLogRecord(record.__dict__)
+            quoted = '"' + piece.replace('"', "'") + '"'
+            continuation.message = f"continued {index}/{len(pieces) + 1}: {quoted}"
+            records.append(self.formatMessage(continuation))
+        return records
+
+
+#: The logger hierarchy whose records are the harness's own. Every other logger's record is another
+#: library's, rendered whole as foreign text (`ScrubbingFormatter._message`).
+_HARNESS_LOGGER = "basecradle_harness"
+
+
+def _is_harness(name: str) -> bool:
+    return name == _HARNESS_LOGGER or name.startswith(_HARNESS_LOGGER + ".")
+
+
+def _prose_args(args: Any) -> Any:
+    """A harness record's arguments with every foreign one wrapped (`_Foreign`)."""
+    if isinstance(args, Mapping):
+        return {key: _prose_arg(value) for key, value in args.items()}
+    return tuple(_prose_arg(value) for value in args)
+
+
+def _prose_arg(value: Any) -> Any:
+    """`value` as written when it is the harness's (`Rendered`) or cannot hold text (a number,
+    ``None``), and wrapped as foreign otherwise — so a ``%d`` still gets its number."""
+    if value is None or isinstance(value, (Rendered, numbers.Number)):
+        return value
+    return _Foreign(value)
+
+
+class _Foreign:
+    """A foreign argument, rendered by `kv`'s value rule without its bound when ``%s`` or ``%r``
+    asks for it: flattened, scrubbed, and quoted when it holds a space, an ``=`` or a ``"``."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __str__(self) -> str:
+        return _prose_value(str(self.value))
+
+    def __repr__(self) -> str:
+        return _prose_value(repr(self.value))
+
+
+def last_word(error: object) -> str:
+    """An error's text for a command's direct write to stderr: one line, scrubbed, and quoted when
+    it holds a space, an ``=`` or a ``"`` (issue #912).
+
+    A command's last word goes past every handler, straight to the stream a box's journal reads,
+    so it gets the formatter's rule for a foreign argument by hand: a newline in it cannot start a
+    record and a ``key=`` in it cannot read as a field. A traceback (``traceback.format_exc()``) is
+    one line too, read whole."""
+    return _prose_value(str(error))
+
+
+def _prose_value(text: str) -> str:
+    text = scrub(_flatten(text))
+    if " " in text or "=" in text or '"' in text:
+        return '"' + text.replace('"', "'") + '"'
+    return text
+
+
+#: One character that would break a record, or a run of them with the spaces around it: every C0 and
+#: C1 control character and DEL, and the Unicode line and paragraph separators — **except an ESC
+#: that opens an SGR sequence**, which is the harness's own palette (`head`, `_field`). A foreign
+#: value never carries one past `_flatten`, which removes every control character.
+_BREAK = re.compile(r"[ ]*(?:(?:\x1b(?!\[[0-9;]*m)|[\x00-\x1a\x1c-\x1f\x7f-\x9f  ])[ ]*)+")
+
+
+def _one_line(text: str) -> str:
+    """`text` with each run of record-breaking characters (`_BREAK`) as one space, trimmed at the
+    end — a clean text returned unchanged."""
+    return _BREAK.sub(" ", text).rstrip(" ") if _BREAK.search(text) else text
+
+
+def _cut(text: str, budget: int) -> tuple[str, str]:
+    """`text` cut where its head fits `budget` UTF-8 bytes: ``(head, rest)``.
+
+    The cut backs out of a ``[A-Za-z0-9_-]`` run, as `bounded` does, unless that would give up half
+    the budget (only a run that long, which no credential is, is ever cut inside), and never splits
+    an SGR escape."""
+    head = text.encode()[:budget].decode(errors="ignore")
+    if len(head) == len(text):
+        return text, ""
+    if _TOKEN_CHAR.match(text, len(head)):
+        backed = _TRAILING_RUN.sub("", head)
+        if len(backed.encode()) * 2 >= budget:
+            head = backed
+    escape = head.rfind("\x1b")
+    if escape != -1 and "m" not in head[escape:]:
+        head = head[:escape]
+    return head, text[len(head) :]
 
 
 #: A ``kv`` value's closing quote: a ``"`` followed by the next ``key=`` (colored, when it is a
@@ -643,7 +834,7 @@ def agent_slug(explicit: str | None = None) -> str:
         return "unknown"
 
 
-def head(text: str, color: str) -> str:
+def head(text: str, color: str) -> Rendered:
     r"""A line's leading **verdict** token, colored as one contiguous span.
 
     The token-integrity rule, and it is the whole of the convention: the escape goes *outside* the
@@ -670,10 +861,10 @@ def head(text: str, color: str) -> str:
     fact-heads are also the anchors the fleet dashboard extracts on (`` llm provider=``,
     `` tool name=``, `` unspoken timeline=``), which a head span would sit inside.
     """
-    return f"{color}{text}{RESET}" if color_enabled() else text
+    return Rendered(f"{color}{text}{RESET}" if color_enabled() else text)
 
 
-def kv(**fields: Any) -> str:
+def kv(**fields: Any) -> Rendered:
     """``key=value`` pairs in the order given, dropping the ones with nothing to say.
 
     ``None`` and ``""`` are omitted — an absent delivery id or trigger leaves no empty
@@ -705,7 +896,7 @@ def kv(**fields: Any) -> str:
         if rendered == "":
             continue
         parts.append(_field(key, rendered, colored=colored))
-    return " ".join(parts)
+    return Rendered(" ".join(parts))
 
 
 def _field(key: str, rendered: str, *, colored: bool) -> str:
@@ -769,7 +960,7 @@ def log_unspoken(text: str | None, *, timeline: str | None = None, kind: str = "
     )
 
 
-def _full_value(value: str) -> str:
+def _full_value(value: str) -> Rendered:
     """`_value`'s rendering minus the cap: flattened, scrubbed, quoted — never truncated.
 
     The three jobs that make a value *safe* in a log stream are kept (one record per line; no
@@ -778,7 +969,7 @@ def _full_value(value: str) -> str:
     narration is prose: it will contain spaces, and it may well contain an ``=``.
     """
     text = scrub(_flatten(value))
-    return '"' + text.replace('"', "'") + '"'
+    return Rendered('"' + text.replace('"', "'") + '"')
 
 
 #: One C0 or C1 control character, or DEL: Unicode's ``Cc`` category exactly, which is what the

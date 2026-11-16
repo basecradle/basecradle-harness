@@ -9,6 +9,7 @@ responses follow the OpenAI chat-completions / Responses schemas.
 import contextlib
 import importlib.util
 import json
+import logging
 import os
 import pathlib
 import re
@@ -313,6 +314,64 @@ def _no_price_list_from_another_test():
     _openai._LAST_LISTS.clear()
     yield
     _openai._LAST_LISTS.clear()
+
+
+class _StructuredLineGuard(logging.Handler):
+    """Every structured line a test makes the harness log, rendered through the real formatter.
+
+    `ScrubbingFormatter` quotes every argument of a harness record that is not `Rendered` (issue
+    #912), so a structured line passed in as plain text — ``"%s", f"{head(...)} " + kv(...)`` — would
+    reach the journal quoted, its head inside a string where no reader finds it, while every test
+    that reads the record through ``caplog`` (which formats with its own formatter) stayed green.
+    This handler is that missing reader: a record whose message parses as a structured line must
+    render exactly as it reads, apart from the scrub the formatter always ran.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.broken: list[tuple[str, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        from basecradle_harness._observability import (
+            _CLOSING_QUOTE,
+            RECORD_BYTES,
+            ScrubbingFormatter,
+            _is_harness,
+            scrub,
+        )
+        from tests._line_expectations import parse_line
+
+        if not _is_harness(record.name):
+            return
+        try:
+            raw = record.getMessage()
+        except Exception:  # noqa: BLE001 - a bad record is logging's own error, not this guard's
+            return
+        if "\n" in raw or parse_line(plain(raw)) is None:
+            return
+        copy = logging.makeLogRecord(
+            {**record.__dict__, "exc_info": None, "exc_text": None, "stack_info": None}
+        )
+        rendered = ScrubbingFormatter("%(message)s").format(copy)
+        expected = '"'.join(scrub(part) for part in _CLOSING_QUOTE.split(raw))
+        if len(expected.encode()) > RECORD_BYTES:
+            return  # split under the record budget on purpose (`test_one_line_records.py`)
+        if rendered != expected:
+            self.broken.append((raw, rendered))
+
+
+@pytest.fixture(autouse=True)
+def _structured_lines_render_as_written():
+    guard = _StructuredLineGuard()
+    logger = logging.getLogger("basecradle_harness")
+    logger.addHandler(guard)
+    try:
+        yield
+    finally:
+        logger.removeHandler(guard)
+    assert not guard.broken, (
+        f"a structured line the formatter would not render as written: {guard.broken}"
+    )
 
 
 # `scripts/isolated_home.py` is repo tooling, not shipped code, so it is loaded by path.

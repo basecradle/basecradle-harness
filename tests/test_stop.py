@@ -460,20 +460,37 @@ def test_a_stop_follows_a_take_over_that_has_not_rewritten_the_claim_yet(tmp_pat
 # --- the process dies by the signal -----------------------------------------------------------
 
 
-def _child(script: str, home: Path) -> subprocess.Popen:
+def _child(script: str, home: Path, *, ready_pipe: bool = False) -> subprocess.Popen:
+    """`script` in a child process; with `ready_pipe`, its READY arrives on a pipe of its own.
+
+    A real wake owns its stdout (issue #912: every line written to it becomes a journal record on
+    stderr), so a child that runs `main()` announces readiness on a descriptor the wake never touches,
+    named by ``READY_FD``, rather than by printing it.
+    """
     env = {**os.environ, "NO_COLOR": "1", "PYTHONPATH": str(REPO)}
-    return subprocess.Popen(
+    fds: tuple[int, ...] = ()
+    ready = None
+    if ready_pipe:
+        ready, write_end = os.pipe()
+        env["READY_FD"] = str(write_end)
+        fds = (write_end,)
+    child = subprocess.Popen(
         [sys.executable, "-c", textwrap.dedent(script), str(home)],
         cwd=REPO,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        pass_fds=fds,
     )
+    if ready is not None:
+        os.close(fds[0])
+        child.ready = os.fdopen(ready)
+    return child
 
 
 def _await_ready(child: subprocess.Popen) -> None:
-    line = child.stdout.readline()
+    line = (getattr(child, "ready", None) or child.stdout).readline()
     assert line.strip() == "READY", child.communicate(timeout=30)
 
 
@@ -520,7 +537,7 @@ def test_a_real_wake_sigtermed_mid_tool_logs_stopped_and_dies_by_the_signal(tmp_
     """
     child = _child(
         """
-        import sys, time
+        import os, sys, time
         from pathlib import Path
 
         import httpx, respx
@@ -536,7 +553,7 @@ def test_a_real_wake_sigtermed_mid_tool_logs_stopped_and_dies_by_the_signal(tmp_
             description = "Surveys the owls; takes a while."
 
             def run(self, **kwargs):
-                print("READY", flush=True)
+                os.write(int(os.environ["READY_FD"]), b"READY\\n")
                 time.sleep(30)
                 return "done"
 
@@ -563,6 +580,7 @@ def test_a_real_wake_sigtermed_mid_tool_logs_stopped_and_dies_by_the_signal(tmp_
             sys.exit(_wake.main(["--timeline", w.TIMELINE_UUID]))
         """,
         tmp_path,
+        ready_pipe=True,
     )
     _await_ready(child)
     child.send_signal(signal.SIGTERM)
@@ -593,7 +611,7 @@ def test_a_real_wake_sigtermed_inside_the_model_call_logs_stopped_and_dies_by_th
     """
     child = _child(
         """
-        import signal, socket, sys, threading, time
+        import os, signal, socket, sys, threading, time
         from pathlib import Path
 
         import httpx, respx
@@ -615,7 +633,7 @@ def test_a_real_wake_sigtermed_inside_the_model_call_logs_stopped_and_dies_by_th
             connection, _ = endpoint.accept()
             request = connection.recv(65536)
             if request.startswith(b"POST /v1/responses"):  # the model call, never a metadata read
-                print("READY", flush=True)  # the request is on the wire; the SDK is reading
+                os.write(int(os.environ["READY_FD"]), b"READY\\n")  # on the wire; the SDK reads
             time.sleep(60)
 
         threading.Thread(target=accept_and_never_answer, daemon=True).start()
@@ -642,6 +660,7 @@ def test_a_real_wake_sigtermed_inside_the_model_call_logs_stopped_and_dies_by_th
             sys.exit(_wake.main(["--timeline", w.TIMELINE_UUID]))
         """,
         tmp_path,
+        ready_pipe=True,
     )
     try:
         _await_ready(child)

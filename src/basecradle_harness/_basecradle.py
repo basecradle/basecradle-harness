@@ -2349,7 +2349,7 @@ def _log_level_from_env() -> int:
     return level if isinstance(level, int) else logging.INFO
 
 
-def _configure_logging() -> None:
+def _configure_logging() -> logging.StreamHandler | None:
     """Install a stderr log handler at ``HARNESS_LOG_LEVEL`` (default ``INFO``) for a CLI entrypoint.
 
     A console-script process that never configures logging runs on Python's last-resort
@@ -2361,15 +2361,20 @@ def _configure_logging() -> None:
     setup always wins and a library import never hijacks logging. ``HARNESS_LOG_LEVEL`` tunes
     the level for a noisier or quieter run; the ``INFO`` default is the point.
 
+    Returns the handler it installed, or ``None`` when it installed none, so the wake can own its
+    output streams (`_journal.owned_streams`) only when the logging is its own.
+
     ``httpx`` and ``httpx2`` are demoted to ``WARNING`` on the way (`_quiet_transport_logs`) — at
     ``INFO`` each narrates every HTTP call the platform SDK and the model SDKs make, which was the
     single loudest thing in the journal and said nothing the harness's own lines don't say better.
     """
     if logging.getLogger().handlers:
-        return
+        return None
     level = _log_level_from_env()
     logging.basicConfig(level=level, handlers=[log_handler()])
     _quiet_transport_logs(level)
+    (handler,) = logging.getLogger().handlers
+    return handler
 
 
 def _quiet_transport_logs(level: int) -> None:

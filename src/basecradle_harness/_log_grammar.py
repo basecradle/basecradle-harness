@@ -163,6 +163,7 @@ from basecradle_harness._observability import (
     agent_slug,
     bounded,
     install_log_handler,
+    last_word,
     scrub,
 )
 from basecradle_harness._report import (
@@ -398,7 +399,7 @@ def main(argv: list[str] | None = None) -> int:
         emit(messages)
         found = _read_back(messages, since=since)
     except Unprovable as error:
-        print(f"UNPROVABLE: {scrub(str(error))}", file=sys.stderr)
+        print(f"UNPROVABLE: {last_word(error)}", file=sys.stderr)
         return EX_TEMPFAIL
     if not found:
         print(
