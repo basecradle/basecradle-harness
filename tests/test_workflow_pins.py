@@ -22,43 +22,25 @@ Two kinds of reference are exempt, each for a stated reason:
 
 from __future__ import annotations
 
-import re
+import importlib.util
 from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-GITHUB = ROOT / ".github"
-# Every file the runner reads a `uses:` from: the workflows, and any composite action.
-WORKFLOWS = sorted(
-    [*(GITHUB / "workflows").glob("*.y*ml"), *(GITHUB / "actions").glob("**/action.y*ml")]
+# The one reader of a workflow's `uses:` lines lives beside the job that checks each pin's comment
+# against its action's repository (issue #916), so the shape this guard checks and the truth that
+# job checks are read off the same set of pins.
+_SPEC = importlib.util.spec_from_file_location(
+    "check_action_pins", Path(__file__).resolve().parent.parent / "scripts" / "check_action_pins.py"
 )
+assert _SPEC is not None and _SPEC.loader is not None
+pins = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(pins)
 
-# Any spelling of the key YAML accepts, quoted or with a space before the colon, so a line the
-# parser below cannot read fails the build instead of being skipped.
-MENTIONS_USES = re.compile(r"""\buses["']?\s*:""")
-
-USES = re.compile(r"^\s*(?:-\s+)?uses:\s*(?P<ref>\S+)(?P<rest>.*)$")
-PINNED = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/\S*)?@[0-9a-f]{40}$")
-VERSION_COMMENT = re.compile(r"^\s+#\s+v\d+\.\d+\.\d+\s*$")
-EXEMPT = ("./", "basecradle/")
-
-
-def references() -> list[tuple[str, int, str, str]]:
-    """Every ``uses:`` in every workflow, as (file, line number, reference, rest of line)."""
-    found = []
-    for path in WORKFLOWS:
-        for number, line in enumerate(path.read_text().splitlines(), start=1):
-            if not MENTIONS_USES.search(line) or line.lstrip().startswith("#"):
-                continue
-            match = USES.match(line)
-            assert match, f"{path.name}:{number}: a `uses:` line this guard cannot read: {line!r}"
-            found.append((str(path.relative_to(GITHUB)), number, match["ref"], match["rest"]))
-    return found
-
-
-def third_party() -> list[tuple[str, int, str, str]]:
-    return [ref for ref in references() if not ref[2].startswith(EXEMPT)]
+PINNED = pins.PINNED
+VERSION_COMMENT = pins.VERSION_COMMENT
+references = pins.references
+third_party = pins.third_party
 
 
 def test_the_guard_sees_the_publish_jobs() -> None:
@@ -102,3 +84,27 @@ def test_the_exemptions_cover_only_what_they_name() -> None:
             assert ref.startswith("basecradle/.github/.github/workflows/"), (
                 f"{name}:{number}: `{ref}` is exempt only as a fleet reusable workflow"
             )
+
+
+# The live half (`scripts/check_action_pins.py`, CI's `pins` job) reads each tag off its action's
+# repository. Its reading of `git ls-remote` is checked here, offline, on fabricated output in
+# the shape git prints (the SHAs are made up).
+_LIGHTWEIGHT = "4f1c0a9d7e2b6c3815d0e7a94b2c6f8d1e3a5b70\trefs/tags/v7.0.1\n"
+_ANNOTATED = (
+    "9b2e4d6f8a0c1e3f5a7b9d1c3e5f7a9b0c2d4e6f\trefs/tags/v1.14.3\n"
+    "c8e0a2b4d6f81a3c5e7092b4d6f8a0c2e4a6b8d0\trefs/tags/v1.14.3^{}\n"
+)
+
+
+def test_a_lightweight_tag_names_its_commit() -> None:
+    assert pins.tagged_commit(_LIGHTWEIGHT, "v7.0.1") == "4f1c0a9d7e2b6c3815d0e7a94b2c6f8d1e3a5b70"
+
+
+def test_an_annotated_tag_is_followed_to_its_commit() -> None:
+    """A SHA pin names the commit, never the tag object an annotated tag points at first."""
+    assert pins.tagged_commit(_ANNOTATED, "v1.14.3") == "c8e0a2b4d6f81a3c5e7092b4d6f8a0c2e4a6b8d0"
+
+
+def test_a_missing_tag_names_nothing() -> None:
+    assert pins.tagged_commit("", "v1.14.3") is None
+    assert pins.tagged_commit(_ANNOTATED, "v1.14") is None

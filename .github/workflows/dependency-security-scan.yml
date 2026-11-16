@@ -37,8 +37,12 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      # The token stays out of .git/config: this job runs a downloaded scanner and a script,
+      # and neither pushes.
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Pinned by version AND checksum, the checksum taken from the release's own
       # osv-scanner_SHA256SUMS: a scanner that moves under us changes what "clean" means
