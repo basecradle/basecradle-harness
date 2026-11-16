@@ -17,8 +17,8 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       - name: Install dependencies
         run: uv sync --locked
       - name: Lint
@@ -34,8 +34,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -65,7 +65,7 @@ jobs:
       matrix:
         mempalace: [locked, floor]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The path check diffs the change's two ends, so both must be in the clone.
           fetch-depth: 0
@@ -104,7 +104,7 @@ jobs:
             esac
           done <<< "$changed"
           echo "run=$run" >> "$GITHUB_OUTPUT"
-      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         if: steps.paths.outputs.run == 'true'
         with:
           python-version: "3.12"
@@ -138,7 +138,7 @@ jobs:
       # The default embedding model (about 80 MB) lands in ~/.cache/chroma on first use, and the
       # suite's throwaway HOME links that directory only when the real home already holds it
       # (scripts/isolated_home.py), so a miss downloads it here, under the real home, first.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: model
         if: steps.paths.outputs.run == 'true'
         with:
@@ -164,7 +164,7 @@ jobs:
     name: changelog
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Check release coherence
@@ -182,7 +182,7 @@ jobs:
       # Both steps are gated on the event rather than the job: a job that *skips* would
       # fail the CI gate below, which counts a skip as a failure. All-steps-skipped still
       # reports success.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'pull_request'
         with:
           # Walking base..head needs both ends present in the clone.
