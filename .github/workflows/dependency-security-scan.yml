@@ -63,19 +63,24 @@ jobs:
           chmod +x "$RUNNER_TEMP/bin/osv-scanner"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
-      # The issue and its label must come from the basecradle-ai App, never GITHUB_TOKEN:
-      # GitHub starts no workflow for an event GITHUB_TOKEN caused, so a needs-human label
-      # it applied would page nobody. Scoped to issues.
-      - name: Mint basecradle-ai App token
+      # The issue and its label must come from a GitHub App, never GITHUB_TOKEN: GitHub
+      # starts no workflow for an event GITHUB_TOKEN caused, so a needs-human label it
+      # applied would page nobody. Scoped to issues.
+      #
+      # Whose token (basecradle#870): this repository's own bot, basecradle-harness-ai[bot].
+      # FLEET_BOT_CLIENT_ID and FLEET_BOT_APP_PRIVATE_KEY hold this repository's captain's
+      # App, so the capital's key is needed nowhere here, and there is no fallback to it.
+      - name: Mint this repository's bot token
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          client-id: ${{ secrets.BASECRADLE_AI_CLIENT_ID }}
-          private-key: ${{ secrets.BASECRADLE_AI_APP_PRIVATE_KEY }}
+          client-id: ${{ secrets.FLEET_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.FLEET_BOT_APP_PRIVATE_KEY }}
           permission-issues: write
 
       # With their authors: this repository is public, so an issue carrying the scan's
-      # title is the scan's only if basecradle-ai[bot] wrote it (the script's SCAN_AUTHOR).
+      # title is the scan's only if one of its identities wrote it, this repository's bot
+      # or, from before basecradle#870, the capital's (the script's SCAN_AUTHORS).
       - name: Read the open issues
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
