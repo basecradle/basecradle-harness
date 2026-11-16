@@ -308,6 +308,32 @@ def test_a_bound_cuts_an_assignment_whole_or_not_at_all(tail, canary):
         assert silent(canary, cut)
 
 
+@pytest.mark.parametrize(
+    ("text", "cut"),
+    [
+        # The review of #918: an assignment the cut never reached once went with it, and so did
+        # the assignments before it, down to the whole field.
+        ("GH_TOKEN=abcdefghij " + "x" * 300, "GH_TOKEN='<a redacted value>' …"),
+        (
+            "env: FOO_KEY=aaaaaaaaaa BAR_TOKEN=bbbbbbbbbb " + "x" * 300,
+            "env: FOO_KEY='<a redacted value>' BAR_TOKEN='<a redacted value>' …",
+        ),
+    ],
+)
+def test_a_bound_keeps_every_assignment_it_does_not_reach(text, cut):
+    assert bounded(scrub(text), MAX_VALUE) == cut
+    assert scrub(cut) == cut  # the blank after the marker keeps the `…` off it
+
+
+def test_a_bound_over_many_assignments_is_linear():
+    for size in (20_000, 200_000):
+        text = scrub("A_KEY=x " * (size // 8)) + " " + "y" * 50
+        started = time.monotonic()
+        cut = bounded(text, len(text) - 10)
+        assert time.monotonic() - started < 1.0, size
+        assert cut.endswith("' …")
+
+
 # --- the fleet's own grammar is untouched --------------------------------------------------------
 
 

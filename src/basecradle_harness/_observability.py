@@ -349,7 +349,7 @@ _SHELL_BLANKS = " \t\n"
 _NAME_LABEL = re.compile(r"[A-Z][A-Z0-9_]*(?:" + "|".join(CREDENTIAL_WORDS) + ")=")
 
 
-def _shell_word_end(text: str, start: int) -> int:
+def _shell_word_end(text: str, start: int, limit: int | None = None) -> int:
     """Where the shell word from `start` ends: at a blank outside every quote, or the end.
 
     One word as the shell reads it, so a value is taken whole whatever surrounds it: a single- or
@@ -359,11 +359,12 @@ def _shell_word_end(text: str, start: int) -> int:
     a value short. A quote or a substitution still open at a record break ends there: it is prose (an
     apostrophe, a markdown backquote) far more often than a value that spans lines. Iterative, with
     its own stack, so no depth of nesting can exhaust the interpreter's. The router's reader
-    (basecradle-router `logfmt._shell_word_end`), carried as it is.
+    (basecradle-router `logfmt._shell_word_end`), carried as it is, but for `limit`: a word still
+    open there is reported as ending there, which is all `bounded` needs to know.
     """
     stack: list[str] = []  # what closes each open context: ' " ` ) } and $' for ANSI-C
     i = start
-    n = len(text)
+    n = len(text) if limit is None else min(limit, len(text))
     while i < n:
         c = text[i]
         top = stack[-1] if stack else ""
@@ -418,10 +419,12 @@ def _shell_word_end(text: str, start: int) -> int:
     return min(i, n)
 
 
-def _value_end(text: str, start: int) -> int:
+def _value_end(text: str, start: int, limit: int | None = None) -> int:
     """Where a credential's value from `start` ends: the longer of the shell word there and the
-    canary's run, so whatever the canary would read as the value is gone with it."""
-    return max(_shell_word_end(text, start), _CANARY_RUN.match(text, start).end())
+    canary's run, so whatever the canary would read as the value is gone with it. Read no further
+    than `limit` when one is given: a value still running there is reported as ending there."""
+    end = len(text) if limit is None else limit
+    return max(_shell_word_end(text, start, end), _CANARY_RUN.match(text, start, end).end())
 
 
 def redact_credentials(text: str) -> str:
@@ -481,26 +484,33 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
     head = text[: max(cap - len(marker), 0)]
     if _TOKEN_CHAR.match(text, len(head)):  # the next character continues the head's last run
         head = _TRAILING_RUN.sub("", head)
-    head = head.rstrip()
-    while (name := _last_credential_name(text, len(head))) is not None:
-        if _value_end(text, name.end()) < len(head):
-            break  # the last assignment before the cut ends before it: nothing reaches the cut
-        head = _TRAILING_RUN.sub("", text[: name.start()]).rstrip()
-    return head + marker if head else ""
+    head, value_end = _whole_assignments(text, head)
+    stripped = head.rstrip()
+    if stripped != head and value_end == len(stripped):
+        stripped += " "  # the blank after a value, so the marker is never glued to it
+    return stripped + marker if stripped else ""
 
 
-def _last_credential_name(text: str, end: int) -> re.Match[str] | None:
-    """The last credential name in `text` whose ``=`` lies before `end`, or ``None``.
+def _whole_assignments(text: str, head: str) -> tuple[str, int | None]:
+    """`head`, a prefix of `text`, backed off before every credential-named assignment it cuts.
 
-    `bounded` treats a credential-named assignment as one token (issue #918): one the cut would
-    reach — a `REDACTED_VALUE` it would halve, or a marker or an ``=`` the cut's ``…`` would be glued
-    to — goes whole, name and all. Otherwise a later scrub (`ScrubbingFormatter` scrubs every line
-    again) reads the cut marker or the ``…`` as a value and writes a whole marker in its place, past
-    the bound and with no ``…`` to say the text was cut."""
-    last = None
-    for match in _CREDENTIAL_NAME.finditer(text, 0, end):
-        last = match
-    return last
+    `bounded` treats an assignment as one token (issue #918): one whose value the cut reaches — a
+    `REDACTED_VALUE` it would halve, or a value running to the cut's very edge, where the ``…`` would
+    be glued to it — goes whole, name and all. Otherwise a later scrub (`ScrubbingFormatter` scrubs
+    every line again) reads the cut marker or the ``…`` as a value and writes a whole marker in its
+    place, past the bound and with no ``…`` to say the text was cut. An assignment the cut does not
+    reach is kept. Linear: the names are found once and tried from the last, and each value is read
+    no further than the head left after the one before it. Returns the head and where the value of
+    the last assignment it keeps ends, or ``None`` when it keeps none."""
+    names = list(_CREDENTIAL_NAME.finditer(text, 0, len(head)))
+    for name in reversed(names):
+        if name.end() > len(head):
+            continue  # its `=` went with an assignment already backed off
+        end = _value_end(text, name.end(), len(head))
+        if end < len(head):
+            return head, end  # the last assignment before the cut ends before it: it is kept
+        head = _TRAILING_RUN.sub("", text[: name.start()])
+    return head, None
 
 
 def scrub(text: str) -> str:
@@ -521,12 +531,13 @@ def scrub(text: str) -> str:
     the prefix rules**, so a prefix run glued before a name (``xsk-…GH_TOKEN=…``) can no longer
     take the name and leave its value to no rule.
 
-    **The marker reads back as itself**: a second scrub leaves an assignment's `REDACTED_VALUE`
-    as it is, on a text with no record break, which is every text a harness record holds
-    (`_flatten`, `_one_line`). On one that keeps a raw break, a quote left open at it ends the value
-    there, and a second scrub can read the closed marker on across the break; it only ever redacts
-    more. (A literal rule can still read its own ``[redacted]`` as a value, ``?token=&key=…``, as it
-    could before #918.)
+    **The marker reads back as itself**: a second scrub of the text `scrub` returned leaves an
+    assignment's `REDACTED_VALUE` as it is, when that text has no record break, which is every text
+    a harness record holds (`_flatten`, `_one_line`). It is read as a shell word, so it can grow on a
+    second scrub only from what was put after it since, and then only toward redaction: a quote
+    left open at a raw break, or the closing quote a ``!r`` rendering glues on (``"…X_TOKEN='<a
+    redacted value>'" to Vertex`` loses `` to Vertex``). (A literal rule can still read its own
+    ``[redacted]`` as a value, ``?token=&key=…``, as it could before #918.)
 
     Run on a whole text **before** `bounded` cuts it, so a rule is never shown a credential cut
     short of its own minimum. `kv` does both itself; a site that cuts a text for a log line before

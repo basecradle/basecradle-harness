@@ -142,8 +142,9 @@ def verbatim(exc: BaseException) -> str:
     softened, never translated — the human decides what to do from the real message.
 
     **Every credential shape is scrubbed out of it, here, at the one place it is dug out** (issue
-    #791): a span `_observability.scrub` matches becomes ``[redacted]`` and every other character
-    stays as the vendor wrote it. The text is posted to a timeline peers read (`report_body`, the
+    #791): a span `_observability.scrub` matches becomes ``[redacted]``, the value of a
+    credential-named assignment becomes ``'<a redacted value>'`` with its name kept, taken whole as
+    the shell would read it (issue #918), and every other character stays as the vendor wrote it. The text is posted to a timeline peers read (`report_body`, the
     stall note through `stall_detail`) and persisted as a claim's reason, so scrubbing it at the
     source means no reader of it can be the one that forgot — and it is scrubbed whole, before
     anything cuts it, so no rule is ever shown a credential cut short of its own minimum.
