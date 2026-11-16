@@ -54,7 +54,7 @@ from basecradle_harness._basecradle import (
     base_url_override,
     normalize_provider,
 )
-from basecradle_harness._observability import kv
+from basecradle_harness._observability import Rendered, kv
 from basecradle_harness._report import probe_prefix
 
 _log = logging.getLogger("basecradle_harness")
@@ -168,7 +168,7 @@ def key_spend_line(
         source=source,
         agent=agent,
     )
-    return probe_prefix(source) + line
+    return Rendered(probe_prefix(source) + line)
 
 
 def key_spend_error_line(
@@ -195,7 +195,7 @@ def key_spend_error_line(
         source=source,
         agent=agent,
     )
-    return probe_prefix(source) + line
+    return Rendered(probe_prefix(source) + line)
 
 
 def _refuseless(key: str) -> _Spend:

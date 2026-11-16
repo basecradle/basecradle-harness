@@ -939,8 +939,8 @@ class AnthropicProvider:
             return
         if len(marked) > anchors:
             _log.warning(
-                "%d turns were anchored for caching; Anthropic takes at most %d breakpoints and one "
-                "is reserved for the request's tail, so the latest %d are kept.",
+                "Caching anchored %d turns; Anthropic takes at most %d breakpoints and one is "
+                "reserved for the request's tail, so the latest %d are kept.",
                 len(marked),
                 MAX_BREAKPOINTS,
                 anchors,

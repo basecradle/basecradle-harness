@@ -76,7 +76,7 @@ import os
 import sys
 import time
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib import metadata
@@ -194,6 +194,7 @@ from basecradle_harness._install import (
     prompt_text,
     system_prompt_text,
 )
+from basecradle_harness._journal import owned_streams, route_crashes
 from basecradle_harness._key_spend import log_key_spend
 from basecradle_harness._mcp import McpImageStore, _timeout_from_env, load_mcp_configs_report
 from basecradle_harness._memory_provider import (
@@ -216,6 +217,7 @@ from basecradle_harness._observability import (
     head,
     in_wake,
     kv,
+    last_word,
     log_unspoken,
     scrub,
 )
@@ -6268,7 +6270,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             print(json.dumps(resolved_config(), indent=2, sort_keys=True))
         except (HarnessError, ProviderError, BaseCradleError, ValueError, KeyError) as error:
-            print(f"basecradle-harness-wake: {scrub(str(error))}", file=sys.stderr)
+            print(f"basecradle-harness-wake: {last_word(error)}", file=sys.stderr)
             return 1
         return 0
 
@@ -6278,18 +6280,36 @@ def main(argv: list[str] | None = None) -> int:
     # Configure logging before the engine runs so the per-step ledger and the other INFO
     # breadcrumbs reach stderr (issue #248). Kept off the --version/--resolved-config paths
     # above: those exit before here, so their machine-readable stdout stays uncontaminated.
-    _configure_logging()
+    handler = _configure_logging()
 
     # A stop is a stop (issue #798): SIGTERM unwinds the wake, which settles what it holds and says
     # `outcome=stopped`, and the process then dies by that signal — so the router's own
     # classification of the exit holds. Installed here, never on import: only this entrypoint owns
     # its process's signals.
     install_stop_handler()
+    # Every record of the wake's journal stream is one line with a harness head (issue #912): what
+    # anything else writes to stdout or stderr is read into whole records (`_journal`), and Python's
+    # own crash reports go through the handler. Only when the logging is this entrypoint's own, so an
+    # embedding application, or a test runner, keeps its descriptors.
+    if handler is not None:
+        route_crashes()
+    try:
+        with owned_streams(handler) if handler is not None else nullcontext():
+            stopped, code = _wake_once(args)
+    except WakeStopped as late:  # held back while the streams were handed back, then raised
+        stopped, code = late, 1
+    if stopped is not None:
+        die_by_signal(stopped)  # after the streams are handed back, so nothing written is lost
+    return code
+
+
+def _wake_once(args: argparse.Namespace) -> tuple[WakeStopped | None, int]:
+    """One wake: ``(the stop that ended it, or None; the exit code)``."""
     try:
         agent = WakeAgent.from_env(timeline=args.timeline)
         agent.wake(trigger=args.message, event_trigger=args.event, asset_trigger=args.asset)
     except WakeStopped as stop:
-        die_by_signal(stop)
+        return stop, 1
     except StaleTimelineError:
         # The delivery names a timeline the not-found 404 at bootstrap says no longer exists
         # (an HQ rotation the agent itself did, a burst that outran a deletion, a never-existed
@@ -6302,7 +6322,7 @@ def main(argv: list[str] | None = None) -> int:
             head("wake skipped", YELLOW),
             kv(timeline=args.timeline, delivery=delivery_id(), reason="timeline_deleted"),
         )
-        return 0
+        return None, 0
     except (HarnessError, ProviderError, BaseCradleError, ValueError, KeyError) as error:
         # `_act_on` degrades the per-item failures (a locked-timeline post, the engine's
         # step cap) in flight, so a wake reaching a locked timeline still exits 0. A
@@ -6318,6 +6338,6 @@ def main(argv: list[str] | None = None) -> int:
             head("wake failed", RED),
             kv(timeline=args.timeline, error=str(error), delivery=delivery_id()),
         )
-        print(f"basecradle-harness-wake: {scrub(str(error))}", file=sys.stderr)
-        return 1
-    return 0
+        print(f"basecradle-harness-wake: {last_word(error)}", file=sys.stderr)
+        return None, 1
+    return None, 0

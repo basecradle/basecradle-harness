@@ -595,7 +595,7 @@ class OpenRouterProvider:
         ceilings = [ceiling for ceiling in map(_endpoint_ceiling, pool) if ceiling is not None]
         if endpoints and not ceilings and (required or denied):
             _log.warning(
-                "%s's OpenRouter routing pin leaves none of its %d endpoints able to serve a "
+                "The OpenRouter routing pin of %s leaves none of its %d endpoints able to serve a "
                 "request (required: %s; denied: %s), so its context limit is unknown.",
                 self.model,
                 len(endpoints),

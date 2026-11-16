@@ -94,7 +94,7 @@ from basecradle._exceptions import BaseCradleError, ForbiddenError, NotFoundErro
 from basecradle_harness._basecradle import _as_uuid, _client_from_env, _configure_logging
 from basecradle_harness._install import config_home
 from basecradle_harness._mempalace import _CLI_CONFIG_DIR, _CLI_CONFIG_FILE
-from basecradle_harness._observability import RED, head, kv, scrub
+from basecradle_harness._observability import RED, Rendered, head, kv, last_word
 from basecradle_harness._token import TEMP_PREFIX, TEMP_SUFFIX
 from basecradle_harness._version import __version__
 from basecradle_harness._wake import (
@@ -187,7 +187,11 @@ class SweepSummary:
     blocked: list[Path] = field(default_factory=list)
 
     def __str__(self) -> str:
-        return (
+        return self.line()
+
+    def line(self) -> Rendered:
+        """The summary as the record the sweep logs: the harness's own words, so `Rendered`."""
+        return Rendered(
             f"cleanup sweep: checked {self.checked} timeline(s) — "
             f"purged {self.purged}, kept {self.kept}, "
             f"kept-forbidden {self.kept_forbidden}, skipped-transient {self.skipped_transient}; "
@@ -780,7 +784,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             summary = sweep(home, _client_from_env())
             blocked = summary.blocked
-            _log.info("%s", summary)
+            _log.info("%s", summary.line())
     except (BaseCradleError, OSError, ValueError, KeyError) as error:
         # A hard setup failure — no/expired credentials (`_client_from_env` or a mint),
         # an unreadable home — surfaces as a clean non-zero exit with a one-line message
@@ -799,7 +803,7 @@ def main(argv: list[str] | None = None) -> int:
         # invisible to a severity filter — and a silently-failing sweep looks exactly like a
         # sweep with nothing to do.
         _log.error("%s %s", head("cleanup failed", RED), kv(error=str(error)))
-        print(f"basecradle-harness-cleanup: {scrub(str(error))}", file=sys.stderr)
+        print(f"basecradle-harness-cleanup: {last_word(error)}", file=sys.stderr)
         return 1
 
     if blocked:

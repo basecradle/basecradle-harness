@@ -130,7 +130,7 @@ from basecradle_harness._mempalace import (
     content_hashes,
     filed_by_observe,
 )
-from basecradle_harness._observability import log_handler, scrub
+from basecradle_harness._observability import last_word, log_handler
 from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL, reranker_from_env
 from basecradle_harness._version import __version__
 
@@ -1765,7 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"failed {len(failing)}, failing digest {digest(failing)}"
                 )
     except ImportError as error:
-        print(f"{PROG}: {scrub(str(error))}", file=sys.stderr)
+        print(f"{PROG}: {last_word(error)}", file=sys.stderr)
         return 1
     return 1 if failing else 0
 

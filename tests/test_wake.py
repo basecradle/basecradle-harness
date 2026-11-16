@@ -72,7 +72,7 @@ from basecradle_harness._basecradle import (
 from basecradle_harness._brief import your_home_text
 from basecradle_harness._cleanup import prune_settled_claims
 from basecradle_harness._messages import ToolCall
-from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
+from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW, last_word
 from basecradle_harness._report import billing_onset_line
 from basecradle_harness._unspoken import addressed
 from basecradle_harness._wake import (
@@ -4247,7 +4247,7 @@ def test_resolved_config_fails_on_a_step_limit_a_wake_refuses(wake_env, monkeypa
     assert main(["--resolved-config"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == f"basecradle-harness-wake: {wake_refusal.value}\n"
+    assert captured.err == f"basecradle-harness-wake: {last_word(wake_refusal.value)}\n"
 
 
 def test_a_zero_cooldown_is_allowed_and_holds_nothing(tmp_path):

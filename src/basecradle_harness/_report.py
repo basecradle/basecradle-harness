@@ -67,7 +67,7 @@ from basecradle_harness._exceptions import (
     ProviderPayloadTooLargeError,
 )
 from basecradle_harness._media import _detail_from_body
-from basecradle_harness._observability import RED, YELLOW, bounded, head, kv, scrub
+from basecradle_harness._observability import RED, YELLOW, Rendered, bounded, head, kv, scrub
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -342,7 +342,7 @@ def billing_onset_line(
         source=source,
         agent=agent,
     )
-    return probe_prefix(source) + line
+    return Rendered(probe_prefix(source) + line)
 
 
 def billing_repeat_line(
@@ -375,7 +375,7 @@ def billing_repeat_line(
         source=source,
         agent=agent,
     )
-    return probe_prefix(source) + line
+    return Rendered(probe_prefix(source) + line)
 
 
 class BillingState:
