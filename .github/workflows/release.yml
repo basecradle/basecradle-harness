@@ -20,6 +20,14 @@
 # tests/test_publish_toolchain.py fails a pull request that lets one float again. No checkout
 # leaves its token in .git/config, because the code each job then runs (a script, a build
 # backend) has no use for it.
+#
+# Two links still move, and neither can be pinned from here. The runner image (`ubuntu-latest`)
+# is GitHub's: its python3 runs the preflight and checks uv's hashes, and its git and Node run
+# the actions. And pypa/gh-action-pypi-publish, pinned by SHA, runs its upload in a container it
+# pulls as `ghcr.io/pypa/gh-action-pypi-publish:<that SHA>`, a registry tag pypa can re-push, in
+# the jobs that hold `id-token: write`. Replacing it with `uv publish` would put the upload on the
+# locked uv, but give up the PEP 740 attestations the action makes; that is the capital's call
+# (issue #916).
 name: Release
 
 on:

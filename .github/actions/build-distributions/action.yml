@@ -5,35 +5,50 @@
 # Pinning the actions (issue #914) fixed which actions run, not what they fetch. Every link that
 # makes the published bytes is held by `uv.lock` here, so it moves only as a diff Dependabot opens:
 #
-#   * uv is the version the lock holds (the `build` group in pyproject.toml). Given no version,
-#     setup-uv installs the newest uv on the day of the tag, and given none but a pyproject.toml it
-#     reads the group's floor, which floats the same way; `version-file: uv.lock` is the exact one.
+#   * uv is the wheel the lock holds (the `build` group in pyproject.toml), installed by pip in
+#     hash-checking mode from the lock's own sha256s (scripts/locked_requirement.py). Not
+#     astral-sh/setup-uv: it downloads uv's release archive, and for a uv newer than the action's
+#     built-in checksum table it trusts a checksum fetched at run time from the same host.
 #   * The build backend and everything it imports resolve inside `uv build`'s isolated
 #     environment, which reads only `[build-system].requires` (`hatchling>=1.27`) and would take
 #     the newest of each. The lock's versions and hashes are exported as build constraints, and
 #     `--require-hashes` refuses any build requirement without a trusted hash, a missing one
 #     included.
 #   * The interpreter is a uv-managed CPython (`--managed-python`), the newest release of the
-#     `.python-version` series the pinned uv knows and verified against the checksum built into
-#     it, never whatever the runner image ships.
+#     `.python-version` series the pinned uv knows, verified against the checksum built into it,
+#     never whatever the runner image ships.
 #
-# No cache: a restored cache would supply build requirements this run did not download, and the
-# point is that every byte here is fetched against a hash this repository holds.
+# What is left is the runner: its image, and the python3 and pip that check uv's hashes. No cache:
+# a restored cache would supply build requirements this run did not download. Dependabot does not
+# read composite actions, so this file names no third-party action
+# (tests/test_publish_toolchain.py).
 name: Build the Distributions
 description: Build the wheel and sdist into dist/ with the toolchain uv.lock pins.
 
 runs:
   using: composite
   steps:
-    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      with:
-        version-file: uv.lock
-        enable-cache: false
+    - name: Install the locked uv from the lock's hashes
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 scripts/locked_requirement.py uv > "$RUNNER_TEMP/uv-requirement.txt"
+        python3 -m venv "$RUNNER_TEMP/uv-venv"
+        "$RUNNER_TEMP/uv-venv/bin/python" -m pip install --quiet --disable-pip-version-check \
+          --require-hashes --no-deps --only-binary :all: -r "$RUNNER_TEMP/uv-requirement.txt"
+        # Only uv on the PATH, never the bootstrap's python.
+        mkdir -p "$RUNNER_TEMP/uv-bin"
+        ln -sf "$RUNNER_TEMP/uv-venv/bin/uv" "$RUNNER_TEMP/uv-bin/uv"
+        echo "$RUNNER_TEMP/uv-bin" >> "$GITHUB_PATH"
     - name: Export the locked build toolchain as hashed constraints
       shell: bash
-      run: >-
-        uv export --locked --only-group build --no-emit-project --format requirements.txt
-        --output-file "$RUNNER_TEMP/build-constraints.txt"
+      run: |
+        set -euo pipefail
+        # The uv on the PATH is the one just installed, at the version the lock holds.
+        locked="$(cut -d' ' -f1 "$RUNNER_TEMP/uv-requirement.txt")"
+        test "uv==$(uv --version | cut -d' ' -f2)" = "$locked"
+        uv export --quiet --locked --only-group build --no-emit-project --format requirements.txt \
+          --output-file "$RUNNER_TEMP/build-constraints.txt"
     - name: Build the wheel and sdist
       shell: bash
       run: >-

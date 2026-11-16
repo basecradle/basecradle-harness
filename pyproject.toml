@@ -183,9 +183,10 @@ dev = [
 ]
 # The toolchain that makes the published bytes (issue #916), held here so `uv.lock` pins every
 # version and hash of it and Dependabot's uv entry moves it as a reviewable diff. Nothing installs
-# this group: `uv sync` installs `dev` only. `uv` is read off the lock by `astral-sh/setup-uv`
-# (`version-file: uv.lock`, in CI and in the release alike), and the build backend is exported
-# from the lock as hashed constraints for `uv build` (`.github/actions/build-distributions`).
+# this group: `uv sync` installs `dev` only. The build (`.github/actions/build-distributions`)
+# installs the locked `uv` wheel by the lock's own hashes and exports the build backend from the
+# lock as hashed constraints for `uv build`; CI's `astral-sh/setup-uv` steps read the same uv
+# version off the lock (`version-file: uv.lock`).
 # Every name in `[build-system].requires` is declared here with the same specifier, or it would
 # resolve fresh on every tag; `tests/test_publish_toolchain.py` fails the build otherwise.
 build = [

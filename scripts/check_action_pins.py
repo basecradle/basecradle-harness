@@ -93,13 +93,19 @@ def ls_remote(repository: str, tag: str) -> str:
     # No prompt for a repository that does not exist (GitHub answers it as an auth challenge).
     environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     for attempt in range(1, ATTEMPTS + 1):
-        result = subprocess.run(
-            command, capture_output=True, text=True, timeout=60, env=environment, check=False
-        )
-        if result.returncode == 0:
-            return result.stdout
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=60, env=environment, check=False
+            )
+        except subprocess.TimeoutExpired:
+            # A hung transport is the case a retry is for.
+            failure = "timed out after 60s"
+        else:
+            if result.returncode == 0:
+                return result.stdout
+            failure = result.stderr.strip()
         if attempt == ATTEMPTS:
-            raise RuntimeError(f"git ls-remote {repository} {tag}: {result.stderr.strip()}")
+            raise RuntimeError(f"git ls-remote {repository} {tag}: {failure}")
         time.sleep(5 * attempt)
     raise AssertionError("unreachable")
 

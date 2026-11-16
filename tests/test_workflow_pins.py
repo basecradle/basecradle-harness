@@ -87,21 +87,22 @@ def test_the_exemptions_cover_only_what_they_name() -> None:
 
 
 # The live half (`scripts/check_action_pins.py`, CI's `pins` job) reads each tag off its action's
-# repository. Its reading of `git ls-remote` is checked here, offline, on fabricated output.
-_LIGHTWEIGHT = "3d3c42e5aac5ba805825da76410c181273ba90b1\trefs/tags/v7.0.1\n"
+# repository. Its reading of `git ls-remote` is checked here, offline, on fabricated output in
+# the shape git prints (the SHAs are made up).
+_LIGHTWEIGHT = "4f1c0a9d7e2b6c3815d0e7a94b2c6f8d1e3a5b70\trefs/tags/v7.0.1\n"
 _ANNOTATED = (
-    "aef6c9b6e301dc803e1bc9133e9ce67ae9b0906b\trefs/tags/v1.14.3\n"
-    "7245906fb61fa33a13554f9d5fb856fe61758086\trefs/tags/v1.14.3^{}\n"
+    "9b2e4d6f8a0c1e3f5a7b9d1c3e5f7a9b0c2d4e6f\trefs/tags/v1.14.3\n"
+    "c8e0a2b4d6f81a3c5e7092b4d6f8a0c2e4a6b8d0\trefs/tags/v1.14.3^{}\n"
 )
 
 
 def test_a_lightweight_tag_names_its_commit() -> None:
-    assert pins.tagged_commit(_LIGHTWEIGHT, "v7.0.1") == "3d3c42e5aac5ba805825da76410c181273ba90b1"
+    assert pins.tagged_commit(_LIGHTWEIGHT, "v7.0.1") == "4f1c0a9d7e2b6c3815d0e7a94b2c6f8d1e3a5b70"
 
 
 def test_an_annotated_tag_is_followed_to_its_commit() -> None:
     """A SHA pin names the commit, never the tag object an annotated tag points at first."""
-    assert pins.tagged_commit(_ANNOTATED, "v1.14.3") == "7245906fb61fa33a13554f9d5fb856fe61758086"
+    assert pins.tagged_commit(_ANNOTATED, "v1.14.3") == "c8e0a2b4d6f81a3c5e7092b4d6f8a0c2e4a6b8d0"
 
 
 def test_a_missing_tag_names_nothing() -> None:
