@@ -632,6 +632,10 @@ def test_an_issue_a_sibling_bot_filed_is_not_the_scans() -> None:
 
     assert sole(scan_of(advisory).plans([issue])).action == "create"
 
+    # Nor its could-not-run issue: a recovering run leaves it alone rather than closing it.
+    stuck = open_issue(sole(scan_of(errors={"pypi": "x"}).plans([])), author=sibling)
+    assert scan_of().plans([stuck]) == []
+
 
 def test_an_issue_with_no_author_is_not_the_scans() -> None:
     advisory = pypi("httpx", "GHSA-1111-2222-3333", "critical")
