@@ -325,7 +325,7 @@ The describer answering again from its once-per-wake memo instead of calling a m
 | `degraded` | The work was done and is usable, with a shortfall the line names. | Required. |
 | `error` | The work was not done, or cannot be used. | Required. |
 
-A `charge` is on this dimension because a billed resource is tool-adjacent (see [`charge`](#charge)), and the shortfall known today is one about money: Steel's stated cost and the rate card disagreeing. It is never a `tool` line, because a session is billed by the minute across zero or more tool uses (@origin, 2026-11-01). A clean `charge` is not a tool use, so a chart of tool outcomes counts every `tool` line (the WARNING companion excluded, as `tool_calls` excludes it) and a `charge` only when it is not `ok`, which keeps the chart's total equal to the tool calls plus the sessions that went wrong.
+A `charge` is on this dimension because a billed resource is tool-adjacent (see [`charge`](#charge)), and the shortfall known today is one about money: Steel's stated cost and the rate card disagreeing. It is never a `tool` line, because a session is billed by the time it runs across zero or more tool uses (@origin, 2026-11-01). A clean `charge` is not a tool use, so a chart of tool outcomes counts every `tool` line (the WARNING companion excluded, as `tool_calls` excludes it) and a `charge` only when it is not `ok`, which keeps the chart's total equal to the tool calls plus the sessions that went wrong.
 
 ### `cost unpriced`
 
@@ -342,11 +342,11 @@ One WARNING, once per wake per gap, naming a charge that is real and that the ha
 
 **A tool's own fee** (issue #880). A fee the harness computes for a tool use is stated the same way: one line per wake per gap, and the reason on the use's own `tool` line as `cost_gap=`, which is the count. `search` is a server-side web search's per-call fee on a host whose price is not the table's (OpenAI's and Anthropic's `web_search`); `grounding` a grounded search's fee the table cannot count (Google); `image` an image made or edited through the Images API, and `audio` a recording transcribed, each named for the family of the `kind` its `tool` line carries (`image.*`, `audio.*`). A tool states no gap in prose.
 
-A `container_time` or `browser_time` gap is the charge the next head would carry: the day a vendor states its container time, or a browser vendor's session minutes get a rate card, that charge is written as a priced `charge kind=compute.container` or `charge kind=browser.session` line and leaves this one. **The rule for the next value:** a gap in a charge billed per call or per use is named for what is billed (`tokens`, `grounding`, `search`, `image`, `audio`); a gap in a charge billed by a quantity of a resource is `<resource>_time` (or `_bytes`, `_storage` for a resource with no run time), and the sentence above names the [`charge`](#charge) `kind` that retires it. Either way it is generic in spelling, never a vendor's name or word, and a new value is a change to this page.
+A `container_time` or `browser_time` gap is the charge the next head would carry: the day a vendor states its container time, or a browser vendor's session time gets a rate card, that charge is written as a priced `charge kind=compute.container` or `charge kind=browser.session` line and leaves this one. **The rule for the next value:** a gap in a charge billed per call or per use is named for what is billed (`tokens`, `grounding`, `search`, `image`, `audio`); a gap in a charge billed by a quantity of a resource is `<resource>_time` (or `_bytes`, `_storage` for a resource with no run time), and the sentence above names the [`charge`](#charge) `kind` that retires it. Either way it is generic in spelling, never a vendor's name or word, and a new value is a change to this page.
 
 ### `charge`
 
-**One line per billed resource instance**: a dollar a vendor bills by a quantity of a resource — browser session minutes, container hours, a 15-minute GPU block, bytes, storage — rather than per call (@origin, 2026-11-01, on basecradle-noc#1153). It is neither a tool *use* nor a model call, so it has a head of its own, and every resource-billed product fits it without a new one.
+**One line per billed resource instance**: a dollar a vendor bills by a quantity of a resource — browser time in the vendor's own billing unit (`second` on Steel's current plans, `minute` on some older ones), container hours, a 15-minute GPU block, bytes, storage — rather than per call (@origin, 2026-11-01, on basecradle-noc#1153). It is neither a tool *use* nor a model call, so it has a head of its own, and every resource-billed product fits it without a new one.
 
 ```text
 charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit=<billing unit> count=<quantity in that unit> [duration=<s>] [started=<iso>] [resource=<vendor resource id>] [generation_id=<model call it belongs to>] outcome=ok|degraded|error [reason=<slug>] cost=<usd> [cost_basis=computed] [vendor_usage=<vendor's own raw figure> vendor_unit=<its unit>]
@@ -362,7 +362,7 @@ charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit
 | `provider` | The vendor that bills the resource. | The producer. | Never. |
 | `kind` | What was bought, in the dotted vocabulary the `tool` line's `kind` uses, so one query reads a family's spend whether a vendor bills it per use or per resource: `browser.session`, `compute.container`, `compute.gpu`, `storage.cache`, and any `tool` kind (`image.generate`, …). A new value is a change to this page. | The producer. | Never. |
 | `executor` | Common: who ran the thing that incurred the charge. | The producer. | Never. |
-| `unit` | Common: the billing unit `count` is in — `minute`, `hour`, `block_15m`, `gb`, `gb_month`, `seat_month`. An open set, listed here as it grows. | The producer. | Never. |
+| `unit` | Common: the billing unit `count` is in — `second`, `minute`, `hour`, `block_15m`, `gb`, `gb_month`, `seat_month`. An open set, listed here as it grows. | The producer. | Never. |
 | `count` | Common: the billed quantity, in `unit`, rounded the way the vendor rounds it. | The producer. | Never. |
 | `duration` | Common: how long the resource instance ran. | The producer. | The resource has no run time (bytes, storage). |
 | `started` | The moment the resource instance started. | The producer. | The vendor states no start. |
@@ -375,13 +375,13 @@ charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit
 | `vendor_usage` | The vendor's own raw figure for the instance, verbatim, when it reports one in a unit this page cannot yet price (a plan's credits, say) — kept for calibrating a computed `cost`. Generic, never a vendor-named field. | The producer. | The vendor reports no such figure. |
 | `vendor_unit` | The unit `vendor_usage` is in (`credits`). | The producer. | `vendor_usage` is absent; never present without it. |
 
-The first producer is the NOC's Steel browser launcher (see [Outside This Repository](#outside-this-repository)); nothing in this repository writes a `charge` line yet. Its per-session spend line, whose `cost` is the dollar Steel states, so it carries no `cost_basis`:
+The first producer is the NOC's Steel browser launcher (see [Outside This Repository](#outside-this-repository)); nothing in this repository writes a `charge` line yet. Its per-session spend line, whose `cost` is the dollar Steel states, so it carries no `cost_basis` (these examples predate Steel's move to per-second billing, so they are in `minute`; a session today writes `unit=second`):
 
 ```text
 INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=7 duration=402.18s started=2026-11-01T03:12:40Z resource=01a19518-4c40-7c41-9f3e-5d8c1a2b4e60 outcome=ok cost=0.07
 ```
 
-A session Steel released as `browser_crashed`, billed for the minutes it ran:
+A session Steel released as `browser_crashed`, billed for the time it ran:
 
 ```text
 INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=2 duration=71.40s started=2026-11-01T03:20:05Z resource=01a19518-5b12-7d03-8e6a-2c4f9b7d1e83 outcome=error reason=crashed cost=0.02
@@ -393,7 +393,7 @@ A session whose stated cost the published rates do not reproduce:
 INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=8 duration=471.02s started=2026-11-08T14:02:11Z resource=01a19518-7e44-7a12-b3c0-6f1d8e2a9c07 outcome=degraded reason=cost_divergence cost=0.0633
 ```
 
-A session on a Steel plan whose per-minute rate the launcher's table lacks writes no `charge` line, and one `cost unpriced` gap instead:
+A session on a Steel plan whose rate the launcher's table lacks writes no `charge` line, and one `cost unpriced` gap instead:
 
 ```text
 WARNING cost unpriced provider=steel charge=browser_time reason=unpriced_tier
@@ -942,7 +942,7 @@ The slices are the issues that remove each row: **slice 2 — tools** ([#758](ht
 
 ### Outside This Repository
 
-The NOC's Steel browser launcher writes its own `browser provider=` head. Its per-session spend line retires into the [`charge`](#charge) line (@origin, 2026-11-01: a session is billed by the minute, not per tool use, so it is not a `tool` line); its lifecycle lines stay on a NOC-only head that no column reads. It is not emitted here, so it is not witnessed here; the launcher's move is basecradle-noc#1153's. A cost shortfall is stated on the `charge` line's own `outcome` (issue #822), so the launcher's `session.ended` companion is detail, never a second verdict a chart reads. Slice 2 carried the rest to the NOC through the capital, together with the NOC columns that read what this repository retired in slice 2 (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`), which read the `tool` line instead.
+The NOC's Steel browser launcher writes its own `browser provider=` head. Its per-session spend line retires into the [`charge`](#charge) line (@origin, 2026-11-01: a session is billed by the time it runs, not per tool use, so it is not a `tool` line); its lifecycle lines stay on a NOC-only head that no column reads. It is not emitted here, so it is not witnessed here; the launcher's move is basecradle-noc#1153's. A cost shortfall is stated on the `charge` line's own `outcome` (issue #822), so the launcher's `session.ended` companion is detail, never a second verdict a chart reads. Slice 2 carried the rest to the NOC through the capital, together with the NOC columns that read what this repository retired in slice 2 (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`), which read the `tool` line instead.
 
 The Claude Code builders' model calls reach this contract through the router's `ai_otel_llm` remap (basecradle-router `deploy/vector.yaml`), which renders each `api_request` as an `llm` line. Under issue #782 an `api_error` (Claude Code's final failure, after its own retries) is rendered as `llm … outcome=failed reason=<slug>` with no tokens, and an auxiliary call as `purpose=helper` with no `kind` (basecradle-router#384). Its slug is read off the status by [Fault Slugs](#fault-slugs); the remap adopts that table's `transport`, `config:auth`, `config:billing`, `config:model_not_found` and `payload_too_large` in basecradle-router's follow-up to issue #786, and until then writes `api_error` for each. Its `duration` is absent where Claude Code cannot state the whole wait (an `api_error` after more than one attempt, or with no status), and its `failed` line is WARNING. A builder's line carries no `timeline`, `delivery` or `step`: it has no wake.
 
