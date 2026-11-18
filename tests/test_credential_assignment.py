@@ -153,7 +153,7 @@ def test_a_bare_word_and_the_base_tail_are_credentials_names(text, scrubbed, can
         "GH_TOKENS=abcdefghij",
         "API_KEY_ID=abcdefghij",
         "KEY_BASES=abcdefghij",
-        "SECRET_KEY_BASE_DUMMY=1",
+        "SECRET_KEY_BASE_DUMMY=abcdefghij",
         "gh_token=abcdefghij",
     ],
 )
@@ -389,6 +389,29 @@ def test_a_name_inside_a_value_takes_its_value_with_it(text, redacted, canary):
     for redact in (redact_credentials, scrub):
         assert redact(text) == redacted
         assert "hunter2" not in redact(text)
+    assert silent(canary, redacted)
+
+
+@pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        # The review of #927: a name inside a name inside a value is read whole too, so a bare word
+        # that became a name (`PASSWORD=`) never pushes a real one down to the canary's run alone.
+        (
+            "PASSWORD=x,AUTH_TOKEN=\tDB_TOKEN=Bearer s3cr3t next=1",
+            "PASSWORD='<a redacted value>' next=1",
+        ),
+        (
+            'PASSWORD=x,A_TOKEN=\tB_TOKEN=Bearer "eyJ secret" next=1',
+            "PASSWORD='<a redacted value>' next=1",
+        ),
+        ("A_KEY=X_TOKEN=\tY_TOKEN=Bearer s3cr3t next=1", "A_KEY='<a redacted value>' next=1"),
+        ("TOKEN=PASSWORD=\tAKEY=' hunter2hunter2", "TOKEN='<a redacted value>'"),
+    ],
+)
+def test_a_name_at_any_depth_takes_its_value_with_it(text, redacted, canary):
+    for redact in (redact_credentials, scrub):
+        assert redact(text) == redacted
     assert silent(canary, redacted)
 
 

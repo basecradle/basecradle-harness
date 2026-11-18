@@ -16,6 +16,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A bare word is a name**: `PASSWORD=`, `KEY=`, `_TOKEN=` and `PASSPHRASE=` lose their values now, where the old rule wanted a capital before the word.
 - **`_BASE` is the one tail after the word** (`_observability.CREDENTIAL_TAIL`): `SECRET_KEY_BASE=`, the Rails master secret's name, loses its value. No other tail: `GH_TOKEN_FILE=`, `API_KEY_ID=` and `GH_TOKENS=` are kept, as the canary keeps them.
 - `CREDENTIAL_NAME` is still linear, pinned to end at exactly the canary's `=`s, and a literal rule's label is read by the same definition (`?TOKEN=` keeps its label and writes the marker).
+- **A name inside a name inside a value is read whole too.** A bare word that became a name could push a real one a level deeper, where only the canary's run was read: `PASSWORD=x,AUTH_TOKEN=<TAB>DB_TOKEN=Bearer s3cr3t` kept `s3cr3t`. Every nested name is now read as any value is, under a work budget of a few times the text, past which (a value names fill so densely that each reading takes the rest of the text) only the canary's run is read, so the reading stays linear. A differential fuzz of 1,200,000 texts against `main` finds no secret the new scrub leaves that the old one redacted.
+- **Not changed: a hyphenated label** (`X-API-KEY=`, `?ACCESS-TOKEN=`) ends in a name the canary reads but still goes with its value as `[redacted]`, as before; keeping it would put a marker inside an enclosing open quote, a class the scrub already mishandles for a whole-name label. Both are on issue #929.
 
 ### Fixed: A credential's bearer value takes its token, in the assignment pass itself (issue #926, basecradle-router#497)
 
