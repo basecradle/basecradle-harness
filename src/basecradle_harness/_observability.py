@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import contextlib
 import getpass
+import heapq
 import logging
 import math
 import numbers
@@ -156,7 +157,7 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: admits capitals, ``_`` and ``-`` (``^tk_[-_A-Za-z0-9]{29}$``, ntfy's ``user/util.go``), which is
 #: the run ``tk_`` takes. A generated token with no digit, about 1 in 12,500, is the word residual
 #: below when glued to a letter. A key with no prefix of its own (Wiro's) has no shape a prefix rule
-#: can match; it is covered where it travels, as an ``x-api-key`` header value (`_LITERAL_RULES`,
+#: can match; it is covered where it travels, as an ``x-api-key`` header value (`_X_API_KEY`,
 #: issue #861).
 #:
 #: **A vendor prefix inside a word is a word, not a credential** (issue #794), and the test is
@@ -219,18 +220,17 @@ def _rule(index: int, prefix: str, run: str, least: int) -> str:
 
 _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PREFIXED)))
 
-#: The rules anchored on a literal of their own — a heartbeat URL, a bearer header, a key in a query,
-#: an ``api_key=`` assignment — which are redacted wherever they match. **They run in a pass before
-#: the prefix rules**, because their literals are made of the characters a prefix rule's run is: in
-#: one alternation the leftmost match wins, so ``task-runner-api-key=…`` was consumed as the run
-#: ``sk-runner-api-key`` and the value after ``=`` was never matched by anything, and
-#: ``task-runner-bearer …`` lost its bearer value the same way. A prefix run cannot reach across the
-#: ``[redacted]`` the first pass leaves, so the second pass never undoes it. Inside this pass the
-#: same holds between two rules: an assignment whose value is a bearer header
-#: (``AUTH_API_KEY=Bearer eyJ…``) takes every ``Bearer`` and the token together, where it once took
-#: ``Bearer`` as the whole value and left the token after the space; every, because a token stored
-#: with its scheme and sent with another reads ``Bearer Bearer eyJ…``. The heartbeat URL runs first
-#: of all, alone (`_HEARTBEAT_RUN`).
+#: The rules anchored on a literal of their own — an ``x-api-key`` header, a key in a query, an
+#: ``api_key=`` assignment, a bearer header — each redacted wherever it matches. **Every rule reads
+#: the text as it came, and what the scrub takes is the union of what each rule takes** (`scrub`,
+#: issue #929): no rule is ever shown another's ``[redacted]``, so no order among the rules can make
+#: one take less than it takes alone. The rules once ran as passes, each over the last one's output,
+#: and every leak that order made is the reason they do not: ``task-runner-api-key=…`` consumed as
+#: the prefix run ``sk-runner-api-key``, its value matched by nothing; ``Bearer AB_TOKEN=secretsecret``
+#: redacted to ``[redacted]=secretsecret``, whose name no later pass could see; a run of scheme words
+#: split by the bearer rule (``A_TOKEN=Bearer x.Bearer 'eyJ…'``), the token left after the split; and
+#: a marker written inside an enclosing value's open quote (``A_TOKEN=='\X_API_KEY=x-api-key: eyJ…``),
+#: whose own quotes moved that quote's end and left the token outside every value.
 #:
 #: **An assignment's value may open with a ``"``, and a bearer header glued to a value goes with it**
 #: (the review of #857): ``API_KEY="…"`` once matched nothing, because the value could not start at
@@ -249,30 +249,47 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: with it** (``x-api-key: KBearer eyJ…``): the value would otherwise end at the scheme word and
 #: leave its token to no rule, the class `_TRAILING_BEARER` closes for a heartbeat URL. The
 #: unquoted ``X-API-Key=…`` is left to the ``api_key=`` rule below, which always took it with the
-#: wider value it allows. It is the first alternative, so the header's name goes with its value; a
-#: key glued directly before the name loses the ``x-`` to it, which leaves it unmatched only when it
-#: was already shorter than its rule's minimum, which no real key is. A bare ``x-api-key`` with no
-#: value is a word.
+#: wider value it allows. The header's name goes with its value. A bare ``x-api-key`` with no value
+#: is a word.
 #: Wiro's signing secret is never sent (its ``x-signature`` is an HMAC keyed on the API key), so
 #: there is nothing more to match.
-_LITERAL_RULES = re.compile(
+#:
+#: **A label that ends in a credential's name keeps it** (``OPENAI_API_KEY=…``, ``?ACCESS_TOKEN=…``,
+#: ``X-API-KEY=…``): where the assignment rule finds a name ending at the label's ``=``, the label
+#: stays and its value becomes `REDACTED_VALUE`, as every credential-named assignment's does; any
+#: other label (``api_key=``, ``?token=``) goes with its value as ``[redacted]``.
+_X_API_KEY = re.compile(
     r"(?i:x[-_]api[-_]?key)(?:\\?[\"']\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?[\"'])?"
     r"(?:(?i:bearer)\s+)*(?:[^\s\"'&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s\"'&\\]+)"
-    r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
-    r"|(?P<query>[?&](?i:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*"
+)
+_QUERY = re.compile(
+    r"(?P<label>[?&](?i:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*"
     r"(?:[^&\s]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^&\s]+)"
-    r"|(?P<assignment>(?i:api[-_]?key=))\"?(?:(?i:bearer)\s+)*"
+)
+_API_KEY = re.compile(
+    r"(?P<label>(?i:api[-_]?key=))\"?(?:(?i:bearer)\s+)*"
     r"(?:[^&\s\"]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^&\s\"]+)"
 )
+
+#: A bearer header: the scheme word in any case and its token, which is eight or more token
+#: characters, so a diagnosis like "Bearer token missing" keeps its words, or a token that opens
+#: with a quote or a substitution (issue #929), taken whole as the shell word it opens
+#: (`_shell_word_end`), as a credential's value is read. Quoted, a token is no run of token
+#: characters, and ``Bearer 'eyJ…'`` once matched nothing. **A run of scheme words goes with the
+#: token after it** (`_bearer_end`).
+_BEARER = re.compile(r"(?P<scheme>(?i:bearer)\s+)(?:[A-Za-z0-9._~+/-]{8,}|[\"'`]|\$['({])")
+_BEARER_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{8,}")
+_BEARER_GAP = re.compile(r"\s+")
+_TOKEN_OPENERS = ("'", '"', "`", "$'", "$(", "${")
 
 #: A Better Stack heartbeat URL, whose secret is its path, redacted by the box's rule
 #: ``(?:https?://\S*)?/heartbeat/\S+`` (basecradle-router#398): a URL with a scheme from the scheme
 #: on, so userinfo before the host (``https://john:…@host/…/heartbeat/…``) never ships; one without
 #: (``curl uptime.example.com/api/v1/heartbeat/…``) from ``/heartbeat/`` on, keeping its host, which
-#: is not the secret. **It runs first, before every other rule**, as the box's does: a rule that
-#: matched first and stopped inside the URL (a bearer run takes ``…https`` and stops at the ``:``)
-#: would leave the rest of it, userinfo included, to the scheme-less arm alone; and this pattern
-#: starts only at a run's start, which a match ending mid-run in one alternation would skip.
+#: is not the secret. **On the box it runs first, before every other rule**: a rule that matched
+#: first and stopped inside the URL (a bearer run takes ``…https`` and stops at the ``:``) would
+#: leave the rest of it, userinfo included, to the scheme-less arm alone. Here every rule reads the
+#: text as it came (`scrub`), so no other rule's match can stop inside the URL or hide a run's start.
 #:
 #: **The box's pattern is not used here, because in `re` it is quadratic**: every ``https?://`` in a
 #: space-free run scans to the run's end before it fails, and ``"http://" * 8000`` took 2.9 s. So this
@@ -354,24 +371,40 @@ _CANARY_RUN = re.compile("[^" + re.escape(CANARY_VALUE_STOPS + _BREAK_CHARS) + "
 #: The characters that end an unquoted shell word: the shell's blanks and its newline.
 _SHELL_BLANKS = " \t\n"
 
-#: A literal rule's label that is itself a credential's name (``API_KEY=``, the ``ACCESS_TOKEN=`` of
-#: ``?ACCESS_TOKEN=``), which `_literal_pass` keeps, writing `REDACTED_VALUE` after it. No literal
-#: label can end in the tail, so only the word is spelled here.
-_NAME_LABEL = re.compile("[A-Z0-9_]*(?:" + "|".join(CREDENTIAL_WORDS) + ")=")
+#: The end of a credential name, its ``=`` included: a credential word, the one tail, the ``=``. The
+#: canary's name is unanchored, so whatever comes before the word, this is a name's end.
+_NAME_END = re.compile("(?:" + "|".join(CREDENTIAL_WORDS) + f")(?:{CREDENTIAL_TAIL})?=\\Z")
+_NAME_END_REACH = max(len(word) for word in CREDENTIAL_WORDS) + len(CREDENTIAL_TAIL) + 1
+
+# --- the router's reading (basecradle-router `logfmt`, issue #929) --------------------------------
+#
+# A credential's value is read here exactly as the router reads it (basecradle-router#506, merged as
+# `153fb58`: `logfmt._shell_word_end` and `logfmt._value_end`), so both writers on a box leave the
+# same bytes where a value stood; `tests/router_reading.py` carries the router's functions verbatim
+# and `tests/test_credential_assignment.py` holds the two readings equal on fuzzed text. The one
+# addition is `limit`, which only `bounded` passes: the reading goes no further than it, and a value
+# that reaches it is reported as ending there.
 
 
-def _shell_word_end(text: str, start: int, limit: int | None = None) -> int:
+def _shell_word_end(text: str, start: int, limit: int | None = None) -> tuple[int, bool]:
     """Where the shell word from `start` ends: at a blank outside every quote, or the end.
 
     One word as the shell reads it, so a value is taken whole whatever surrounds it: a single- or
     double-quoted string, an ANSI-C ``$'…'``, a ``$(…)``, ``${…}`` or ``(…)`` (each nesting as the
-    shell's does, quotes inside included), a backquoted command, and a backslash escape. Only a
-    space, a tab or a newline ends an unquoted word, as in the shell, so no other character can cut
-    a value short. A quote or a substitution still open at a record break ends there: it is prose (an
-    apostrophe, a markdown backquote) far more often than a value that spans lines. Iterative, with
-    its own stack, so no depth of nesting can exhaust the interpreter's. The router's reader
-    (basecradle-router `logfmt._shell_word_end`), carried as it is, but for `limit`: a word still
-    open there is reported as ending there, which is all `bounded` needs to know.
+    shell's does, quotes inside included), a backquoted command, and a backslash escape (but of a
+    tab outside every quote: the backslash is then the word's last character, since the canary's
+    run crosses the tab and a scheme word after it is the value's, basecradle-router#502's review).
+    Only a space, a tab or a newline ends an unquoted word, as in the shell, so no other character
+    can cut a value short. A quote or a substitution still open at a record break ends there: it is
+    prose (an apostrophe, a markdown backquote) far more often than a value that spans lines.
+    Iterative, with its own stack, so no depth of nesting can exhaust the interpreter's.
+
+    The word also ends just past a credential name's ``=`` that stands outside every quote and
+    substitution in it (``x,DB_PASSWORD=…``), and then says so: the rest of the word is that name's
+    value. **A name inside a quote is the quote's text** (issue #929): ``A_TOKEN='B_TOKEN=x' next=1``
+    keeps ``next=1``, where reading ``B_TOKEN=`` as a name opened a quote at its value's ``'`` and
+    took the rest of the line. Returns where the word ends, and whether it ends at a name's ``=``;
+    a word still open at `limit` is reported as ending there.
     """
     stack: list[str] = []  # what closes each open context: ' " ` ) } and $' for ANSI-C
     i = start
@@ -380,7 +413,7 @@ def _shell_word_end(text: str, start: int, limit: int | None = None) -> int:
         c = text[i]
         top = stack[-1] if stack else ""
         if top and c in _BREAK_CHARS:
-            return i
+            return i, False
         if top == "'":
             if c == "'":
                 stack.pop()
@@ -393,6 +426,9 @@ def _shell_word_end(text: str, start: int, limit: int | None = None) -> int:
                 stack.pop()
             i += 1
         elif c == "\\":
+            if not top and text.startswith("\t", i + 1):
+                # A backslash before a tab is the word's last character (basecradle-router#502).
+                return i + 1, False
             i += 2
         elif top == "`":
             if c == "`":
@@ -412,6 +448,12 @@ def _shell_word_end(text: str, start: int, limit: int | None = None) -> int:
         else:  # outside every quote: the word itself, or inside a ( ), $( ) or ${ }
             if not top and c in _SHELL_BLANKS:
                 break
+            if (
+                not top
+                and c == "="
+                and _NAME_END.search(text, max(start, i + 1 - _NAME_END_REACH), i + 1)
+            ):
+                return i + 1, True
             if top and c == top:
                 stack.pop()
                 i += 1
@@ -427,13 +469,16 @@ def _shell_word_end(text: str, start: int, limit: int | None = None) -> int:
                 elif c == "(" and top != "}":
                     stack.append(")")  # an array, a subshell, arithmetic
                 i += 1
-    return min(i, n)
+    return min(i, n), False
 
 
 #: The characters a bearer header's scheme word may be glued to (``KBearer``, ``api_key=Bearer``):
 #: a token's, as a header value spells one. The router's `logfmt.SCHEME_GLUE`, byte for byte
 #: (basecradle-router#497), so both writers on a box read the same scheme word.
 _SCHEME_GLUE = "A-Za-z0-9._~+/%:=-"
+
+#: A run of the characters a scheme word may be glued to: one word, as `_bearer_end` reads it.
+_GLUE_RUN = re.compile(f"[{_SCHEME_GLUE}]*")
 
 #: A bearer header's scheme word, which is never a credential's whole value: the token after it is
 #: (issue #926, basecradle-router#497). Alone it is the word in any case; glued to a value only as
@@ -443,90 +488,179 @@ _SCHEME_WORD = re.compile(f"(?i:bearer)|[{_SCHEME_GLUE}]*Bearer")
 #: What stands between a scheme word and its token: blanks, never a newline, as the box reads them.
 _SCHEME_BLANKS = re.compile("[ \t]+")
 
+#: The characters, beyond a blank, a canary stop and a record break, that a word may not hold
+#: unquoted before the tab ahead of a bearer scheme word (basecradle-router#502): a quote's opener, a
+#: backslash's escape and a parenthesis, whose reading a regular expression cannot nest. The
+#: router's `logfmt.LEAD_OPENERS`, byte for byte.
+_LEAD_OPENERS = "'`\\("
+
+
+def _run_char(but: str = "") -> str:
+    """A character of the canary's run (a tab is one), and none of `but`."""
+    return "[^" + re.escape(CANARY_VALUE_STOPS + _BREAK_CHARS + but) + "]"
+
+
+#: A word the canary's run crosses whole, and the tabs after it: what stands before a scheme word
+#: that a tab glues to a value (``x<TAB>Bearer``, ``'q'<TAB>KBearer``), so the token after that
+#: scheme word goes with the value (basecradle-router#502). Its pieces each close inside the run: a
+#: bare character, a backslash and the character after it, a single-quoted piece and a backquoted
+#: one (in which a backslash escapes), so each piece has one reading and the word one end, the shell
+#: word's. A backslash before the tab is the word's last character, as the shell reading has it
+#: here (``a\<TAB>Bearer``: the canary's run crosses the tab). A word holding a quote that never
+#: closes there, a ``"``, a ``(``, a blank or a stop is no lead word, and no scheme word after it is
+#: read as one.
+_LEAD_PIECE = (
+    "(?:"
+    + "|".join(
+        [
+            _run_char("\t" + _LEAD_OPENERS),  # a bare character: neither a tab nor an opener
+            "\\\\" + _run_char("\t"),  # an escape, of a quote or a backslash included
+            "'" + _run_char("'") + "*'",  # single-quoted: no escape inside
+            "`(?:" + _run_char("`\\") + "|\\\\" + _run_char() + ")*`",  # backquoted
+            "\\(" + _run_char("()'`\\") + "*\\)",  # a parenthesis, closed, one level, no quote
+        ]
+    )
+    + ")"
+)
+_LEAD_WORD = re.compile(f"(?:{_LEAD_PIECE}+\\\\?|\\\\)\t+")
+
+#: The tabs a value may open with: the canary's run crosses them to its first word.
+_TABS = re.compile("\t*")
+
+#: Where a marker at a value's head ends it: a blank, a canary stop or a record break after it (the
+#: canary's own run ends inside the marker, at its space), so a value redacted where it is bounded
+#: and again where it is rendered stays one marker.
+_MARKER_ENDS = frozenset("\t" + CANARY_VALUE_STOPS + _BREAK_CHARS)
+
+#: What a word after a tab may not start with, to be reached across it: a blank, a ``,`` or a ``}``
+#: (the canary's stops, which end its run and are structure on a JSON line) and a record break, so
+#: no word the value reaches this way starts in the next record. A ``"`` may: it opens the word's
+#: quoted piece.
+_UNREACHED = frozenset(CANARY_VALUE_STOPS.replace('"', "") + _BREAK_CHARS)
+
+
+def _reached(text: str, at: int) -> bool:
+    return at < len(text) and text[at] not in _UNREACHED
+
+
+def _token_after_a_glued_scheme_word(text: str, floor: int, end: int) -> int | None:
+    """Where the token starts, when a value read from `floor` ends at `end` just after a bearer
+    scheme word a tab glues to it (``(a)<TAB>Bearer tok``: the canary's run takes the scheme word),
+    with a word on its record after its blanks; else ``None``. A value never ends between a scheme
+    word and its token, whatever stands before the tab (basecradle-router#502's review)."""
+    tab = text.rfind("\t", floor, end)
+    if tab < 0 or not _SCHEME_WORD.fullmatch(text, tab + 1, end):
+        return None
+    if (blanks := _SCHEME_BLANKS.match(text, end)) is None or not _reached(text, blanks.end()):
+        return None
+    return blanks.end()
+
+
+def _run_end(text: str, at: int, stop: int) -> int:
+    """Where the canary's run from `at` ends, read no further than `stop`."""
+    return _CANARY_RUN.match(text, at, stop).end() if at < stop else stop
+
 
 def _value_end(text: str, start: int, limit: int | None = None) -> int:
-    """Where a credential's value from `start` ends: the longer of the shell word there and the
-    canary's run, so whatever the canary would read as the value is gone with it; and while a word
-    of the value is a bearer scheme word (`_SCHEME_WORD`), the word after the blanks that follow it
-    too, so a doubled scheme word goes with the token after both (issue #926). A scheme word with
-    nothing after it on its line is the value alone.
+    """Where a credential's value from `start` ends: past every word the value reaches, each read
+    whole as a shell word, and past the canary's run.
 
-    The words are shell words: the canary's run crosses a tab, and read that way
-    ``bearer<TAB>Bearer`` would be one word and no scheme word, and the token after it would ship.
-    Each word is read once, and the canary's run once from where the last one ended, so the value is
-    linear in its length. The router's reading (basecradle-router#497, `logfmt._value_end`), carried
-    as it is, but for `limit`: read no further than it, and a value still running there — the word
-    after a scheme word's blanks among it, which the cut hides — is reported as ending there, which
-    is all `bounded` needs to know; and for a credential name the value reaches past its ``=``,
-    whose value then goes with this one, read whole at any depth (the review of #926: the
-    redactor's next search starts past that ``=``, so nothing else would ever read it). The router
-    has no such clause yet, so on that one shape this reading redacts more than the router's."""
+    A value reaches its first word, after any tabs it opens with, unless it opens with a marker
+    where the canary's run would end after it, which is the whole value. From a word it reaches:
+
+    1. **Across a tab** to the next word, while the word is a lead word (`_LEAD_WORD`): the canary's
+       run crosses a tab, so a word after one is still the value's (basecradle-router#502). The next
+       word must start where a run could go on (`_reached`).
+    2. **Across blanks** to the next word, while the word is a bearer scheme word (`_SCHEME_WORD`),
+       so a doubled scheme word goes with the token after both (issue #926), and wherever the value
+       would end just after a scheme word a tab glues to it, whatever stands before the tab
+       (`_token_after_a_glued_scheme_word`). A scheme word with nothing after it on its record is
+       the value alone.
+    3. **Into a value of its own** at a credential name's ``=`` outside every quote in the word
+       (``x,DB_PASSWORD=<TAB>…``): the redactor's next search starts past that ``=``, so the name's
+       value is read here, by this same reading, and goes with this one (the review of #926).
+
+    Each word is read once, the canary's run once from each place the value goes on past it, and the
+    walk stops where a word's shell reading runs past its lead word's tab: the value already reaches
+    that far. So the value is linear in its length. With `limit`, the result is the router's end or
+    `limit`, whichever is less: every scan stops at `limit`, and the reading returns as soon as the
+    value reaches it."""
     stop = len(text) if limit is None else min(limit, len(text))
-    end = _scheme_value_end(text, start, stop)
-    # A credential name the value reaches past its ``=`` (``A_TOKEN=x,DB_PASSWORD=<TAB>…``: the
-    # shell word runs to the tab, past the second name, and the canary's run of that name's value
-    # crosses the tab) is never searched for again, so its value goes with this one, read as any
-    # value is, at any depth: a name inside that value is read the same way. Each such reading is
-    # charged what it scanned, against a budget of a few times the text: inside a value that names
-    # fill so densely the budget runs out (``A_TOKEN=`` repeated, each reading the rest of the
-    # text), the canary's run alone is read, each run once, so the reading stays linear.
-    pos, budget, run_lo, run_hi = start, _NESTED_BUDGET * (stop - start) + _NESTED_FLOOR, -1, -1
-    while (name := _CREDENTIAL_NAME.search(text, pos, end)) is not None:
-        pos = name.end()
-        if budget > 0:
-            read_to = _scheme_value_end(text, pos, stop)
-            budget -= read_to - pos + 1
-            end = max(end, read_to)
-        elif not run_lo <= pos <= run_hi:
-            run_lo, run_hi = pos, _CANARY_RUN.match(text, pos, stop).end()
-            end = max(end, run_hi)
-    return end
+    end = run_end = _run_end(text, start, stop)
+    at = start
+    while end < stop:  # a value from `at`
+        floor = at
+        if text.startswith(REDACTED_VALUE, at):
+            after = at + len(REDACTED_VALUE)
+            if after == len(text) or text[after] in _MARKER_ENDS:
+                return min(max(end, after), stop)
+        if (tabs := _TABS.match(text, at).end()) > at:
+            if not _reached(text, tabs):
+                return end  # nothing after the tabs is the value's: a blank, a stop or a break
+            at = tabs
+        while True:  # the words it reaches
+            word_end, at_a_name = _shell_word_end(text, at, stop)
+            end = max(end, word_end)
+            if at_a_name or end >= stop:
+                break  # a credential name's `=`: its value is read as one from here
+            if _SCHEME_WORD.fullmatch(text, at, word_end) and (
+                blanks := _SCHEME_BLANKS.match(text, word_end)
+            ):
+                token = blanks.end()
+                if _reached(text, token):  # a word after the blanks, on the same record
+                    at = token
+                    if at >= run_end:
+                        run_end = _run_end(text, at, stop)
+                        end = max(end, run_end)
+                    continue
+            lead = _LEAD_WORD.match(text, at)
+            if lead is None or word_end > lead.end() or not _reached(text, lead.end()):
+                # No lead word, one the shell reads past, or nothing after its tabs: the value ends,
+                # unless it ends just after a scheme word a tab glues to it.
+                if (token := _token_after_a_glued_scheme_word(text, floor, end)) is None:
+                    return end
+                at = floor = token
+                if at >= run_end:
+                    run_end = _run_end(text, at, stop)
+                    end = max(end, run_end)
+                continue
+            at = lead.end()
+        at = word_end
+        if at >= run_end:
+            run_end = _run_end(text, at, stop)
+            end = max(end, run_end)
+    return stop
 
 
-#: How much reading the names inside one value may cost before `_value_end` reads only the canary's
-#: run of each: this many times the text from the value on, and a floor, so a short text is never
-#: short of budget.
-_NESTED_BUDGET = 4
-_NESTED_FLOOR = 4096
-
-
-def _scheme_value_end(text: str, start: int, stop: int) -> int:
-    """`_value_end`'s reading of one value, ending no later than `stop`: the router's reading."""
-    run_end = _CANARY_RUN.match(text, start, stop).end()
-    word_end = _shell_word_end(text, start, stop)
-    end = max(word_end, run_end)
-    while _SCHEME_WORD.fullmatch(text, start, word_end) and (
-        blanks := _SCHEME_BLANKS.match(text, word_end, stop)
-    ):
-        start = blanks.end()
-        if start == stop < len(text):
-            return stop  # the token, if there is one, stands past the cut
-        if (word_end := _shell_word_end(text, start, stop)) == start:
-            break  # nothing after the scheme word on its line
-        if start >= run_end:
-            run_end = _CANARY_RUN.match(text, start, stop).end()
-        end = max(end, word_end, run_end)
-    return end
+def _credential_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Every credential-named assignment's value, as its start (the character after the ``=``) and
+    its end (`_value_end`), in order; an empty value's two are equal. Each name is found once, and
+    the next search starts where its value ends."""
+    if "=" not in text:
+        return
+    pos = 0
+    while (match := _CREDENTIAL_NAME.search(text, pos)) is not None:
+        start = match.end()
+        pos = _value_end(text, start)
+        yield start, pos
 
 
 def redact_credentials(text: str) -> str:
     """`text` with every credential-named assignment's value replaced by `REDACTED_VALUE`.
 
-    The name stays. The value is the longer of two readings from the character after the ``=``
-    (`_value_end`): the shell word there, so a quoted value or a ``"$(…)"`` goes whole, and the
-    canary's own run. A bearer scheme word is no value alone: the token after it goes with it
-    (issue #926), so the function is right called alone, never only by the passes `scrub` runs
-    before it. An empty value (a space, a record break or the text's end follows the ``=``) has
-    nothing to hide and is left as it is. Linear in `text`: each name is found once, and the next
-    search starts where its value ends. The router's function of the same name
-    (basecradle-router#491, #497), which `scrub` runs as its third pass."""
-    if "=" not in text:
-        return text
+    The name stays. The value (`_value_end`) is every shell word it reaches from the character after
+    the ``=`` (`_shell_word_end`), so a quoted value or a ``"$(…)"`` goes whole, and the canary's
+    own run, so whatever the canary would read as the value is gone in every record the text is
+    written into, a prose line that keeps a tab included. It reaches across a tab after a lead word
+    (basecradle-router#502), past a bearer scheme word to its token (issue #926), and into the value
+    of a credential name standing in it outside a quote (the review of #926). An empty value (a
+    space, a record break or the text's end follows the ``=``) has nothing to hide and is left as it
+    is. Linear in `text`, and idempotent: a marker where the canary's run would end after it is a
+    whole value. The router's function of the same name, byte for byte in what it returns
+    (basecradle-router#506), and one of the rules `scrub` takes the union of."""
     out: list[str] = []
     pos = 0
-    while (match := _CREDENTIAL_NAME.search(text, pos)) is not None:
-        start = match.end()
-        end = _value_end(text, start)
+    for start, end in _credential_spans(text):
         out.append(text[pos:start])
         if end > start:
             out.append(REDACTED_VALUE)
@@ -547,6 +681,15 @@ _TOKEN_CHAR = re.compile(r"[A-Za-z0-9_-]")
 _TRAILING_RUN = re.compile(r"[A-Za-z0-9_-]+\Z")
 
 
+def _run_start(text: str, end: int) -> int:
+    """Where the ``[A-Za-z0-9_-]`` run that ends at `end` starts (`end` itself when none does),
+    read backwards, so backing a cut off a run costs the run's length and no more."""
+    start = end
+    while start > 0 and _TOKEN_CHAR.match(text, start - 1):
+        start -= 1
+    return start
+
+
 def bounded(text: str, cap: int, *, marker: str = "…") -> str:
     """`text` whole if it fits `cap` characters, else a head of it plus `marker` — never cut mid-token.
 
@@ -561,59 +704,69 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
 
     The result, marker included, is at most `cap` characters. This is the one cut for any free-text
     value bound for a log line, and such a value is `scrub`-bed first; a site that slices one by hand
-    is the defect this exists to retire.
+    is the defect this exists to retire. Linear in the head it keeps, whatever the text holds
+    (issue #929): every position is an index into `text`, and the text is sliced once.
     """
     if len(text) <= cap:
         return text
-    head = text[: max(cap - len(marker), 0)]
-    if _TOKEN_CHAR.match(text, len(head)):  # the next character continues the head's last run
-        head = _TRAILING_RUN.sub("", head)
-    head, value_end = _whole_assignments(text, head)
+    cut = max(cap - len(marker), 0)
+    if _TOKEN_CHAR.match(text, cut):  # the next character continues the head's last run
+        cut = _run_start(text, cut)
+    cut, value_end = _whole_assignments(text, cut)
+    head = text[:cut]
     stripped = head.rstrip()
     if stripped != head and value_end == len(stripped):
         stripped += " "  # the blank after a value, so the marker is never glued to it
     return stripped + marker if stripped else ""
 
 
-def _whole_assignments(text: str, head: str) -> tuple[str, int | None]:
-    """`head`, a prefix of `text`, backed off before every credential-named assignment it cuts.
+def _whole_assignments(text: str, cut: int) -> tuple[int, int | None]:
+    """`cut`, an index into `text`, backed off before every credential-named assignment it cuts.
 
     `bounded` treats an assignment as one token (issue #918): one whose value the cut reaches — a
     `REDACTED_VALUE` it would halve, or a value running to the cut's very edge, where the ``…`` would
     be glued to it — goes whole, name and all. Otherwise a later scrub (`ScrubbingFormatter` scrubs
     every line again) reads the cut marker or the ``…`` as a value and writes a whole marker in its
     place, past the bound and with no ``…`` to say the text was cut. An assignment the cut does not
-    reach is kept. Linear: the names are found once and tried from the last, and each value is read
-    no further than the head left after the one before it. Returns the head and where the value of
-    the last assignment it keeps ends, or ``None`` when it keeps none."""
-    names = list(_CREDENTIAL_NAME.finditer(text, 0, len(head)))
-    for name in reversed(names):
-        if name.end() > len(head):
-            continue  # its `=` went with an assignment already backed off
-        end = _value_end(text, name.end(), len(head))
-        if end < len(head):
-            return head, end  # the last assignment before the cut ends before it: it is kept
-        head = _TRAILING_RUN.sub("", text[: name.start()])
-    return head, None
+    reach is kept.
+
+    The assignments are the ones `redact_credentials` reads, found as it finds them, so a name inside
+    another's value (``A_TOKEN='B_TOKEN=x y …``) is that value's text and never stands for it. Each
+    value is read no further than the cut, and the search goes on from where it ends, so the head is
+    read once (issue #929: backing off by re-slicing the text and re-searching it, once per name, was
+    quadratic). Returns the cut and where the value of the last assignment it keeps ends, or ``None``
+    when it keeps none."""
+    found: list[tuple[int, int]] = []  # each assignment's name start and value end, in order
+    pos = 0
+    while (name := _CREDENTIAL_NAME.search(text, pos, cut)) is not None:
+        pos = _value_end(text, name.end(), cut)
+        found.append((name.start(), pos))
+        if pos >= cut:
+            break  # this value reaches the cut, so no name after it stands before the cut
+    for name_start, value_end in reversed(found):
+        if value_end < cut:
+            return cut, value_end  # the last assignment before the cut ends before it: it is kept
+        cut = _run_start(text, name_start)
+    return cut, None
 
 
 def scrub(text: str) -> str:
     """`text` with every credential shape the scrub knows redacted.
 
-    Four passes, in order: the heartbeat URL (`_HEARTBEAT_RUN`), the other literal rules
-    (`_literal_pass`), the value of every credential-named assignment (`redact_credentials`), then
-    the prefix rules (`_PREFIXED`). A match becomes ``[redacted]``, but for an assignment's value,
-    which becomes `REDACTED_VALUE` with its name kept, and a prefixed match `_is_word` reads as a
-    word, which is kept as written.
+    Five rules, each reading `text` as it came: the heartbeat URL (`_HEARTBEAT_RUN`), the literal
+    rules (`_X_API_KEY`, `_QUERY`, `_API_KEY`, `_BEARER`), the value of every credential-named
+    assignment (`_credential_spans`, which `redact_credentials` renders alone), and the prefix rules
+    (`_PREFIXED`). **What the scrub takes is the union of what the rules take** (issue #929): the
+    spans they match are merged where they overlap or touch, and each merged span is written once —
+    as `REDACTED_VALUE` when it starts where a credential name's value starts, the name kept, and
+    as ``[redacted]`` otherwise. A prefixed match `_is_word` reads as a word is no span.
 
-    **The literal rules run before the assignment pass** (issue #918), because an assignment's
-    value can be another rule's label: in ``GH_TOKEN=x-api-key: K…`` the shell word is
-    ``x-api-key:``, so an assignment pass run first left ``K…`` to no rule. Every match the rules
-    before #918 made is made here on the same text, so nothing is redacted less. A literal label
-    that is itself a credential's name keeps it (``OPENAI_API_KEY=…``, ``?ACCESS_TOKEN=…``), where
-    the ``api_key=`` and query rules once took it with the value. **The assignment pass runs before
-    the prefix rules**, so a prefix run glued before a name (``xsk-…GH_TOKEN=…``) can no longer
-    take the name and leave its value to no rule.
+    The union is why no rule can take less beside another than alone, which passes run one after
+    another could not promise: a pass shown an earlier pass's ``[redacted]`` reads a different text,
+    and every leak of that kind is recorded at `_X_API_KEY`. So ``scrub`` redacts everything
+    `redact_credentials` redacts, and everything each other rule redacts on its own. A literal label
+    ending at the ``=`` of a name the assignment rule found keeps it (``OPENAI_API_KEY=…``,
+    ``?ACCESS_TOKEN=…``, ``X-API-KEY=…``), its value then one with the assignment's.
 
     **The marker reads back as itself**: a second scrub of the text `scrub` returned leaves an
     assignment's `REDACTED_VALUE` as it is, when that text has no record break, which is every text
@@ -625,69 +778,124 @@ def scrub(text: str) -> str:
 
     Run on a whole text **before** `bounded` cuts it, so a rule is never shown a credential cut
     short of its own minimum. `kv` does both itself; a site that cuts a text for a log line before
-    `kv` sees it calls this first.
+    `kv` sees it calls this first. Linear in `text`: each rule reads it once, and the spans, each
+    rule's already in order, are merged in one pass.
     """
-    text = redact_credentials(_literal_pass(_HEARTBEAT_RUN.sub(_heartbeat, text)))
-    return _PREFIX_RULES.sub(_redaction, text)
-
-
-def _literal_pass(text: str) -> str:
-    """`text` with every `_LITERAL_RULES` match replaced by ``[redacted]`` — or, when the match's
-    label is a credential's name (`_NAME_LABEL`), by the label and `REDACTED_VALUE`.
-
-    The matches are the rules' own, found on the whole text as they were before issue #918, so no
-    span they took is taken less. A credential-named label's value is taken whole, as
-    `redact_credentials` takes one (the rule's match or the value's reading, `_value_end`,
-    whichever is longer), so the assignment pass after it reads the marker alone; and a later match
-    that value reaches is taken with it, whole, so a value can never cut another rule's match in
-    half (a ``Bearer`` inside the value whose token stands past it). Linear: each value is read from
-    past the span already taken, so no character is read twice."""
-    matches = list(_LITERAL_RULES.finditer(text))
+    values: set[int] = set()  # where each credential name's value starts, empty ones included
+    assignments: list[tuple[int, int]] = []
+    for start, end in _credential_spans(text):
+        values.add(start)
+        if end > start:
+            assignments.append((start, end))
+    spans = heapq.merge(
+        assignments,
+        (_heartbeat_span(match) for match in _HEARTBEAT_RUN.finditer(text)),
+        _label_spans(_X_API_KEY, text, values),
+        _label_spans(_QUERY, text, values),
+        _label_spans(_API_KEY, text, values),
+        _bearer_spans(text),
+        (match.span() for match in _PREFIX_RULES.finditer(text) if not _is_word(match)),
+    )
     out: list[str] = []
     pos = 0
-    index = 0
-    while index < len(matches):
-        first = matches[index]
-        out.append(text[pos : first.start()])
-        label = _name_label(first)
-        end = first.end()
-        while index < len(matches) and matches[index].start() < end:
-            match = matches[index]
-            group = "query" if match.group("query") else "assignment"
-            # A value is read only from past the span's end, so no character is read twice and the
-            # pass stays linear (``API_KEY="`` repeated is one value); one inside the span is gone.
-            if _name_label(match) is not None and (match is first or match.end(group) >= end):
-                end = max(end, _value_end(text, match.end(group)))
-            end = max(end, match.end())
-            index += 1
-        out += [label, REDACTED_VALUE] if label is not None else ["[redacted]"]
+    pending = next(spans, None)
+    while pending is not None:
+        start, end = pending
+        marked = start in values
+        pending = next(spans, None)
+        while True:
+            while pending is not None and pending[0] <= end:
+                end = max(end, pending[1])
+                pending = next(spans, None)
+            if not marked or (grown := _past_marker(text, end)) == end:
+                break
+            end = grown  # what a second reading of the marker would take, and the spans it meets
+        out += [text[pos:start], REDACTED_VALUE if marked else "[redacted]"]
         pos = end
     out.append(text[pos:])
     return "".join(out)
 
 
-def _name_label(match: re.Match[str]) -> str | None:
-    """The match's ``api_key=`` or query label when it is a credential's name, else ``None``.
+def _past_marker(text: str, at: int) -> int:
+    """Where a value ends once `scrub` has written its marker for `text` up to `at`: `at` itself when
+    a marker ends a value there (`_MARKER_ENDS`), else as far as reading the marker again would go.
 
-    The whole label, by the canary's definition (``API_KEY=``, the ``ACCESS_TOKEN=`` of
-    ``?ACCESS_TOKEN=``, a bare ``?TOKEN=``): `_literal_pass` keeps it and writes `REDACTED_VALUE`
-    after it. A hyphenated label (``X-API-KEY=``) ends in a name the canary reads, but is not one
-    whole, so it goes with its value as ``[redacted]``; keeping it would put a marker inside an
-    enclosing value's open quote, which the base reading already mishandles for a whole-name label
-    (issue #929)."""
-    label = match.group("query") or match.group("assignment")
-    return label if label and _NAME_LABEL.fullmatch(label.lstrip("?&")) else None
+    A span another rule ends can end where a value would not (``OPENAI_API_KEY=x-api-key:
+    `$'sk-)``: the header's value stops at the ``'``), and a marker written there is read again
+    with what follows it as one shell word. So the span takes what that reading takes: the rest of
+    the word the marker begins, then the value of a credential name it ends at, or the token after a
+    scheme word a tab glues into it, each read as `_value_end` reads one. A value `_value_end` reads
+    ends where a marker ends one, so a marker `scrub` writes reads back as itself."""
+    if at == len(text) or text[at] in _MARKER_ENDS:
+        return at
+    word_end, at_a_name = _shell_word_end(text, at)
+    if at_a_name:
+        return _value_end(text, word_end)
+    token = _token_after_a_glued_scheme_word(text, at, word_end)
+    return word_end if token is None else max(word_end, _value_end(text, token))
 
 
-def _heartbeat(match: re.Match[str]) -> str:
-    """A space-free run holding a heartbeat URL, redacted from where the box's rule would begin."""
+def _label_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterator[tuple[int, int]]:
+    """Every match of a literal rule, its label left out when a credential's value starts after it
+    (`scrub`). In order, since each starts no earlier than the match before it ends."""
+    labelled = "label" in rule.groupindex
+    for match in rule.finditer(text):
+        label_end = match.end("label") if labelled else -1
+        yield (label_end if label_end in values else match.start()), match.end()
+
+
+def _bearer_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Every bearer header's span: its scheme word, any scheme words after it, and its token
+    (`_bearer_end`). A match inside a span already walked is that walk's suffix, so it is not walked
+    again, which keeps the rule linear."""
+    reach = -1
+    for match in _BEARER.finditer(text):
+        end = _bearer_end(text, match) if match.start() >= reach else match.end()
+        reach = max(reach, end)
+        yield match.start(), end
+
+
+def _bearer_end(text: str, match: re.Match[str]) -> int:
+    """Where a bearer header `match` found ends, once a run of scheme words has its token.
+
+    The token a quote or a substitution opens is the shell word it opens (`_shell_word_end`). While
+    the word the token is part of ends in the scheme word, in any case, as the rule's own scheme
+    word may be glued to anything (``Bearer x.Bearer 'eyJ…'``, ``Bearer a=Bearer eyJ…``,
+    ``Bearer "q"bearer 'eyJ…'``), the word after the whitespace that follows it is a token too,
+    read the same way; the last token read is where the header ends (issue #929). A scheme word with
+    no token after it ends nothing. Each word is read once, so the walk is linear in its length."""
+    end, at = match.end(), match.end("scheme")
+    while True:
+        if text.startswith(_TOKEN_OPENERS, at):
+            word = _shell_word_end(text, at)[0]
+            end = max(end, word)
+        else:
+            if (token := _BEARER_TOKEN.match(text, at)) is not None:
+                end = max(end, token.end())
+            word = _GLUE_RUN.match(text, at).end()
+        if word - at < len("bearer") or text[word - len("bearer") : word].lower() != "bearer":
+            return end
+        if (gap := _BEARER_GAP.match(text, word)) is None:
+            return end
+        at = gap.end()
+
+
+def _heartbeat_span(match: re.Match[str]) -> tuple[int, int]:
+    """The span of a space-free run holding a heartbeat URL that the box's rule would redact."""
     run = match.group()
     start = run.index(_HEARTBEAT)
     scheme = _SCHEME.search(run, 0, run.rindex(_HEARTBEAT, 0, len(run) - 1))
     if scheme:
         start = min(start, scheme.start())
     bearer = _TRAILING_BEARER.search(run, start)
-    return run[:start] + "[redacted]" + (bearer.group() if bearer else "")
+    return match.start() + start, match.end() - (len(bearer.group()) if bearer else 0)
+
+
+def _heartbeat(match: re.Match[str]) -> str:
+    """A space-free run holding a heartbeat URL, redacted from where the box's rule would begin."""
+    start, end = _heartbeat_span(match)
+    text = match.string
+    return text[match.start() : start] + "[redacted]" + text[end : match.end()]
 
 
 def _redaction(match: re.Match[str]) -> str:
@@ -701,7 +909,7 @@ def _is_word(match: re.Match[str]) -> bool:
     no digit and no uppercase letter — never one without the other, because a serialization can glue
     a key to a letter, and a key's run always holds a digit or a capital with overwhelming
     certainty. A glued word whose run holds one is still redacted: the scrub errs toward redaction.
-    Only the prefix pass asks; `_LITERAL_RULES` redacts unconditionally.
+    Only the prefix rules ask; every other rule redacts unconditionally.
 
     **A match that took a glued key is never a word** (issue #858): its glued tail can hold a later
     key that was no part of any word (``xhf_…ghp_…-sk-…``, whose ``sk-`` follows a ``-``), and judged

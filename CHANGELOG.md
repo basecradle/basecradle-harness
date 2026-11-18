@@ -9,6 +9,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.198.1] - 2026-11-17
 
+### Fixed: Every scrub rule reads the text as it came, a quoted bearer token is redacted, and the value is read as the router reads it (issue #929, basecradle-router#504, #506)
+
+**`scrub` shipped a bearer token in four shapes**, on 0.198.0 and before (fabricated values; a journal written by an earlier version may hold one):
+
+- `auth: Bearer 'eyJ…'` and `auth: Bearer "eyJ…"`: the bearer rule wants a run of token characters, and a quoted token is none.
+- `A_TOKEN=Bearer x.Bearer 'eyJ…'` and `A_TOKEN=Bearer Bearer12 Bearer 'eyJ…'`: the bearer rule ran before the assignment pass, took `Bearer x.Bearer` as a header, and the assignment's value ended at its `[redacted]`, with the token after it.
+- `A_TOKEN=='\X_API_KEY=x-api-key: eyJ…`: the inner marker was written inside the value's open quote, and its own quotes closed it early.
+- `Bearer AB_TOKEN=secretsecret`: the bearer rule took the name as its token, and the assignment pass, shown `[redacted]=secretsecret`, never saw a name.
+
+What changed:
+
+- **Every rule reads the text `scrub` was given, and the scrub takes the union of what they take.** The spans each rule finds are merged and written once: as the marker where a credential's value starts, the name kept, and as `[redacted]` elsewhere. No order among the rules can make one take less than it takes alone, so the three pass-order leaks above cannot recur in another form, and `scrub` takes everything `redact_credentials` takes.
+- **A bearer token that opens with a quote or a substitution is the shell word it opens**, and a run of scheme words goes with the token after it (a token ending in `bearer`, in any case, hands on to the word after it: `Bearer x.Bearer 'eyJ…'`, `Bearer "q"bearer 'eyJ…'`). `Bearer token missing` keeps its words. The box's bearer rule takes no quoted token either; `docs/telemetry.md` → Credential Scrubbing states what it must now take, and that half is basecradle-router's.
+- **A credential's value is read as the router reads it, byte for byte** (`logfmt._shell_word_end` and `logfmt._value_end` at basecradle-router `153fb58`). `tests/router_reading.py` carries the router's functions verbatim and the tests hold `redact_credentials` and `_value_end` equal to them at every start of fuzzed text. Two readings change with it: **a name inside a quote is the quote's text** (`A_TOKEN='B_TOKEN=x' next=1 other=2` keeps `next=1 other=2`, where the whole rest of the line went), and **a value never ends between a scheme word and its token, whatever a tab glues before it** (`A_TOKEN=x<TAB>Bearer eyJ…` lost only `x` and shipped the token when `redact_credentials` was called alone). The nested-name budget is gone: the router's reading reads each word once.
+- **A hyphenated label ending in a credential's name keeps it** (`X-API-KEY='<a redacted value>'`, `?ACCESS-TOKEN='<a redacted value>'`), now that no marker can land inside an enclosing quote.
+- **`bounded` is linear on raw text** and reads the assignments the redactor reads: `bounded("A_TOKEN=" * 40_000, cap)` one under its length took 7.3 seconds and takes about a millisecond, and a name inside a quote no longer stands for the value that holds it.
+- A differential fuzz of 200,000 texts against `main` and 120,000 against 0.198.0, built from every literal label, credential names, scheme-word runs, quotes, tabs, markers, record breaks and real key shapes, finds no shaped secret (a vendor key, a bearer token) the new scrub leaves that the old one redacted, no secret it leaves that the router's redactor removes, and no record the canary reads. **Stated, not hidden:** some shapeless text that stands in no credential's value by the router's reading is now kept where the old reading took it: after a name inside a quote (`A_TOKEN=Bearer x"DB_PASSWORD="<TAB>hunter2…` keeps `hunter2…`, which the canary does not read as a value either), after a marker that a stop follows, past a record break through a nested name's value, and inside a quote the old passes had rewritten.
+
 ### Changed: The credential-named assignment rule takes the fleet's widened definition (issue #927, basecradle-noc#1547)
 
 `@origin` approved widening the NOC canary's `credential_assignment` rule on 2026-11-17, and the source scrub follows it, as every copy of the definition does: `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}`, held byte for byte as `NOC_CREDENTIAL_ASSIGNMENT` in `tests/conftest.py`.
@@ -16,8 +34,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A bare word is a name**: `PASSWORD=`, `KEY=`, `_TOKEN=` and `PASSPHRASE=` lose their values now, where the old rule wanted a capital before the word.
 - **`_BASE` is the one tail after the word** (`_observability.CREDENTIAL_TAIL`): `SECRET_KEY_BASE=`, the Rails master secret's name, loses its value. No other tail: `GH_TOKEN_FILE=`, `API_KEY_ID=` and `GH_TOKENS=` are kept, as the canary keeps them.
 - `CREDENTIAL_NAME` is still linear, pinned to end at exactly the canary's `=`s, and a literal rule's label is read by the same definition (`?TOKEN=` keeps its label and writes the marker).
-- **A name inside a name inside a value is read whole too.** A bare word that became a name could push a real one a level deeper, where only the canary's run was read: `PASSWORD=x,AUTH_TOKEN=<TAB>DB_TOKEN=Bearer s3cr3t` kept `s3cr3t`. Every nested name is now read as any value is, under a work budget of a few times the text, past which (a value names fill so densely that each reading takes the rest of the text) only the canary's run is read, so the reading stays linear. A differential fuzz of 1,200,000 texts against `main` finds no secret the new scrub leaves that the old one redacted.
-- **Not changed: a hyphenated label** (`X-API-KEY=`, `?ACCESS-TOKEN=`) ends in a name the canary reads but still goes with its value as `[redacted]`, as before; keeping it would put a marker inside an enclosing open quote, a class the scrub already mishandles for a whole-name label. Both are on issue #929.
+- **A name inside a name inside a value is read whole too.** A bare word that became a name could push a real one a level deeper, where only the canary's run was read: `PASSWORD=x,AUTH_TOKEN=<TAB>DB_TOKEN=Bearer s3cr3t` kept `s3cr3t`. Every nested name standing outside a quote is now read as any value is, by the router's reading (issue #929 above).
 
 ### Fixed: A credential's bearer value takes its token, in the assignment pass itself (issue #926, basecradle-router#497)
 
@@ -25,7 +42,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **A scheme word goes with the word after it**, mirroring the router's print site (`logfmt._value_end`, basecradle-router#503), so both writers on a box leave the same bytes: `Bearer` in any case alone, a `Bearer` glued to token characters (`KBearer`; `abc-bearer` is no header), doubled or mixed, separated by spaces or tabs. A scheme word with nothing after it on its line is the value alone.
 - **A short word after a credential's scheme word is its token now**, whatever its length (`AUTH_TOKEN=Bearer missing here` keeps only `here`), as the router reads it; a bare `Bearer missing` outside an assignment keeps its words.
-- **A credential name inside a value takes its value with it.** In `AUTH_TOKEN=x,DB_PASSWORD=<TAB>hunter2…` the first value's shell word runs to the tab, past the second name's `=`, and the next search started past it, so the second value was read by nothing (on 0.198.0 too, and through a scheme word once the scheme word took its token). The router's reading does not have this yet, so on that shape the harness redacts more than the router.
+- **A credential name inside a value takes its value with it.** In `AUTH_TOKEN=x,DB_PASSWORD=<TAB>hunter2…` the first value's shell word runs to the tab, past the second name's `=`, and the next search started past it, so the second value was read by nothing (on 0.198.0 too, and through a scheme word once the scheme word took its token). The router reads it the same way (basecradle-router#506), for a name standing outside every quote (issue #929 above).
 - **`bounded` reads the same value**: a cut that falls in the blanks after a scheme word, where the token is unseen, takes the assignment whole.
 - A differential fuzz of 1,200,000 texts built from credential names, literal labels, scheme words, blanks, quotes and real key shapes finds no secret the new `scrub` leaves that 0.198.0's redacted, and 531 that 0.198.0's left and the new one redacts.
 
