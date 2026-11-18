@@ -39,12 +39,14 @@ def plain(text: str) -> str:
 
 
 #: The NOC's log-store canary rule `credential_assignment`, byte for byte as basecradle-noc spells it
-#: (`observability/log-canary.json`, read at 6ac34236a74554b050a0d65e5b47aca85befb240, 2026-11-16;
-#: `docs/observability.md` §10), and as basecradle-router holds it in its own `tests/conftest.py`.
-#: The scrub's definition of a credential's name (`_observability.CREDENTIAL_NAME`, issue #918) is
-#: held to these bytes, and every credential-assignment test uses this pattern as its oracle. Moving
-#: it is a change to the NOC's rule: move it here with it.
-NOC_CREDENTIAL_ASSIGNMENT = r'[A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=[^ ",}]{8,}'
+#: (`observability/log-canary.json`, read at 9685e4efdef42de1cb7c67c6009894423d83c7b4 on
+#: basecradle-noc#1560, 2026-11-18; `docs/observability.md` §10), and as basecradle-router holds it
+#: in its own `tests/conftest.py`. Widened by `@origin`'s decision on basecradle-noc#1547
+#: (2026-11-17, issue #927): a bare word is a name, and `_BASE` is the one tail after the word. The
+#: scrub's definition of a credential's name (`_observability.CREDENTIAL_NAME`, issue #918) is held
+#: to these bytes, and every credential-assignment test uses this pattern as its oracle. Moving it is
+#: a change to the NOC's rule: move it here with it.
+NOC_CREDENTIAL_ASSIGNMENT = r'[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}'
 
 
 @pytest.fixture

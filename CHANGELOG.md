@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.198.1] - 2026-11-17
 
+### Changed: The credential-named assignment rule takes the fleet's widened definition (issue #927, basecradle-noc#1547)
+
+`@origin` approved widening the NOC canary's `credential_assignment` rule on 2026-11-17, and the source scrub follows it, as every copy of the definition does: `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}`, held byte for byte as `NOC_CREDENTIAL_ASSIGNMENT` in `tests/conftest.py`.
+
+- **A bare word is a name**: `PASSWORD=`, `KEY=`, `_TOKEN=` and `PASSPHRASE=` lose their values now, where the old rule wanted a capital before the word.
+- **`_BASE` is the one tail after the word** (`_observability.CREDENTIAL_TAIL`): `SECRET_KEY_BASE=`, the Rails master secret's name, loses its value. No other tail: `GH_TOKEN_FILE=`, `API_KEY_ID=` and `GH_TOKENS=` are kept, as the canary keeps them.
+- `CREDENTIAL_NAME` is still linear, pinned to end at exactly the canary's `=`s, and a literal rule's label is read by the same definition (`?TOKEN=` keeps its label and writes the marker).
+
 ### Fixed: A credential's bearer value takes its token, in the assignment pass itself (issue #926, basecradle-router#497)
 
 `_observability.redact_credentials` read a bearer scheme word as a credential's whole value and left the token after it: called alone, `AUTH_TOKEN=Bearer eyJ…` rendered as `AUTH_TOKEN='<a redacted value>' eyJ…`. Its one caller, `scrub`, runs the bearer rule first, which hid most of it, but not all: **`scrub` shipped the token wherever the bearer rule does not match one** (it wants eight characters from `[A-Za-z0-9._~+/-]` and no quote), so `AUTH_TOKEN=Bearer "eyJ…"`, `AUTH_TOKEN=Bearer 'eyJ…'`, `AUTH_TOKEN=Bearer s3cr3t`, `AUTH_TOKEN=Bearer abc,defghijklmnop` and `AUTH_TOKEN=Bearer $(cat /run/tok)` each reached the journal with the token after the marker. A journal written by an earlier version may hold one.

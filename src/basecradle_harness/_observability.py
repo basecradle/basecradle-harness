@@ -301,29 +301,39 @@ _TRAILING_BEARER = re.compile(r"(?<![A-Za-z0-9])(?i:bearer)\Z")
 # a credential" is the NOC's log-store canary's definition, its `credential_assignment` rule
 # (basecradle-noc `observability/log-canary.json`), never a list of this package's own:
 #
-#     [A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=[^ ",}]{8,}
+#     [A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}
 #
 # `tests/conftest.py` holds that pattern byte for byte, and the tests hold the pieces below to it:
-# the words, the value's stop characters and its floor must spell it exactly, the name pattern must
-# end at exactly the canary's `=`s, and the canary's own pattern is the oracle every scrubbed text
-# is checked against. The router renders by the same definition (basecradle-router#491,
-# `logfmt.redact_credentials`), so both writers on a box leave the same bytes where a value stood.
+# the words, the tail, the value's stop characters and its floor must spell it exactly, the name
+# pattern must end at exactly the canary's `=`s, and the canary's own pattern is the oracle every
+# scrubbed text is checked against. The router renders by the same definition (basecradle-router
+# #491, `logfmt.redact_credentials`), so both writers on a box leave the same bytes where a value
+# stood. The definition was widened by `@origin`'s decision on basecradle-noc#1547 (2026-11-17,
+# issue #927): a name needs no capital before its word, so a bare ``PASSWORD=`` is one, and
+# ``_BASE`` is the one tail allowed after the word (``SECRET_KEY_BASE=``, the Rails master secret's
+# name); no other tail, so ``GH_TOKEN_FILE=`` and ``GH_TOKENS=`` name no credential.
 
 #: The words that make a name a credential's, in the canary's order.
 CREDENTIAL_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSPHRASE")
+
+#: The one tail a credential's name may carry after its word, as the canary's optional group.
+CREDENTIAL_TAIL = "_BASE"
 
 #: The canary reads a value as a run of anything but these, at least `CANARY_VALUE_FLOOR`
 #: characters long, from the character after the ``=``.
 CANARY_VALUE_STOPS = ' ",}'
 CANARY_VALUE_FLOOR = 8
 
+#: The name pattern's word and tail, as one group: a credential word and, optionally, its tail.
+_WORD_AND_TAIL = "(?:" + "|".join(CREDENTIAL_WORDS) + f")(?:{CREDENTIAL_TAIL})?"
+
 #: A credential name, up to the ``=`` it is assigned with. The canary's own name pattern,
-#: ``[A-Z][A-Z0-9_]*(…)=``, run unanchored in a backtracking engine such as Python's `re` tries every
-#: start inside a run of capitals and is quadratic in it. This spelling matches before exactly the
-#: same ``=``s (pinned against the canary's pattern by a test) and is linear: it starts only where a
-#: run of name characters starts, skips digits and underscores to the run's first capital, which the
-#: canary's ``[A-Z]`` needs, and extends lazily to a credential word. It is the router's spelling.
-CREDENTIAL_NAME = r"(?<![A-Z0-9_])[0-9_]*[A-Z][A-Z0-9_]*?(?:" + "|".join(CREDENTIAL_WORDS) + ")="
+#: ``[A-Z0-9_]*(…)(_BASE)?=``, run unanchored in a backtracking engine such as Python's `re` tries
+#: every start inside a run of name characters and is quadratic in it. This spelling matches before
+#: exactly the same ``=``s (pinned against the canary's pattern by a test) and is linear: it starts
+#: only where a run of name characters starts, and extends lazily to a credential word and its
+#: optional tail. A run holds at most one ``=``, at its end, so one start per run finds every name.
+CREDENTIAL_NAME = r"(?<![A-Z0-9_])[A-Z0-9_]*?" + _WORD_AND_TAIL + "="
 _CREDENTIAL_NAME = re.compile(CREDENTIAL_NAME)
 
 #: What stands where a credential's value stood — the router's marker, byte for byte. It must read
@@ -346,7 +356,7 @@ _SHELL_BLANKS = " \t\n"
 
 #: A literal rule's label that is itself a credential's name (``API_KEY=``, the ``ACCESS_TOKEN=`` of
 #: ``?ACCESS_TOKEN=``), which `_literal_pass` keeps, writing `REDACTED_VALUE` after it.
-_NAME_LABEL = re.compile(r"[A-Z][A-Z0-9_]*(?:" + "|".join(CREDENTIAL_WORDS) + ")=")
+_NAME_LABEL = re.compile("[A-Z0-9_]*" + _WORD_AND_TAIL + "=")
 
 
 def _shell_word_end(text: str, start: int, limit: int | None = None) -> int:
