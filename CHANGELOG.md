@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.198.1] - 2026-11-17
+
 ### Fixed: A credential's bearer value takes its token, in the assignment pass itself (issue #926, basecradle-router#497)
 
 `_observability.redact_credentials` read a bearer scheme word as a credential's whole value and left the token after it: called alone, `AUTH_TOKEN=Bearer eyJ…` rendered as `AUTH_TOKEN='<a redacted value>' eyJ…`. No harness log line shipped one, because its one caller, `scrub`, runs the bearer rule first; the function was right only by its caller's order.
