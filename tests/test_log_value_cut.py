@@ -762,3 +762,90 @@ def test_the_assignment_rules_are_linear():
     scrub("?token=" + "bearer" * 30_000)
     scrub('API_KEY="' * 20_000)
     assert time.monotonic() - started < 1.0
+
+
+# --- the cut treats a literal label as one token (issue #931) -----------------------------------
+
+#: Every literal rule's label, in each spelling its rule allows: a query parameter, an ``api_key=``
+#: assignment, an ``x-api-key`` header with each separator, and a heartbeat URL.
+LABELS = [
+    *(
+        f"{lead}{name}="
+        for lead in "?&"
+        for name in ("api-key", "api_key", "apikey", "Access-Token", "access_token", "accesstoken")
+        + ("token", "KEY")
+    ),
+    "api-key=",
+    "api_key=",
+    "APIKEY=",
+    *(
+        name + separator
+        for name in ("x-api-key", "X_API_KEY", "x-apikey")
+        for separator in (":", " :", "=>", " =>", '":', "'=", '\\":', "',")
+    ),
+    "https://h.example.com/heartbeat/",
+    "h/heartbeat/",
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "cap", "cut"),
+    [
+        # The review of #929: each label cut to its `…`, which the formatter's second scrub read as
+        # its value and wrote as `[redacted]`, past the cap of the first and without the `…` in all.
+        ("see ?token= tail", 13, "see…"),
+        ("see api_key= tail", 14, "see…"),
+        ("see x-api-key: tail", 16, "see…"),
+        # A scheme word's token and an `x-api-key` value are read across blanks, so no blank
+        # between a label and the marker would keep the marker out of the value.
+        ("see x-api-key: Bearer tail", 22, "see…"),
+        ("see ?token=Bearer  tail", 20, "see…"),
+        # A heartbeat URL whose secret the cut hides: the box's rule reads the `…` as the secret.
+        ("curl h.example.com/heartbeat/ then more", 33, "curl…"),
+        # A label whose own `[redacted]` the cut keeps, the `…` glued to it.
+        ("see x-api-key: [redacted] more", 28, "see…"),
+    ],
+)
+def test_a_bound_cuts_a_label_whole_when_the_marker_would_be_its_value(text, cap, cut):
+    assert bounded(text, cap) == cut
+    assert scrub(cut) == cut
+
+
+def test_a_bound_keeps_a_label_whose_value_the_cut_does_not_reach():
+    # The blank after `?token=` ends its value before the cut, so the scrub reads none there.
+    assert bounded("see ?token= then more", 17) == "see ?token= then…"
+    assert scrub("see ?token= then…") == "see ?token= then…"
+
+
+@pytest.mark.parametrize("marker", ["…", " […]"])
+def test_no_literal_label_lets_a_second_scrub_grow_a_bound_or_take_its_marker(marker):
+    # Measured on `main` at `5bce26a`, with the `…`: 51 of these 30,000 texts grew past their cap
+    # and 1,029 more lost the `…`.
+    rng = random.Random(931)
+    pieces = [
+        *LABELS, "Bearer ", "bearer\t", "KBearer", "abc", "abcdefghij", " ", "  ", "\t", "&", '"',
+        "'", "\\", "b'", "…", "[redacted]", REDACTED_VALUE, "A_TOKEN=",
+    ]  # fmt: skip
+    for _ in range(30_000):
+        text = scrub("".join(rng.choice(pieces) for _ in range(rng.randint(1, 10))))
+        cap = rng.randint(1, len(text) + 2)
+        cut = bounded(text, cap, marker=marker)
+        again = scrub(cut)
+        assert len(again) <= cap, (text, cap, cut, again)
+        if cut != text and cut:
+            assert again.endswith(marker), (text, cap, cut, again)
+
+
+def test_a_bound_over_many_labels_is_linear():
+    started = time.monotonic()
+    for text in (
+        "?token= " * 40_000,
+        "x-api-key: " * 30_000,
+        "x-api-key:" + " " * 200_000 + "z",
+        "?token=Bearer " * 30_000,
+        "u/heartbeat/ " * 30_000,
+        "a/heartbeat/" * 30_000 + " x",
+        "&key=" * 60_000,
+    ):
+        bounded(text, len(text) - 1)
+    assert time.monotonic() - started < 2.0

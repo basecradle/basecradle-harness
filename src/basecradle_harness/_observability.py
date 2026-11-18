@@ -258,21 +258,30 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: ``X-API-KEY=…``): where the assignment rule finds a name ending at the label's ``=``, the label
 #: stays and its value becomes `REDACTED_VALUE`, as every credential-named assignment's does; any
 #: other label (``api_key=``, ``?token=``) goes with its value as ``[redacted]``.
+_X_API_LABEL = r"(?i:x[-_]api[-_]?key)(?:\\?[\"']\s*(?:=>|[:=,])|\s*(?::|=>))"
+_X_API_OPENER = r"\s*(?:b?\\?[\"'])?"
+_X_API_RUN = r"[^\s\"'&\\]"
+_SCHEME_WORDS = r"(?:(?i:bearer)\s+)*"
 _X_API_KEY = re.compile(
-    r"(?i:x[-_]api[-_]?key)(?:\\?[\"']\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?[\"'])?"
-    r"(?P<value>(?:(?i:bearer)\s+)*(?:[^\s\"'&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s\"'&\\]+))"
+    _X_API_LABEL + _X_API_OPENER + f"(?P<value>{_SCHEME_WORDS}"
+    rf"(?:{_X_API_RUN}*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{{8,}}|{_X_API_RUN}+))"
 )
 #: How far before a header's span end a label that would read on past it can start: the longest
 #: label (``x-api-key``), its separator (``=>``), and the one scheme word its value may open with
 #: glued to them, the blank after it being where the span stops (`_x_api_key_spans`).
 _X_API_LABEL_REACH = len("x-api-key") + len("=>") + len("bearer")
+_QUERY_LABEL = r"[?&](?i:api[-_]?key|access[-_]?token|token|key)="
+_QUERY_RUN = r"[^&\s]"
 _QUERY = re.compile(
-    r"(?P<label>[?&](?i:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*"
-    r"(?:[^&\s]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^&\s]+)"
+    f"(?P<label>{_QUERY_LABEL}){_SCHEME_WORDS}"
+    rf"(?:{_QUERY_RUN}*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{{8,}}|{_QUERY_RUN}+)"
 )
+_API_KEY_LABEL = r"(?i:api[-_]?key=)"
+_API_KEY_OPENER = r"\"?"
+_API_KEY_RUN = r"[^&\s\"]"
 _API_KEY = re.compile(
-    r"(?P<label>(?i:api[-_]?key=))\"?(?:(?i:bearer)\s+)*"
-    r"(?:[^&\s\"]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^&\s\"]+)"
+    f"(?P<label>{_API_KEY_LABEL}){_API_KEY_OPENER}{_SCHEME_WORDS}"
+    rf"(?:{_API_KEY_RUN}*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{{8,}}|{_API_KEY_RUN}+)"
 )
 
 #: A bearer header: the scheme word in any case and its token, which is eight or more token
@@ -722,7 +731,7 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
     cut = max(cap - len(marker), 0)
     if _TOKEN_CHAR.match(text, cut):  # the next character continues the head's last run
         cut = _run_start(text, cut)
-    cut, value_end = _whole_assignments(text, cut)
+    cut, value_end = _whole_values(text, cut)
     head = text[:cut]
     stripped = head.rstrip()
     if stripped != head and value_end == len(stripped):
@@ -730,34 +739,85 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
     return stripped + marker if stripped else ""
 
 
-def _whole_assignments(text: str, cut: int) -> tuple[int, int | None]:
-    """`cut`, an index into `text`, backed off before every credential-named assignment it cuts.
+#: Each literal rule's label and, after it, everything its value may still take: the rule's own
+#: pieces, with the value's run allowed to be empty and its bearer alternative left out (a token run
+#: never takes a ``…``, so that alternative ends before a marker glued after it). A head ending inside
+#: one of these readings, past its label, ends inside a value the rule would read the marker into
+#: (`_whole_values`). The heartbeat URL's label is a space-free run up to its first ``/heartbeat/``,
+#: since the box's rule reads any run holding one, and the marker, as the URL's secret.
+_OPEN_LABELS = (
+    re.compile(f"(?P<label>{_X_API_LABEL}){_X_API_OPENER}{_SCHEME_WORDS}{_X_API_RUN}*"),
+    re.compile(f"(?P<label>{_QUERY_LABEL}){_SCHEME_WORDS}{_QUERY_RUN}*"),
+    re.compile(f"(?P<label>{_API_KEY_LABEL}){_API_KEY_OPENER}{_SCHEME_WORDS}{_API_KEY_RUN}*"),
+    re.compile(r"(?<!\S)(?P<label>\S*?" + _HEARTBEAT + r")\S*"),
+)
 
-    `bounded` treats an assignment as one token (issue #918): one whose value the cut reaches — a
-    `REDACTED_VALUE` it would halve, or a value running to the cut's very edge, where the ``…`` would
-    be glued to it — goes whole, name and all. Otherwise a later scrub (`ScrubbingFormatter` scrubs
-    every line again) reads the cut marker or the ``…`` as a value and writes a whole marker in its
-    place, past the bound and with no ``…`` to say the text was cut. An assignment the cut does not
-    reach is kept.
 
-    The assignments are the ones `redact_credentials` reads, found as it finds them, so a name inside
-    another's value (``A_TOKEN='B_TOKEN=x y …``) is that value's text and never stands for it. Each
-    value is read no further than the cut, and the search goes on from where it ends, so the head is
-    read once (issue #929: backing off by re-slicing the text and re-searching it, once per name, was
-    quadratic). Returns the cut and where the value of the last assignment it keeps ends, or ``None``
-    when it keeps none."""
-    found: list[tuple[int, int]] = []  # each assignment's name start and value end, in order
+def _whole_values(text: str, cut: int) -> tuple[int, int | None]:
+    """`cut`, an index into `text`, backed off before every value it cuts that a later scrub reads.
+
+    `bounded` treats a value as one token: one whose value the cut reaches goes whole, its name or
+    label with it. Otherwise a later scrub (`ScrubbingFormatter` scrubs every line again) reads the
+    cut marker or the ``…`` as the value and writes ``[redacted]`` or a whole marker in its place,
+    past the bound when the label was short, and always with no ``…`` to say the text was cut. A
+    value the cut does not reach is kept. There are two kinds:
+
+    - **A credential-named assignment** (issue #918), reached when the cut halves its
+      `REDACTED_VALUE` or its value runs to the cut's very edge, where the ``…`` would be glued to
+      it. The assignments are the ones `redact_credentials` reads, found as it finds them, so a name
+      inside another's value (``A_TOKEN='B_TOKEN=x y …``) is that value's text and never stands for
+      it.
+    - **A literal rule's label** (issue #931): ``?token=``, ``api_key=``, an ``x-api-key:`` header
+      or a heartbeat URL, reached when the head, its trailing blanks gone, ends past the label and
+      inside what its value may take (`_OPEN_LABELS`): ``?token= tail`` cut to ``?token=…`` scrubs
+      to ``[redacted]``, ten characters for a cap of nine. A blank between the label and the marker
+      would keep the label for some rules and not for others (an ``x-api-key:`` value and a scheme
+      word's token are read across blanks), so a reached label goes whole, as a name does.
+
+    Every reading goes no further than the first cut, and each search goes on from where the last
+    reading ended, so each rule reads the head once, as `scrub` reads the text (issue #929: backing
+    off by re-slicing the text and re-searching it, once per name, was quadratic). The cut then
+    walks back over what was found, latest first, each item checked against the cut as it stands
+    then; an item past the cut is already gone. A marker that opens with a blank reads less than
+    these readings assume, so it costs at most a label that could have stayed, never one that
+    should not. Returns the cut and where the value of the last assignment it keeps ends, or
+    ``None`` when it keeps none."""
+    found: list[tuple[int, int, int]] = []  # an assignment's name start, -1 and its value end
     pos = 0
     while (name := _CREDENTIAL_NAME.search(text, pos, cut)) is not None:
         pos = _value_end(text, name.end(), cut)
-        found.append((name.start(), pos))
+        found.append((name.start(), -1, pos))
         if pos >= cut:
             break  # this value reaches the cut, so no name after it stands before the cut
-    for name_start, value_end in reversed(found):
-        if value_end < cut:
-            return cut, value_end  # the last assignment before the cut ends before it: it is kept
-        cut = _run_start(text, name_start)
-    return cut, None
+    labels = (
+        ((m.start(), m.end("label"), m.end()) for m in rule.finditer(text, 0, cut))
+        for rule in _OPEN_LABELS
+    )  # each label's start, its end, and where the reading after it ends
+    items = list(heapq.merge(found, *labels))
+    end = _head_end(text, cut)
+    kept: int | None = None
+    for start, label_end, reach in reversed(items):
+        if start >= cut:
+            continue  # cut away with a value after it
+        if label_end < 0:
+            if reach < cut:  # an assignment the cut does not reach: the latest one sets the blank
+                if kept is None:
+                    kept = reach
+                continue
+        elif not label_end <= end <= reach:
+            continue  # a label the head does not end in the value of
+        cut = _run_start(text, start)
+        end = _head_end(text, cut)
+        kept = None
+    return cut, kept
+
+
+def _head_end(text: str, cut: int) -> int:
+    """Where the head ``text[:cut]`` ends once `str.rstrip` has taken its trailing blanks, read
+    backwards, so it costs the blanks and no more."""
+    while cut > 0 and text[cut - 1].isspace():
+        cut -= 1
+    return cut
 
 
 def scrub(text: str) -> str:
