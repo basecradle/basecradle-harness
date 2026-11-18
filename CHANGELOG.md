@@ -7,6 +7,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed: A credential's bearer value takes its token, in the assignment pass itself (issue #926, basecradle-router#497)
+
+`_observability.redact_credentials` read a bearer scheme word as a credential's whole value and left the token after it: called alone, `AUTH_TOKEN=Bearer eyJ…` rendered as `AUTH_TOKEN='<a redacted value>' eyJ…`. No harness log line shipped one, because its one caller, `scrub`, runs the bearer rule first; the function was right only by its caller's order.
+
+- **A scheme word goes with the word after it**, mirroring the router's print site (`logfmt._value_end`, basecradle-router#503), so both writers on a box leave the same bytes: `Bearer` in any case alone, a `Bearer` glued to token characters (`KBearer`; `abc-bearer` is no header), doubled or mixed, separated by spaces or tabs. A scheme word with nothing after it on its line is the value alone.
+- **A short word after a credential's scheme word is its token now**, whatever its length (`AUTH_TOKEN=Bearer missing here` keeps only `here`), as the router reads it; a bare `Bearer missing` outside an assignment keeps its words.
+- **`bounded` reads the same value**: a cut that falls in the blanks after a scheme word, where the token is unseen, takes the assignment whole.
+- A differential fuzz of 400,000 texts finds no token the new `scrub` leaves that the old one redacted.
+
 ## [0.198.0] - 2026-11-16
 
 ### Fixed: The scrub redacts the value of every credential-named assignment (issue #918, basecradle#877)
