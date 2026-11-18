@@ -446,8 +446,32 @@ def _value_end(text: str, start: int, limit: int | None = None) -> int:
     linear in its length. The router's reading (basecradle-router#497, `logfmt._value_end`), carried
     as it is, but for `limit`: read no further than it, and a value still running there — the word
     after a scheme word's blanks among it, which the cut hides — is reported as ending there, which
-    is all `bounded` needs to know."""
+    is all `bounded` needs to know; and for a credential name the value reaches past its ``=``,
+    whose value then goes with this one as far as the canary reads it (the review of #926: the
+    redactor's next search starts past that ``=``, so nothing else would ever read it). The router
+    has no such clause yet, so on that one shape this reading redacts more than the router's."""
     stop = len(text) if limit is None else min(limit, len(text))
+    end = _scheme_value_end(text, start, stop)
+    # A credential name the value reaches past its ``=`` (``A_TOKEN=x,DB_PASSWORD=<TAB>…``: the
+    # shell word runs to the tab, past the second name, and the canary's run of that name's value
+    # crosses the tab) is never searched for again, so its value goes with this one. It is read as
+    # any value is, unless it stands inside the value of a name read that way before it, where the
+    # canary's run alone is read: so no character is read whole twice, and the reading stays
+    # linear however densely names fill a value (``A_TOKEN=`` repeated).
+    pos, read_to, run_lo, run_hi = start, start, -1, -1
+    while (name := _CREDENTIAL_NAME.search(text, pos, end)) is not None:
+        pos = name.end()
+        if pos > read_to:
+            read_to = _scheme_value_end(text, pos, stop)
+            end = max(end, read_to)
+        elif not run_lo <= pos <= run_hi:
+            run_lo, run_hi = pos, _CANARY_RUN.match(text, pos, stop).end()
+            end = max(end, run_hi)
+    return end
+
+
+def _scheme_value_end(text: str, start: int, stop: int) -> int:
+    """`_value_end`'s reading of one value, ending no later than `stop`: the router's reading."""
     run_end = _CANARY_RUN.match(text, start, stop).end()
     word_end = _shell_word_end(text, start, stop)
     end = max(word_end, run_end)
