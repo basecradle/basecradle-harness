@@ -301,29 +301,39 @@ _TRAILING_BEARER = re.compile(r"(?<![A-Za-z0-9])(?i:bearer)\Z")
 # a credential" is the NOC's log-store canary's definition, its `credential_assignment` rule
 # (basecradle-noc `observability/log-canary.json`), never a list of this package's own:
 #
-#     [A-Z][A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)=[^ ",}]{8,}
+#     [A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}
 #
 # `tests/conftest.py` holds that pattern byte for byte, and the tests hold the pieces below to it:
-# the words, the value's stop characters and its floor must spell it exactly, the name pattern must
-# end at exactly the canary's `=`s, and the canary's own pattern is the oracle every scrubbed text
-# is checked against. The router renders by the same definition (basecradle-router#491,
-# `logfmt.redact_credentials`), so both writers on a box leave the same bytes where a value stood.
+# the words, the tail, the value's stop characters and its floor must spell it exactly, the name
+# pattern must end at exactly the canary's `=`s, and the canary's own pattern is the oracle every
+# scrubbed text is checked against. The router renders by the same definition (basecradle-router
+# #491, `logfmt.redact_credentials`; its widened copy moves in basecradle-router#504), so both
+# writers on a box leave the same bytes where a value stood. The definition was widened by `@origin`'s decision on basecradle-noc#1547 (2026-11-17,
+# issue #927): a name needs no capital before its word, so a bare ``PASSWORD=`` is one, and
+# ``_BASE`` is the one tail allowed after the word (``SECRET_KEY_BASE=``, the Rails master secret's
+# name); no other tail, so ``GH_TOKEN_FILE=`` and ``GH_TOKENS=`` name no credential.
 
 #: The words that make a name a credential's, in the canary's order.
 CREDENTIAL_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSPHRASE")
+
+#: The one tail a credential's name may carry after its word, as the canary's optional group.
+CREDENTIAL_TAIL = "_BASE"
 
 #: The canary reads a value as a run of anything but these, at least `CANARY_VALUE_FLOOR`
 #: characters long, from the character after the ``=``.
 CANARY_VALUE_STOPS = ' ",}'
 CANARY_VALUE_FLOOR = 8
 
+#: The name pattern's word and tail, as one group: a credential word and, optionally, its tail.
+_WORD_AND_TAIL = "(?:" + "|".join(CREDENTIAL_WORDS) + f")(?:{CREDENTIAL_TAIL})?"
+
 #: A credential name, up to the ``=`` it is assigned with. The canary's own name pattern,
-#: ``[A-Z][A-Z0-9_]*(…)=``, run unanchored in a backtracking engine such as Python's `re` tries every
-#: start inside a run of capitals and is quadratic in it. This spelling matches before exactly the
-#: same ``=``s (pinned against the canary's pattern by a test) and is linear: it starts only where a
-#: run of name characters starts, skips digits and underscores to the run's first capital, which the
-#: canary's ``[A-Z]`` needs, and extends lazily to a credential word. It is the router's spelling.
-CREDENTIAL_NAME = r"(?<![A-Z0-9_])[0-9_]*[A-Z][A-Z0-9_]*?(?:" + "|".join(CREDENTIAL_WORDS) + ")="
+#: ``[A-Z0-9_]*(…)(_BASE)?=``, run unanchored in a backtracking engine such as Python's `re` tries
+#: every start inside a run of name characters and is quadratic in it. This spelling matches before
+#: exactly the same ``=``s (pinned against the canary's pattern by a test) and is linear: it starts
+#: only where a run of name characters starts, and extends lazily to a credential word and its
+#: optional tail. A run holds at most one ``=``, at its end, so one start per run finds every name.
+CREDENTIAL_NAME = r"(?<![A-Z0-9_])[A-Z0-9_]*?" + _WORD_AND_TAIL + "="
 _CREDENTIAL_NAME = re.compile(CREDENTIAL_NAME)
 
 #: What stands where a credential's value stood — the router's marker, byte for byte. It must read
@@ -345,8 +355,9 @@ _CANARY_RUN = re.compile("[^" + re.escape(CANARY_VALUE_STOPS + _BREAK_CHARS) + "
 _SHELL_BLANKS = " \t\n"
 
 #: A literal rule's label that is itself a credential's name (``API_KEY=``, the ``ACCESS_TOKEN=`` of
-#: ``?ACCESS_TOKEN=``), which `_literal_pass` keeps, writing `REDACTED_VALUE` after it.
-_NAME_LABEL = re.compile(r"[A-Z][A-Z0-9_]*(?:" + "|".join(CREDENTIAL_WORDS) + ")=")
+#: ``?ACCESS_TOKEN=``), which `_literal_pass` keeps, writing `REDACTED_VALUE` after it. No literal
+#: label can end in the tail, so only the word is spelled here.
+_NAME_LABEL = re.compile("[A-Z0-9_]*(?:" + "|".join(CREDENTIAL_WORDS) + ")=")
 
 
 def _shell_word_end(text: str, start: int, limit: int | None = None) -> int:
@@ -447,27 +458,36 @@ def _value_end(text: str, start: int, limit: int | None = None) -> int:
     as it is, but for `limit`: read no further than it, and a value still running there — the word
     after a scheme word's blanks among it, which the cut hides — is reported as ending there, which
     is all `bounded` needs to know; and for a credential name the value reaches past its ``=``,
-    whose value then goes with this one as far as the canary reads it (the review of #926: the
+    whose value then goes with this one, read whole at any depth (the review of #926: the
     redactor's next search starts past that ``=``, so nothing else would ever read it). The router
     has no such clause yet, so on that one shape this reading redacts more than the router's."""
     stop = len(text) if limit is None else min(limit, len(text))
     end = _scheme_value_end(text, start, stop)
     # A credential name the value reaches past its ``=`` (``A_TOKEN=x,DB_PASSWORD=<TAB>…``: the
     # shell word runs to the tab, past the second name, and the canary's run of that name's value
-    # crosses the tab) is never searched for again, so its value goes with this one. It is read as
-    # any value is, unless it stands inside the value of a name read that way before it, where the
-    # canary's run alone is read: so no character is read whole twice, and the reading stays
-    # linear however densely names fill a value (``A_TOKEN=`` repeated).
-    pos, read_to, run_lo, run_hi = start, start, -1, -1
+    # crosses the tab) is never searched for again, so its value goes with this one, read as any
+    # value is, at any depth: a name inside that value is read the same way. Each such reading is
+    # charged what it scanned, against a budget of a few times the text: inside a value that names
+    # fill so densely the budget runs out (``A_TOKEN=`` repeated, each reading the rest of the
+    # text), the canary's run alone is read, each run once, so the reading stays linear.
+    pos, budget, run_lo, run_hi = start, _NESTED_BUDGET * (stop - start) + _NESTED_FLOOR, -1, -1
     while (name := _CREDENTIAL_NAME.search(text, pos, end)) is not None:
         pos = name.end()
-        if pos > read_to:
+        if budget > 0:
             read_to = _scheme_value_end(text, pos, stop)
+            budget -= read_to - pos + 1
             end = max(end, read_to)
         elif not run_lo <= pos <= run_hi:
             run_lo, run_hi = pos, _CANARY_RUN.match(text, pos, stop).end()
             end = max(end, run_hi)
     return end
+
+
+#: How much reading the names inside one value may cost before `_value_end` reads only the canary's
+#: run of each: this many times the text from the value on, and a floor, so a short text is never
+#: short of budget.
+_NESTED_BUDGET = 4
+_NESTED_FLOOR = 4096
 
 
 def _scheme_value_end(text: str, start: int, stop: int) -> int:
@@ -647,7 +667,14 @@ def _literal_pass(text: str) -> str:
 
 
 def _name_label(match: re.Match[str]) -> str | None:
-    """The match's ``api_key=`` or query label when it is a credential's name, else ``None``."""
+    """The match's ``api_key=`` or query label when it is a credential's name, else ``None``.
+
+    The whole label, by the canary's definition (``API_KEY=``, the ``ACCESS_TOKEN=`` of
+    ``?ACCESS_TOKEN=``, a bare ``?TOKEN=``): `_literal_pass` keeps it and writes `REDACTED_VALUE`
+    after it. A hyphenated label (``X-API-KEY=``) ends in a name the canary reads, but is not one
+    whole, so it goes with its value as ``[redacted]``; keeping it would put a marker inside an
+    enclosing value's open quote, which the base reading already mishandles for a whole-name label
+    (issue #929)."""
     label = match.group("query") or match.group("assignment")
     return label if label and _NAME_LABEL.fullmatch(label.lstrip("?&")) else None
 

@@ -30,6 +30,7 @@ from basecradle_harness._observability import (
     CANARY_VALUE_FLOOR,
     CANARY_VALUE_STOPS,
     CREDENTIAL_NAME,
+    CREDENTIAL_TAIL,
     CREDENTIAL_WORDS,
     MAX_VALUE,
     REDACTED_VALUE,
@@ -72,8 +73,8 @@ def silent(canary: re.Pattern[str], *lines: str) -> bool:
 
 
 def test_the_pieces_spell_the_canarys_rule_byte_for_byte():
-    stops = CANARY_VALUE_STOPS
-    spelled = f"[A-Z][A-Z0-9_]*({'|'.join(CREDENTIAL_WORDS)})=[^{stops}]{{{CANARY_VALUE_FLOOR},}}"
+    words, stops, tail = "|".join(CREDENTIAL_WORDS), CANARY_VALUE_STOPS, CREDENTIAL_TAIL
+    spelled = f"[A-Z0-9_]*({words})({tail})?=[^{stops}]{{{CANARY_VALUE_FLOOR},}}"
     assert spelled == NOC_CREDENTIAL_ASSIGNMENT
 
 
@@ -101,6 +102,10 @@ def _linear_name_ends(text: str) -> set[int]:
         "KEYKEY=x PASSPHRASE=x A_PASSPHRASE=x APASSWORD=x A_SECRET_KEY=x",
         "gh_token=x Gh_TOKEN=x GH_TOKEN_FILE=x GH_TOKENS=x A_KEY==x",
         "A_TOKEN=B_TOKEN=C_TOKEN=x",
+        # The tail (issue #927): `_BASE` after the word, and no other.
+        "SECRET_KEY_BASE=x KEY_BASE=x TOKEN_BASE=x _BASE=x BASE=x KEY_BASE_BASE=x",
+        "KEY_BASEX=x KEY_BASES=x KEYBASE=x KEY__BASE=x KEY_base=x A_KEY_BASE_KEY=x",
+        "$PASSWORD=x -PASSWORD=x apiKEY=x fooBAR_TOKEN=x 9_KEY=x",
     ],
 )
 def test_the_linear_spelling_names_exactly_the_canarys_credentials(text):
@@ -109,18 +114,52 @@ def test_the_linear_spelling_names_exactly_the_canarys_credentials(text):
 
 def test_the_linear_spelling_agrees_with_the_canary_on_random_text():
     rng = random.Random(918)
-    alphabet = ["A", "K", "E", "Y", "T", "O", "N", "S", "_", "9", "a", "=", " "]
-    alphabet += list(CREDENTIAL_WORDS)
+    alphabet = ["A", "K", "E", "Y", "T", "O", "N", "S", "B", "_", "9", "a", "=", " "]
+    alphabet += [*CREDENTIAL_WORDS, CREDENTIAL_TAIL, "BASE"]
     for _ in range(4000):
         text = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 14)))
         assert _linear_name_ends(text) == _canary_name_ends(text), text
 
 
-def test_a_bare_word_is_no_credentials_name_because_the_canarys_is_not():
-    # The canary needs a capital before the word, so `PASSWORD=` alone names nothing to it, and a
-    # lowercase name nothing either. One definition: what the canary does not page on is kept.
-    for text in ("PASSWORD=hunter2hunter2", "TOKEN=abcdefghij", "gh_token=abcdefghij"):
-        assert scrub(text) == text
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        # A bare word is a name (issue #927): the canary no longer needs a capital before it.
+        ("PASSWORD=hunter2hunter2", "PASSWORD='<a redacted value>'"),
+        ("TOKEN=abcdefghij next", "TOKEN='<a redacted value>' next"),
+        ("KEY=abcdefghij", "KEY='<a redacted value>'"),
+        ("_TOKEN=abcdefghij", "_TOKEN='<a redacted value>'"),
+        ("PASSPHRASE=abcdefghij", "PASSPHRASE='<a redacted value>'"),
+        ("export $PASSWORD=abcdefghij", "export $PASSWORD='<a redacted value>'"),
+        # A literal rule's label is read by the same definition, so a bare query word keeps it.
+        ("GET /v1?TOKEN=abcdefghijk&x=1 HTTP", "GET /v1?TOKEN='<a redacted value>' HTTP"),
+        ("GET /v1?KEY=abcdefghijk HTTP", "GET /v1?KEY='<a redacted value>' HTTP"),
+        # `_BASE` is the one tail: the Rails master secret's name.
+        ("SECRET_KEY_BASE=0123456789abcdef", "SECRET_KEY_BASE='<a redacted value>'"),
+        ("KEY_BASE=abcdefghij", "KEY_BASE='<a redacted value>'"),
+    ],
+)
+def test_a_bare_word_and_the_base_tail_are_credentials_names(text, scrubbed, canary):
+    assert scrub(text) == scrubbed
+    assert scrub(scrubbed) == scrubbed
+    assert silent(canary, scrubbed)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # No other tail, a plural, a lowercase name: what the canary does not page on is kept.
+        "GH_TOKEN_FILE=/run/secrets/gh-token",
+        "GH_TOKENS=abcdefghij",
+        "API_KEY_ID=abcdefghij",
+        "KEY_BASES=abcdefghij",
+        "SECRET_KEY_BASE_DUMMY=abcdefghij",
+        "gh_token=abcdefghij",
+    ],
+)
+def test_any_other_tail_is_no_credentials_name_because_the_canarys_is_not(text, canary):
+    assert scrub(text) == text
+    assert silent(canary, text)
 
 
 def test_two_hundred_thousand_capitals_are_scrubbed_in_linear_time():
@@ -133,6 +172,9 @@ def test_two_hundred_thousand_capitals_are_scrubbed_in_linear_time():
         "A" * 200_000 + "=x",
         "KEY" * 66_667 + "=x",
         "_" * 200_000 + "TOKEN=x",
+        "KEY_BASE" * 25_000 + "=x",
+        "KEY_" * 50_000 + "BASE=x",
+        "9" * 200_000 + "KEY=x",
         "A_TOKEN=" * 25_000,
         'A_TOKEN="' * 22_223,
         'API_KEY="' * 22_223,
@@ -347,6 +389,29 @@ def test_a_name_inside_a_value_takes_its_value_with_it(text, redacted, canary):
     for redact in (redact_credentials, scrub):
         assert redact(text) == redacted
         assert "hunter2" not in redact(text)
+    assert silent(canary, redacted)
+
+
+@pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        # The review of #927: a name inside a name inside a value is read whole too, so a bare word
+        # that became a name (`PASSWORD=`) never pushes a real one down to the canary's run alone.
+        (
+            "PASSWORD=x,AUTH_TOKEN=\tDB_TOKEN=Bearer s3cr3t next=1",
+            "PASSWORD='<a redacted value>' next=1",
+        ),
+        (
+            'PASSWORD=x,A_TOKEN=\tB_TOKEN=Bearer "eyJ secret" next=1',
+            "PASSWORD='<a redacted value>' next=1",
+        ),
+        ("A_KEY=X_TOKEN=\tY_TOKEN=Bearer s3cr3t next=1", "A_KEY='<a redacted value>' next=1"),
+        ("TOKEN=PASSWORD=\tAKEY=' hunter2hunter2", "TOKEN='<a redacted value>'"),
+    ],
+)
+def test_a_name_at_any_depth_takes_its_value_with_it(text, redacted, canary):
+    for redact in (redact_credentials, scrub):
+        assert redact(text) == redacted
     assert silent(canary, redacted)
 
 
