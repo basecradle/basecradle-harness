@@ -564,6 +564,17 @@ def test_the_routed_shapes_are_read_as_the_router_reads_them(text, redacted, can
         (f"Bearer a=Bearer {FAKE_JWT} next=1", "Bearer a=[redacted] next=1"),
         (f"?token=Bearer x.Bearer '{FAKE_JWT}' next=1", "[redacted] next=1"),
         ("Bearer $(cat /run/tok) next=1", "[redacted] next=1"),
+        (f"Bearer x.Bearer $'{FAKE_JWT} x' next=1", "[redacted] next=1"),
+        # A token in escaped quotes (JSON inside a JSON string) ends at its escaped close.
+        (
+            f'"Authorization": "Bearer \\"{FAKE_JWT}\\"", "x": 1',
+            '"Authorization": "[redacted]", "x": 1',
+        ),
+        # The review of #929: an `x-api-key` value that is the next header's own label is read on
+        # through that header, beside a credential's value or a heartbeat URL alike.
+        (f"x-api-key: x-api-key: {FAKE_JWT} next", "[redacted] next"),
+        (f'A_TOKEN=x-api-key: "x-api-key": "{FAKE_JWT}"', "A_TOKEN='<a redacted value>'\""),
+        (f"https://h.example.com/heartbeat/K9=x-api-key=> x-api-key: {FAKE_JWT}", "[redacted]"),
         # A bare scheme word before a short word, or none, is still prose.
         ("auth: Bearer token missing", "auth: Bearer token missing"),
         ("use the Bearer scheme, then Bearer Bearer", "use the Bearer scheme, then Bearer Bearer"),
@@ -588,8 +599,12 @@ def test_no_run_of_scheme_words_lets_a_token_through_scrubbed(canary):
         blanks = [" ", "\t", "  "]
         run = "".join(rng.choice(words) + rng.choice(blanks) for _ in range(rng.randint(1, 5)))
         head = rng.choice(["", "x ", "curl -H ", "A_TOKEN=", "x A_TOKEN=", "?token=", "auth: "])
-        token = rng.choice([FAKE_JWT, f'"{FAKE_JWT} x"', f"'{FAKE_JWT} x'", f"$({FAKE_JWT} x)"])
-        text = f"{head}{run}{token}{rng.choice(['', ' next=1'])}"
+        token = rng.choice(
+            [FAKE_JWT, f'"{FAKE_JWT} x"', f"'{FAKE_JWT} x'", f"$({FAKE_JWT} x)", f"$'{FAKE_JWT} x'"]
+            + [f'\\"{FAKE_JWT} x\\"', f"`{FAKE_JWT} x`"]
+        )
+        tail = rng.choice(["", " next=1", '", "x": 1'])
+        text = f"{head}{run}{token}{tail}"
         once = scrub(text)
         assert FAKE_JWT not in once, repr(text)
         assert scrub(once) == once, repr(text)

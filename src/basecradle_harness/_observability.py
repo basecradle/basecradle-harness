@@ -260,8 +260,11 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: other label (``api_key=``, ``?token=``) goes with its value as ``[redacted]``.
 _X_API_KEY = re.compile(
     r"(?i:x[-_]api[-_]?key)(?:\\?[\"']\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?[\"'])?"
-    r"(?:(?i:bearer)\s+)*(?:[^\s\"'&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s\"'&\\]+)"
+    r"(?P<value>(?:(?i:bearer)\s+)*(?:[^\s\"'&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s\"'&\\]+))"
 )
+#: How far before a header's span end a label that would read on past it can start: the longest
+#: label (``x-api-key``), its separator (``=>``), and a quote, escaped (`_x_api_key_spans`).
+_X_API_LABEL_REACH = len("x-api-key") + len("=>") + len('\\"')
 _QUERY = re.compile(
     r"(?P<label>[?&](?i:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*"
     r"(?:[^&\s]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^&\s]+)"
@@ -277,10 +280,14 @@ _API_KEY = re.compile(
 #: (`_shell_word_end`), as a credential's value is read. Quoted, a token is no run of token
 #: characters, and ``Bearer 'eyJ…'`` once matched nothing. **A run of scheme words goes with the
 #: token after it** (`_bearer_end`).
-_BEARER = re.compile(r"(?P<scheme>(?i:bearer)\s+)(?:[A-Za-z0-9._~+/-]{8,}|[\"'`]|\$['({])")
+_BEARER = re.compile(r"(?P<scheme>(?i:bearer)\s+)(?:[A-Za-z0-9._~+/-]{8,}|[\"'`]|\$['({]|\\[\"'])")
 _BEARER_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{8,}")
 _BEARER_GAP = re.compile(r"\s+")
 _TOKEN_OPENERS = ("'", '"', "`", "$'", "$(", "${")
+
+#: A bearer token in escaped quotes (``"Bearer \\"eyJ…\\""``, JSON inside a JSON string): to the
+#: escaped quote that closes it, on its own line, or as a shell word when none does.
+_ESCAPED_TOKEN = re.compile(r'\\"[^\n]*?\\"|\\\'[^\n]*?\\\'')
 
 #: A Better Stack heartbeat URL, whose secret is its path, redacted by the box's rule
 #: ``(?:https?://\S*)?/heartbeat/\S+`` (basecradle-router#398): a URL with a scheme from the scheme
@@ -790,7 +797,7 @@ def scrub(text: str) -> str:
     spans = heapq.merge(
         assignments,
         (_heartbeat_span(match) for match in _HEARTBEAT_RUN.finditer(text)),
-        _label_spans(_X_API_KEY, text, values),
+        _x_api_key_spans(text),
         _label_spans(_QUERY, text, values),
         _label_spans(_API_KEY, text, values),
         _bearer_spans(text),
@@ -844,10 +851,38 @@ def _label_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterator
         yield (label_end if label_end in values else match.start()), match.end()
 
 
+def _x_api_key_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Every ``x-api-key`` header's span, read on through a header its value opens with.
+
+    A value can end in the next header's own label (``x-api-key: "x-api-key": "K9…"``, whose value
+    is ``x-api-key`` up to the quote; ``x-api-key: abc-x-api-key: K9…``, whose value ends at
+    ``x-api-key:``), and the header after it would then be matched by nothing, since each search
+    starts past the last match (the review of #929). So while a header whose label ends where the
+    span does reaches further, it is read too, and the span ends where the last one does. Only such
+    a label can: a header starting earlier in the value stops where the value stops, at the same
+    space, quote, backslash or ``&``, and a bearer header that crosses one is the bearer rule's.
+    The label must end at the span's end, or one or two characters before it (``:``, ``=>``), so
+    only a few characters are searched for it, and the rule stays linear."""
+    pos = 0
+    while (match := _X_API_KEY.search(text, pos)) is not None:
+        start, end, floor = match.start(), match.end(), match.start("value")
+        while True:
+            tail = range(max(floor, end - _X_API_LABEL_REACH), end)
+            inner = next(
+                (m for i in tail if (m := _X_API_KEY.match(text, i)) and m.end() > end), None
+            )
+            if inner is None:
+                break
+            end, floor = inner.end(), inner.start("value")
+        yield start, end
+        pos = end
+
+
 def _bearer_spans(text: str) -> Iterator[tuple[int, int]]:
     """Every bearer header's span: its scheme word, any scheme words after it, and its token
-    (`_bearer_end`). A match inside a span already walked is that walk's suffix, so it is not walked
-    again, which keeps the rule linear."""
+    (`_bearer_end`). Matches are read leftmost-first, as the box's regular expression reads them:
+    one that starts inside a span already walked is not walked again, so a scheme word inside a
+    walked token (``Bearer 'a Bearer "eyJ' x"``) is that token's text, and the rule stays linear."""
     reach = -1
     for match in _BEARER.finditer(text):
         end = _bearer_end(text, match) if match.start() >= reach else match.end()
@@ -866,7 +901,10 @@ def _bearer_end(text: str, match: re.Match[str]) -> int:
     no token after it ends nothing. Each word is read once, so the walk is linear in its length."""
     end, at = match.end(), match.end("scheme")
     while True:
-        if text.startswith(_TOKEN_OPENERS, at):
+        if (escaped := _ESCAPED_TOKEN.match(text, at)) is not None:
+            word = escaped.end()
+            end = max(end, word)
+        elif text.startswith(_TOKEN_OPENERS, at) or text.startswith(('\\"', "\\'"), at):
             word = _shell_word_end(text, at)[0]
             end = max(end, word)
         else:
