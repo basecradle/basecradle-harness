@@ -419,12 +419,74 @@ def _shell_word_end(text: str, start: int, limit: int | None = None) -> int:
     return min(i, n)
 
 
+#: The characters a bearer header's scheme word may be glued to (``KBearer``, ``api_key=Bearer``):
+#: a token's, as a header value spells one. The router's `logfmt.SCHEME_GLUE`, byte for byte
+#: (basecradle-router#497), so both writers on a box read the same scheme word.
+_SCHEME_GLUE = "A-Za-z0-9._~+/%:=-"
+
+#: A bearer header's scheme word, which is never a credential's whole value: the token after it is
+#: (issue #926, basecradle-router#497). Alone it is the word in any case; glued to a value only as
+#: HTTP spells it, so a value merely ending in the letters (``abc-bearer``) is no header.
+_SCHEME_WORD = re.compile(f"(?i:bearer)|[{_SCHEME_GLUE}]*Bearer")
+
+#: What stands between a scheme word and its token: blanks, never a newline, as the box reads them.
+_SCHEME_BLANKS = re.compile("[ \t]+")
+
+
 def _value_end(text: str, start: int, limit: int | None = None) -> int:
     """Where a credential's value from `start` ends: the longer of the shell word there and the
-    canary's run, so whatever the canary would read as the value is gone with it. Read no further
-    than `limit` when one is given: a value still running there is reported as ending there."""
-    end = len(text) if limit is None else limit
-    return max(_shell_word_end(text, start, end), _CANARY_RUN.match(text, start, end).end())
+    canary's run, so whatever the canary would read as the value is gone with it; and while a word
+    of the value is a bearer scheme word (`_SCHEME_WORD`), the word after the blanks that follow it
+    too, so a doubled scheme word goes with the token after both (issue #926). A scheme word with
+    nothing after it on its line is the value alone.
+
+    The words are shell words: the canary's run crosses a tab, and read that way
+    ``bearer<TAB>Bearer`` would be one word and no scheme word, and the token after it would ship.
+    Each word is read once, and the canary's run once from where the last one ended, so the value is
+    linear in its length. The router's reading (basecradle-router#497, `logfmt._value_end`), carried
+    as it is, but for `limit`: read no further than it, and a value still running there — the word
+    after a scheme word's blanks among it, which the cut hides — is reported as ending there, which
+    is all `bounded` needs to know; and for a credential name the value reaches past its ``=``,
+    whose value then goes with this one as far as the canary reads it (the review of #926: the
+    redactor's next search starts past that ``=``, so nothing else would ever read it). The router
+    has no such clause yet, so on that one shape this reading redacts more than the router's."""
+    stop = len(text) if limit is None else min(limit, len(text))
+    end = _scheme_value_end(text, start, stop)
+    # A credential name the value reaches past its ``=`` (``A_TOKEN=x,DB_PASSWORD=<TAB>…``: the
+    # shell word runs to the tab, past the second name, and the canary's run of that name's value
+    # crosses the tab) is never searched for again, so its value goes with this one. It is read as
+    # any value is, unless it stands inside the value of a name read that way before it, where the
+    # canary's run alone is read: so no character is read whole twice, and the reading stays
+    # linear however densely names fill a value (``A_TOKEN=`` repeated).
+    pos, read_to, run_lo, run_hi = start, start, -1, -1
+    while (name := _CREDENTIAL_NAME.search(text, pos, end)) is not None:
+        pos = name.end()
+        if pos > read_to:
+            read_to = _scheme_value_end(text, pos, stop)
+            end = max(end, read_to)
+        elif not run_lo <= pos <= run_hi:
+            run_lo, run_hi = pos, _CANARY_RUN.match(text, pos, stop).end()
+            end = max(end, run_hi)
+    return end
+
+
+def _scheme_value_end(text: str, start: int, stop: int) -> int:
+    """`_value_end`'s reading of one value, ending no later than `stop`: the router's reading."""
+    run_end = _CANARY_RUN.match(text, start, stop).end()
+    word_end = _shell_word_end(text, start, stop)
+    end = max(word_end, run_end)
+    while _SCHEME_WORD.fullmatch(text, start, word_end) and (
+        blanks := _SCHEME_BLANKS.match(text, word_end, stop)
+    ):
+        start = blanks.end()
+        if start == stop < len(text):
+            return stop  # the token, if there is one, stands past the cut
+        if (word_end := _shell_word_end(text, start, stop)) == start:
+            break  # nothing after the scheme word on its line
+        if start >= run_end:
+            run_end = _CANARY_RUN.match(text, start, stop).end()
+        end = max(end, word_end, run_end)
+    return end
 
 
 def redact_credentials(text: str) -> str:
@@ -432,10 +494,12 @@ def redact_credentials(text: str) -> str:
 
     The name stays. The value is the longer of two readings from the character after the ``=``
     (`_value_end`): the shell word there, so a quoted value or a ``"$(…)"`` goes whole, and the
-    canary's own run. An empty value (a space, a record break or the text's end follows the ``=``)
-    has nothing to hide and is left as it is. Linear in `text`: each name is found once, and the
-    next search starts where its value ends. The router's function of the same name
-    (basecradle-router#491), which `scrub` runs as its third pass."""
+    canary's own run. A bearer scheme word is no value alone: the token after it goes with it
+    (issue #926), so the function is right called alone, never only by the passes `scrub` runs
+    before it. An empty value (a space, a record break or the text's end follows the ``=``) has
+    nothing to hide and is left as it is. Linear in `text`: each name is found once, and the next
+    search starts where its value ends. The router's function of the same name
+    (basecradle-router#491, #497), which `scrub` runs as its third pass."""
     if "=" not in text:
         return text
     out: list[str] = []

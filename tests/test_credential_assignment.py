@@ -26,6 +26,7 @@ import pytest
 from basecradle_harness._engine import Engine
 from basecradle_harness._observability import (
     _BREAK_CHARS,
+    _SCHEME_GLUE,
     CANARY_VALUE_FLOOR,
     CANARY_VALUE_STOPS,
     CREDENTIAL_NAME,
@@ -37,6 +38,7 @@ from basecradle_harness._observability import (
     kv,
     last_word,
     log_handler,
+    redact_credentials,
     scrub,
     scrub_line,
 )
@@ -226,16 +228,19 @@ def test_the_marker_is_no_value_to_the_canary_whatever_follows_it(canary):
             "AUTH_TOKEN=Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig sent",
             "AUTH_TOKEN='<a redacted value>' sent",
         ),
-        # The bearer rule takes the second `Bearer` with its token, as it always did; the first
-        # is the assignment's value.
+        # The bearer rule takes the second `Bearer` with its token, and the assignment's value,
+        # the first `Bearer`, takes the bearer rule's `[redacted]` after it as its token (#926).
         (
             "AUTH_TOKEN=Bearer Bearer eyJhbGciOiJIUzI1NiJ9 sent",
-            "AUTH_TOKEN='<a redacted value>' [redacted] sent",
+            "AUTH_TOKEN='<a redacted value>' sent",
         ),
         ("AUTH_TOKEN=KBearer eyJhbGciOiJIUzI1NiJ9 sent", "AUTH_TOKEN='<a redacted value>' sent"),
         ('AUTH_TOKEN="Bearer eyJhbGciOiJIUzI1NiJ9" sent', "AUTH_TOKEN='<a redacted value>' sent"),
-        # A short word after a bearer value is prose, as it is to the bearer rule.
-        ("AUTH_TOKEN=Bearer missing here", "AUTH_TOKEN='<a redacted value>' missing here"),
+        # A short word after a credential's bearer value is its token, whatever its length, as the
+        # router reads it (basecradle-router#497): the value is a credential's, so it errs toward
+        # redaction. A short word after a bare `Bearer` is still prose to the bearer rule.
+        ("AUTH_TOKEN=Bearer missing here", "AUTH_TOKEN='<a redacted value>' here"),
+        ("auth: Bearer missing here", "auth: Bearer missing here"),
         # A heartbeat URL runs first, and its name still stands with the router's marker.
         (
             "HB_TOKEN=https://uptime.example.com/api/v1/heartbeat/Ab3Cd5Ef7Gh9Ij1K ok",
@@ -252,6 +257,148 @@ def test_the_other_rules_never_read_the_marker_and_never_lose_a_token(text, scru
     assert scrub(text) == scrubbed
     assert SHAPELESS not in scrub(text)
     assert silent(canary, scrub(text))
+
+
+# --- a bearer value goes with its token, called alone (issue #926) ------------------------------
+
+#: A fabricated JWT: the token a bearer header carries, which no shape rule matches.
+FAKE_JWT = "eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig"
+
+
+@pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        # The issue's reproductions, which shipped the token when the function was called alone.
+        (f"AUTH_TOKEN=Bearer {FAKE_JWT} next=1", "AUTH_TOKEN='<a redacted value>' next=1"),
+        (f"X_API_KEY=KBearer {FAKE_JWT} next=1", "X_API_KEY='<a redacted value>' next=1"),
+        (f"A_TOKEN=Bearer Bearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"DB_PASSWORD=Bearer {FAKE_JWT} next=1", "DB_PASSWORD='<a redacted value>' next=1"),
+        # Any case alone, any run of the two forms in any order, and a tab between them.
+        (f"A_TOKEN=bearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=BEARER\t{FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=bearer\tBEARER {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=Bearer KBearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=KBearer Bearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=x.Bearer Bearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # A short word after the scheme word is the token too, as the router reads it.
+        ("X_TOKEN=Bearer abc next=1", "X_TOKEN='<a redacted value>' next=1"),
+        # The token is a shell word like any value: quoted, it goes whole, after a tab too.
+        ('A_TOKEN=Bearer "a b" next=1', "A_TOKEN='<a redacted value>' next=1"),
+        ('A_TOKEN=Bearer\t"a b" next=1', "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN=Bearer\t'a b' next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # Glued only as HTTP spells it: a value merely ending in the letters is no header, nor is
+        # a scheme word inside a quoted piece.
+        ("A_TOKEN=abc-bearer next=1", "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN='a Bearer' next=1", "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN=a\\ Bearer next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # A scheme word with no word after it on its line is the value.
+        ("A_TOKEN=Bearer", "A_TOKEN='<a redacted value>'"),
+        ("A_TOKEN=Bearer ", "A_TOKEN='<a redacted value>' "),
+        ("A_TOKEN=Bearer \nnext=1", "A_TOKEN='<a redacted value>' \nnext=1"),
+        # A marker after a scheme word is the token, already redacted: one marker stands.
+        ("A_TOKEN=Bearer '<a redacted value>' next=1", "A_TOKEN='<a redacted value>' next=1"),
+    ],
+)
+def test_a_bearer_scheme_word_goes_with_its_token_called_alone(text, redacted, canary):
+    assert redact_credentials(text) == redacted
+    assert redact_credentials(redacted) == redacted
+    assert FAKE_JWT not in redact_credentials(text)
+    assert silent(canary, redacted)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # `main`'s `scrub` shipped each token: the bearer rule wants eight token characters and no
+        # quote, and the assignment pass took the scheme word alone.
+        f'AUTH_TOKEN=Bearer "{FAKE_JWT}" next=1',
+        f"AUTH_TOKEN=Bearer '{FAKE_JWT}' next=1",
+        "AUTH_TOKEN=Bearer s3cr3t next=1",
+        "AUTH_TOKEN=Bearer abc,defghijklmnop next=1",
+        "AUTH_TOKEN=Bearer $(cat /run/tok) next=1",
+    ],
+)
+def test_scrub_ships_no_token_after_a_credentials_scheme_word(text):
+    assert scrub(text) == text.split("=", 1)[0] + "='<a redacted value>' next=1"
+
+
+@pytest.mark.parametrize(
+    ("text", "redacted"),
+    [
+        # The review of #926: the value's shell word runs to the tab, past a second name's `=`,
+        # and the next search starts past it, so that name's value was read by nothing. Without a
+        # scheme word this already shipped on `main`; through one, `main` had redacted it.
+        (
+            "AUTH_TOKEN=Bearer x,DB_PASSWORD=\thunter2hunter2 next=1",
+            "AUTH_TOKEN='<a redacted value>' next=1",
+        ),
+        (
+            "AUTH_TOKEN=x,DB_PASSWORD=\thunter2hunter2 next=1",
+            "AUTH_TOKEN='<a redacted value>' next=1",
+        ),
+        ("A_TOKEN=Bearer }DB_PASSWORD=\thunter2hunter2 x", "A_TOKEN='<a redacted value>' x"),
+        # A quote the second value opens runs to the end, as the shell reads it.
+        ('A_TOKEN=Bearer x"DB_PASSWORD="\thunter2hunter2 x', "A_TOKEN='<a redacted value>'"),
+        # A name the value does not reach past its `=` is its own, and keeps its name.
+        ("A_TOKEN=x B_TOKEN=y", "A_TOKEN='<a redacted value>' B_TOKEN='<a redacted value>'"),
+    ],
+)
+def test_a_name_inside_a_value_takes_its_value_with_it(text, redacted, canary):
+    for redact in (redact_credentials, scrub):
+        assert redact(text) == redacted
+        assert "hunter2" not in redact(text)
+    assert silent(canary, redacted)
+
+
+def test_a_value_holding_many_names_is_read_in_linear_time():
+    started = time.monotonic()
+    for unit in ("A_TOKEN=", "A_TOKEN=\t", "x,A_TOKEN=\t", "A_TOKEN=Bearer x,"):
+        redact_credentials("A_TOKEN=" + unit * 40_000)
+    assert time.monotonic() - started < 5.0
+
+
+def test_the_scheme_glue_is_the_routers_byte_for_byte():
+    assert _SCHEME_GLUE == "A-Za-z0-9._~+/%:=-"
+
+
+def test_no_run_of_scheme_words_lets_a_token_through_called_alone(canary):
+    rng = random.Random(926)
+    words = ["Bearer", "bearer", "BEARER", "KBearer", "x.Bearer", "a=Bearer"]
+    for _ in range(3000):
+        blanks = [" ", "\t", "  "]
+        run = "".join(rng.choice(words) + rng.choice(blanks) for _ in range(rng.randint(1, 5)))
+        head, tail = rng.choice(["", "x ", "curl -H "]), rng.choice(["", " next=1"])
+        token = rng.choice([FAKE_JWT, f'"{FAKE_JWT} x"', f"'{FAKE_JWT} x'", f"x,{FAKE_JWT}"])
+        text = f"{head}A_TOKEN={run}{token}{tail}"
+        once = redact_credentials(text)
+        assert FAKE_JWT not in once, repr(text)
+        assert redact_credentials(once) == once, repr(text)
+        assert silent(canary, once)
+        # A cut anywhere in the raw text keeps the assignment whole or drops it: it never keeps
+        # the assignment's scheme words as if they were its whole value, with the token unseen.
+        cap = rng.randint(len(head) + 9, len(text) + 2)
+        cut = bounded(text, cap)
+        assert cut == text or not re.search(r"(?i)bearer\s*…\Z", cut), (repr(text), cap)
+
+
+def test_a_bound_never_keeps_a_scheme_word_whose_token_the_cut_hides():
+    # The cut falls in the blanks after a scheme word: the token past it is unseen, so the
+    # assignment goes whole rather than standing as `Bearer` alone and its `…`.
+    for pad in range(MAX_VALUE - 40, MAX_VALUE + 5):
+        text = "x" * pad + f" A_TOKEN=Bearer   {FAKE_JWT}"
+        cut = bounded(text, MAX_VALUE)
+        assert "Bearer" not in cut and FAKE_JWT not in cut, (pad, cut[-40:])
+
+
+def test_a_long_run_of_scheme_words_is_read_in_linear_time():
+    started = time.monotonic()
+    redact_credentials("A_TOKEN=" + "Bearer " * 50_000 + "x")
+    redact_credentials("A_TOKEN=" + "Bearer\t" * 50_000)
+    redact_credentials("A_TOKEN=" + "xbearer" * 50_000)
+    redact_credentials("A_TOKEN=" + "xBearer" * 50_000 + " x")
+    bounded("A_TOKEN=" + "Bearer " * 50_000 + "x", MAX_VALUE)
+    scrub("A_TOKEN=" + "Bearer " * 50_000 + "x")
+    assert time.monotonic() - started < 5.0
 
 
 def test_scrubbing_twice_is_scrubbing_once():
@@ -297,7 +444,14 @@ def test_the_marker_reads_back_as_itself_on_every_flattened_text():
 # --- the cut treats an assignment as one token ---------------------------------------------------
 
 
-@pytest.mark.parametrize("tail", [MINT, "A_TOKEN=abc and more words", "A_TOKEN= then words"])
+@pytest.mark.parametrize(
+    "tail",
+    [
+        MINT,
+        "A_TOKEN=abc and more words",
+        "A_TOKEN= then words",
+    ],
+)
 def test_a_bound_cuts_an_assignment_whole_or_not_at_all(tail, canary):
     # `ScrubbingFormatter` scrubs every line again: a cut marker, or a `…` glued to a marker or an
     # `=`, would be read as a value and rebuilt as a whole marker, past the bound and with no `…`.

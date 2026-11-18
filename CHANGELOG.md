@@ -7,6 +7,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.198.1] - 2026-11-17
+
+### Fixed: A credential's bearer value takes its token, in the assignment pass itself (issue #926, basecradle-router#497)
+
+`_observability.redact_credentials` read a bearer scheme word as a credential's whole value and left the token after it: called alone, `AUTH_TOKEN=Bearer eyJ…` rendered as `AUTH_TOKEN='<a redacted value>' eyJ…`. Its one caller, `scrub`, runs the bearer rule first, which hid most of it, but not all: **`scrub` shipped the token wherever the bearer rule does not match one** (it wants eight characters from `[A-Za-z0-9._~+/-]` and no quote), so `AUTH_TOKEN=Bearer "eyJ…"`, `AUTH_TOKEN=Bearer 'eyJ…'`, `AUTH_TOKEN=Bearer s3cr3t`, `AUTH_TOKEN=Bearer abc,defghijklmnop` and `AUTH_TOKEN=Bearer $(cat /run/tok)` each reached the journal with the token after the marker. A journal written by an earlier version may hold one.
+
+- **A scheme word goes with the word after it**, mirroring the router's print site (`logfmt._value_end`, basecradle-router#503), so both writers on a box leave the same bytes: `Bearer` in any case alone, a `Bearer` glued to token characters (`KBearer`; `abc-bearer` is no header), doubled or mixed, separated by spaces or tabs. A scheme word with nothing after it on its line is the value alone.
+- **A short word after a credential's scheme word is its token now**, whatever its length (`AUTH_TOKEN=Bearer missing here` keeps only `here`), as the router reads it; a bare `Bearer missing` outside an assignment keeps its words.
+- **A credential name inside a value takes its value with it.** In `AUTH_TOKEN=x,DB_PASSWORD=<TAB>hunter2…` the first value's shell word runs to the tab, past the second name's `=`, and the next search started past it, so the second value was read by nothing (on 0.198.0 too, and through a scheme word once the scheme word took its token). The router's reading does not have this yet, so on that shape the harness redacts more than the router.
+- **`bounded` reads the same value**: a cut that falls in the blanks after a scheme word, where the token is unseen, takes the assignment whole.
+- A differential fuzz of 1,200,000 texts built from credential names, literal labels, scheme words, blanks, quotes and real key shapes finds no secret the new `scrub` leaves that 0.198.0's redacted, and 531 that 0.198.0's left and the new one redacts.
+
 ## [0.198.0] - 2026-11-16
 
 ### Fixed: The scrub redacts the value of every credential-named assignment (issue #918, basecradle#877)
