@@ -565,14 +565,19 @@ def test_the_routed_shapes_are_read_as_the_router_reads_them(text, redacted, can
         (f"?token=Bearer x.Bearer '{FAKE_JWT}' next=1", "[redacted] next=1"),
         ("Bearer $(cat /run/tok) next=1", "[redacted] next=1"),
         (f"Bearer x.Bearer $'{FAKE_JWT} x' next=1", "[redacted] next=1"),
-        # A token in escaped quotes (JSON inside a JSON string) ends at its escaped close.
+        # A token in escaped quotes (JSON inside a JSON string) is the rest of its word, so an
+        # unbalanced, open or doubly escaped one is taken too (the review of #929).
+        (f'{{"a":"Bearer \\"tok1, b: Bearer \\"{FAKE_JWT}\\""}}', '{"a":"[redacted] b: [redacted]'),
+        (f'Bearer \\\\\\"{FAKE_JWT}\\\\\\" next=1', "[redacted] next=1"),
+        (f'Bearer \\"{FAKE_JWT}', "[redacted]"),
         (
             f'"Authorization": "Bearer \\"{FAKE_JWT}\\"", "x": 1',
-            '"Authorization": "[redacted]", "x": 1',
+            '"Authorization": "[redacted] "x": 1',
         ),
         # The review of #929: an `x-api-key` value that is the next header's own label is read on
         # through that header, beside a credential's value or a heartbeat URL alike.
         (f"x-api-key: x-api-key: {FAKE_JWT} next", "[redacted] next"),
+        ("x-api-key: x-api-key:Bearer K9sec!ret%value next", "[redacted] next"),
         (f'A_TOKEN=x-api-key: "x-api-key": "{FAKE_JWT}"', "A_TOKEN='<a redacted value>'\""),
         (f"https://h.example.com/heartbeat/K9=x-api-key=> x-api-key: {FAKE_JWT}", "[redacted]"),
         # A bare scheme word before a short word, or none, is still prose.

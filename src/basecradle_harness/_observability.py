@@ -263,8 +263,9 @@ _X_API_KEY = re.compile(
     r"(?P<value>(?:(?i:bearer)\s+)*(?:[^\s\"'&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s\"'&\\]+))"
 )
 #: How far before a header's span end a label that would read on past it can start: the longest
-#: label (``x-api-key``), its separator (``=>``), and a quote, escaped (`_x_api_key_spans`).
-_X_API_LABEL_REACH = len("x-api-key") + len("=>") + len('\\"')
+#: label (``x-api-key``), its separator (``=>``), and the one scheme word its value may open with
+#: glued to them, the blank after it being where the span stops (`_x_api_key_spans`).
+_X_API_LABEL_REACH = len("x-api-key") + len("=>") + len("bearer")
 _QUERY = re.compile(
     r"(?P<label>[?&](?i:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*"
     r"(?:[^&\s]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^&\s]+)"
@@ -280,14 +281,16 @@ _API_KEY = re.compile(
 #: (`_shell_word_end`), as a credential's value is read. Quoted, a token is no run of token
 #: characters, and ``Bearer 'eyJ…'`` once matched nothing. **A run of scheme words goes with the
 #: token after it** (`_bearer_end`).
-_BEARER = re.compile(r"(?P<scheme>(?i:bearer)\s+)(?:[A-Za-z0-9._~+/-]{8,}|[\"'`]|\$['({]|\\[\"'])")
+_BEARER = re.compile(r"(?P<scheme>(?i:bearer)\s+)(?:[A-Za-z0-9._~+/-]{8,}|[\"'`]|\$['({]|\\+[\"'])")
 _BEARER_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{8,}")
 _BEARER_GAP = re.compile(r"\s+")
 _TOKEN_OPENERS = ("'", '"', "`", "$'", "$(", "${")
 
-#: A bearer token in escaped quotes (``"Bearer \\"eyJ…\\""``, JSON inside a JSON string): to the
-#: escaped quote that closes it, on its own line, or as a shell word when none does.
-_ESCAPED_TOKEN = re.compile(r'\\"[^\n]*?\\"|\\\'[^\n]*?\\\'')
+#: A bearer token in escaped quotes (``"Bearer \\"eyJ…\\""``, JSON inside a JSON string, escaped
+#: once or more): the escaped quote and the rest of its word, to the next blank or record break.
+#: An escaped quote closes nothing a reader can trust (it may be unbalanced, or cut), so the word
+#: is the token, whatever is glued to it, and never more than the word.
+_ESCAPED_TOKEN = re.compile("\\\\+[\"'][^\\s\\x00]*")
 
 #: A Better Stack heartbeat URL, whose secret is its path, redacted by the box's rule
 #: ``(?:https?://\S*)?/heartbeat/\S+`` (basecradle-router#398): a URL with a scheme from the scheme
@@ -861,8 +864,10 @@ def _x_api_key_spans(text: str) -> Iterator[tuple[int, int]]:
     span does reaches further, it is read too, and the span ends where the last one does. Only such
     a label can: a header starting earlier in the value stops where the value stops, at the same
     space, quote, backslash or ``&``, and a bearer header that crosses one is the bearer rule's.
-    The label must end at the span's end, or one or two characters before it (``:``, ``=>``), so
-    only a few characters are searched for it, and the rule stays linear."""
+    The label must end where the span does, or before its separator (``:``, ``=>``) and the one
+    scheme word an inner value may open with glued to it (``x-api-key: x-api-key:Bearer K9…``,
+    whose value stops at the blank after ``Bearer``), so only `_X_API_LABEL_REACH` characters are
+    searched for it, and the rule stays linear."""
     pos = 0
     while (match := _X_API_KEY.search(text, pos)) is not None:
         start, end, floor = match.start(), match.end(), match.start("value")
@@ -904,7 +909,7 @@ def _bearer_end(text: str, match: re.Match[str]) -> int:
         if (escaped := _ESCAPED_TOKEN.match(text, at)) is not None:
             word = escaped.end()
             end = max(end, word)
-        elif text.startswith(_TOKEN_OPENERS, at) or text.startswith(('\\"', "\\'"), at):
+        elif text.startswith(_TOKEN_OPENERS, at):
             word = _shell_word_end(text, at)[0]
             end = max(end, word)
         else:
