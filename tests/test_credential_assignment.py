@@ -131,6 +131,9 @@ def test_the_linear_spelling_agrees_with_the_canary_on_random_text():
         ("_TOKEN=abcdefghij", "_TOKEN='<a redacted value>'"),
         ("PASSPHRASE=abcdefghij", "PASSPHRASE='<a redacted value>'"),
         ("export $PASSWORD=abcdefghij", "export $PASSWORD='<a redacted value>'"),
+        # A literal rule's label is read by the same definition, so a bare query word keeps it.
+        ("GET /v1?TOKEN=abcdefghijk&x=1 HTTP", "GET /v1?TOKEN='<a redacted value>' HTTP"),
+        ("GET /v1?KEY=abcdefghijk HTTP", "GET /v1?KEY='<a redacted value>' HTTP"),
         # `_BASE` is the one tail: the Rails master secret's name.
         ("SECRET_KEY_BASE=0123456789abcdef", "SECRET_KEY_BASE='<a redacted value>'"),
         ("KEY_BASE=abcdefghij", "KEY_BASE='<a redacted value>'"),
