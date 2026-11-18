@@ -11,10 +11,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed: A bounded text no longer grows past its cap when the formatter scrubs a literal label again (issue #931)
 
-`bounded` kept a credential-named assignment whole (issue #918) but not a literal rule's label. A cut that left `?token=`, `api_key=` or an `x-api-key:` header glued to the `…` handed `ScrubbingFormatter`'s second scrub a value of `…`, which it wrote as `[redacted]`: past the cap when the label was short (`see ?token= tail` at a cap of 12 became `see [redacted]`, 14 characters), and always without the `…` that said the text was cut. A heartbeat URL whose secret the cut hid did the same (`curl h.example.com/heartbeat/…` became `curl [redacted]`). No secret shipped and no canary read one.
+`bounded` kept a credential-named assignment whole (issue #918) but not a literal rule's label. A cut that left `?token=`, `api_key=` or an `x-api-key:` header glued to the `…` handed `ScrubbingFormatter`'s second scrub a value of `…`, which it wrote as `[redacted]`: past the cap when the label was short (`see ?token= tail` at a cap of 12 became `see [redacted]`, 14 characters), and always without the `…` that said the text was cut. A heartbeat URL whose secret the cut hid lost its `…` the same way (`curl h.example.com/heartbeat/…` became `curl h.example.com[redacted]`), though within the cap. No secret shipped and no canary read one.
 
 - **A label the cut reaches goes whole, as a credential's name does.** A label is reached when the head, its trailing blanks gone, ends past the label and inside what its value may take. One the cut does not reach is kept. A blank between the label and the `…` would not do for every rule, since an `x-api-key` value and a bearer token are read across blanks.
-- **Still linear.** Each rule reads the head once, as `scrub` reads the text; 450,000 characters of labels bound in under 40 milliseconds.
+- **Still linear.** Each rule reads the head once, as `scrub` reads the text; `"?token=Bearer " * 30_000`, 420,000 characters, bounds one under its length in about 35 milliseconds.
 - A fuzz of `scrub(bounded(scrub(x), cap))` over every literal label's spellings, with the `…` and with ` […]`, holds the length within the cap and keeps the marker. On `main`, 51 of the same 30,000 texts grew past their cap and 1,029 more lost the `…`.
 
 ## [0.198.1] - 2026-11-17

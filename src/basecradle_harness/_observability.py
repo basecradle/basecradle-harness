@@ -779,8 +779,8 @@ def _whole_values(text: str, cut: int) -> tuple[int, int | None]:
     off by re-slicing the text and re-searching it, once per name, was quadratic). The cut then
     walks back over what was found, latest first, each item checked against the cut as it stands
     then; an item past the cut is already gone. A marker that opens with a blank reads less than
-    these readings assume, so it costs at most a label that could have stayed, never one that
-    should not. Returns the cut and where the value of the last assignment it keeps ends, or
+    these readings assume, so it can cost text that could have stayed (a label, with any token run
+    glued before it), never keep a label that should go. Returns the cut and where the value of the last assignment it keeps ends, or
     ``None`` when it keeps none."""
     found: list[tuple[int, int, int]] = []  # an assignment's name start, -1 and its value end
     pos = 0
