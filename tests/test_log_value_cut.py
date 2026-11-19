@@ -10,6 +10,7 @@ site that truncates a value bound for a log line, and pin the scrub layers' divi
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import time
@@ -764,6 +765,90 @@ def test_the_assignment_rules_are_linear():
     assert time.monotonic() - started < 1.0
 
 
+# --- an `api_key=` value in escaped quotes, and a value ending in the next label (issue #934) -----
+
+#: A key of no vendor's shape, fabricated: only the label it follows can say what it is.
+SHAPELESS_KEY = "K9fabricatedSecret07"
+
+#: A quote escaped as a third JSON string nested in two others writes it: seven backslashes.
+ESCAPED_3 = "\\" * 7 + '"'
+
+#: A fabricated bearer token, the shape the issue's lines carried.
+FAKE_JWT = "eyJfabricatedSecretValue01"
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        # The issue's four lines, found by the router and the NOC at 0.198.2.
+        (f'api_key=\\"{SHAPELESS_KEY}\\" n', '[redacted]\\" n'),
+        (f'{{"h":"api_key=\\"{SHAPELESS_KEY}\\""}}', '{"h":"[redacted]\\""}'),
+        (f'api_key=x,api_key="{FAKE_JWT}"', '[redacted]"'),
+        (f'api-key="Bearer api_key="{FAKE_JWT}', "[redacted]"),
+        # An escaped quote escaped again, as JSON inside a JSON string writes it.
+        (f'api_key=\\\\\\"{SHAPELESS_KEY}\\\\\\" n', '[redacted]\\\\\\" n'),
+        # A label ending where the value stops, before the backslashes that escape the stop.
+        (f'api_key=x,api_key=\\"{SHAPELESS_KEY}\\" n', '[redacted]\\" n'),
+        # Escaped deeper than the label is long, three JSON strings in: the backslashes are skipped.
+        (f"api_key=x,api_key={ESCAPED_3}{SHAPELESS_KEY}{ESCAPED_3} n", f"[redacted]{ESCAPED_3} n"),
+        # A label before one scheme word the value stops after.
+        ("api_key=x,api_key=Bearer abc n", "[redacted] n"),
+        ("?token=x?token=Bearer abc n", "[redacted] n"),
+        # A label just before the glued scheme word a value ended in, with its wider run after it.
+        ('api_key=\\"api_key=bearer\tX-API-KEY= n', "[redacted] n"),
+        # A label inside a value in escaped quotes has no escaped opener: it reads to the stop.
+        (f'api_key=\\"api-key={SHAPELESS_KEY}\\" n', '[redacted]" n'),
+        # The header's read-on is the same piece (the review of #929).
+        (f'x-api-key: "x-api-key": "{SHAPELESS_KEY}"', '[redacted]"'),
+    ],
+)
+def test_a_literal_value_is_read_whole_however_it_is_escaped_and_whatever_label_it_ends_in(
+    text, scrubbed
+):
+    assert scrub(text) == scrubbed
+    assert scrub(scrubbed) == scrubbed
+
+
+@pytest.mark.parametrize("depth", range(4))
+def test_an_api_key_in_a_json_string_leaves_the_line_parseable(depth):
+    line = json.dumps({"h": f'api_key="{SHAPELESS_KEY}" sent'})
+    for _ in range(depth):
+        line = json.dumps({"log": line})
+    scrubbed = scrub(line)
+    assert SHAPELESS_KEY not in scrubbed
+    for _ in range(depth + 1):
+        scrubbed = json.loads(scrubbed)
+        scrubbed = scrubbed.get("log", scrubbed.get("h"))
+    assert scrubbed == '[redacted]" sent'
+
+
+def test_no_chain_of_labels_or_escapes_lets_an_api_key_through():
+    rng = random.Random(934)
+    labels = ["api_key=", "api-key=", "APIKEY=", "X-API-KEY=", "?token=", "x-api-key: "]
+    pieces = [
+        *labels, "x", "abc", ",", '"', '\\"', '\\\\\\"', "Bearer ", "bearer\t", "KBearer", "&",
+    ]  # fmt: skip
+    for _ in range(20_000):
+        head = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 8)))
+        opener = rng.choice(["", '"', '\\"', '\\\\\\"', "Bearer ", '"Bearer '])
+        tail = rng.choice(["", " n", '\\"'])
+        text = f"{head}{rng.choice(labels[:4])}{opener}{SHAPELESS_KEY}{tail}"
+        assert SHAPELESS_KEY not in scrub(text), repr(text)
+
+
+def test_the_read_on_is_linear():
+    started = time.monotonic()
+    scrub('api_key=x,api_key="' * 20_000)
+    scrub('api_key=\\"' * 20_000)
+    scrub("api_key=" + "\\" * 200_000 + '"')
+    scrub('api_key=\\"' + "api_key=bearer\t" * 20_000)
+    scrub('api_key=\\"' + "a," * 100_000 + '\\"')
+    scrub('api_key=\\"' + "api_key=" * 20_000 + '\\"')
+    scrub("?token=x" + "?token=Bearer " * 20_000)
+    scrub("api_key=x" + ("api_key=bearer abcdefghij=" * 10_000))
+    assert time.monotonic() - started < 2.0
+
+
 # --- the cut treats a literal label as one token (issue #931) -----------------------------------
 
 #: Every literal rule's label, in each spelling its rule allows: a query parameter, an ``api_key=``
@@ -824,7 +909,7 @@ def test_no_literal_label_lets_a_second_scrub_grow_a_bound_or_take_its_marker(ma
     rng = random.Random(931)
     pieces = [
         *LABELS, "Bearer ", "bearer\t", "KBearer", "abc", "abcdefghij", " ", "  ", "\t", "&", '"',
-        "'", "\\", "b'", "…", "[redacted]", REDACTED_VALUE, "A_TOKEN=",
+        "'", "\\", "b'", "…", "[redacted]", REDACTED_VALUE, "A_TOKEN=", '\\"', '\\\\\\"', "x,",
     ]  # fmt: skip
     for _ in range(30_000):
         text = scrub("".join(rng.choice(pieces) for _ in range(rng.randint(1, 10))))

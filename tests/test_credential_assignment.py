@@ -30,7 +30,6 @@ import pytest
 from basecradle_harness._engine import Engine
 from basecradle_harness._observability import (
     _BREAK_CHARS,
-    _SCHEME_GLUE,
     CANARY_VALUE_FLOOR,
     CANARY_VALUE_STOPS,
     CREDENTIAL_NAME,
@@ -334,11 +333,14 @@ FAKE_JWT = "eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig"
         ('A_TOKEN=Bearer "a b" next=1', "A_TOKEN='<a redacted value>' next=1"),
         ('A_TOKEN=Bearer\t"a b" next=1', "A_TOKEN='<a redacted value>' next=1"),
         ("A_TOKEN=Bearer\t'a b' next=1", "A_TOKEN='<a redacted value>' next=1"),
-        # Glued only as HTTP spells it: a value merely ending in the letters is no header, nor is
-        # a scheme word inside a quoted piece.
-        ("A_TOKEN=abc-bearer next=1", "A_TOKEN='<a redacted value>' next=1"),
+        # Glued to anything before it, a scheme word is one (basecradle-router#510, issue #934):
+        # a word ending in the letters, an escaped blank before them included, takes the word after
+        # it. A scheme word inside a quoted piece is the quote's text.
+        ("A_TOKEN=abc-bearer next=1", "A_TOKEN='<a redacted value>'"),
+        (f'A_TOKEN=x"q"bearer {FAKE_JWT} next=1', "A_TOKEN='<a redacted value>' next=1"),
+        (f"A_TOKEN=(a)Bearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
         ("A_TOKEN='a Bearer' next=1", "A_TOKEN='<a redacted value>' next=1"),
-        ("A_TOKEN=a\\ Bearer next=1", "A_TOKEN='<a redacted value>' next=1"),
+        ("A_TOKEN=a\\ Bearer next=1", "A_TOKEN='<a redacted value>'"),
         # A scheme word with no word after it on its line is the value.
         ("A_TOKEN=Bearer", "A_TOKEN='<a redacted value>'"),
         ("A_TOKEN=Bearer ", "A_TOKEN='<a redacted value>' "),
@@ -431,13 +433,18 @@ def test_a_value_holding_many_names_is_read_in_linear_time():
     assert time.monotonic() - started < 5.0
 
 
-def test_the_scheme_glue_is_the_routers_byte_for_byte():
-    assert _SCHEME_GLUE == "A-Za-z0-9._~+/%:=-"
-
-
 def test_no_run_of_scheme_words_lets_a_token_through_called_alone(canary):
     rng = random.Random(926)
-    words = ["Bearer", "bearer", "BEARER", "KBearer", "x.Bearer", "a=Bearer"]
+    words = [
+        "Bearer",
+        "bearer",
+        "BEARER",
+        "KBearer",
+        "x.Bearer",
+        "a=Bearer",
+        "abc-bearer",
+        'x"q"bearer',
+    ]
     for _ in range(3000):
         blanks = [" ", "\t", "  "]
         run = "".join(rng.choice(words) + rng.choice(blanks) for _ in range(rng.randint(1, 5)))
@@ -484,7 +491,7 @@ def test_the_routers_reading_is_carried_byte_for_byte():
     source = Path(router_reading.__file__).read_text(encoding="utf-8")
     excerpt = source.split("import re\n\n", 1)[1]
     digest = hashlib.sha256(excerpt.encode()).hexdigest()
-    assert digest == "d4e2e522229009a3e01ffe46d1e039cfd4b855a381d65fd34045dffd48bab2ed"
+    assert digest == "770c95555c7faca832aac087035ccb183394cbaff83b5197351acd45e73835a7"
     assert digest in source
 
 
@@ -492,7 +499,7 @@ def test_the_routers_reading_is_carried_byte_for_byte():
 #: a scheme word, a lead word's openers, a marker, and the scheme words themselves.
 _ROUTED_PIECES = [
     "A_TOKEN=", "B_TOKEN=", "DB_PASSWORD=", "PASSWORD=", "KEY=", "x", "abc", "Bearer", "KBearer",
-    "x.Bearer", "bearer", " ", "  ", "\t", "\t\t", "'", '"', "`", "(", ")", "$(", "${", "}", "$'",
+    "x.Bearer", "bearer", "abc-bearer", "(a)Bearer", " ", "  ", "\t", "\t\t", "'", '"', "`", "(", ")", "$(", "${", "}", "$'",
     "\\", ",", "=", "\n", "\r", REDACTED_VALUE, FAKE_JWT, "hunter2hunter2", "next=1",
 ]  # fmt: skip
 

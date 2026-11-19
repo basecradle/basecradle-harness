@@ -7,6 +7,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.198.3] - 2026-11-18
+
+### Fixed: An `api_key=` value in escaped quotes, or after a label its value ends in, is redacted, and the router's reading is re-pinned at `a8e8f5f` (issue #934, basecradle-router#510)
+
+The router and the NOC found two shapes the `api_key=` rule shipped at 0.198.2. A value opening with an escaped quote matched only the opener's backslash: `api_key=\"K9…\" n` scrubbed to `[redacted]"K9…\" n`, and inside a JSON string the key shipped and the line no longer parsed. A value ending in the next value's own label sent the value after that label to no rule: `api_key=x,api_key="eyJ…"` and `api-key="Bearer api_key="eyJ…` each shipped `eyJ…`.
+
+- **An escaped opener, escaped any number of times, ends at its escaped close.** The key goes and the escaped close stays, so `{"h":"api_key=\"K9…\""}` scrubs to `{"h":"[redacted]\""}`, which still parses.
+- **Every literal rule reads on through a label its value ends in**: one piece (`_observability._literal_spans`) for the `api_key=`, query and `x-api-key` rules, the last of which read on since #929. It searches the three places a label can read further than the value it stands in, and stays linear.
+- **The router's reading is re-pinned at `a8e8f5f`.** A bearer scheme word is `bearer` glued to anything before it, the fleet's one definition, so `A_TOKEN=abc-bearer eyJ…` loses its token. `tests/router_reading.py` carries the new excerpt, and `_value_end` and `redact_credentials` are held equal to it at every start and limit of fuzzed text.
+- **The box takes neither `api_key=` shape**, and `docs/telemetry.md` states that as its limit. A differential of 1,000,000 texts against 0.198.2 finds no key the literal rules leave that 0.198.2 redacted; what reads less is stated there, the re-pin's share being the router's own bytes.
+
 ## [0.198.2] - 2026-11-18
 
 ### Fixed: A bounded text no longer grows past its cap when the formatter scrubs a literal label again (issue #931)
