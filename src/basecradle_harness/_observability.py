@@ -242,8 +242,12 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: (``{"h":"api_key=\"K9…\""}``) the line no longer parsed. A quote is escaped by an odd run of
 #: backslashes; after an even run it is a real quote, the backslashes escaping each other
 #: (``{"h":"api_key=\\","k":"v"}``), and is never taken as an opener. The value's run still stops at
-#: the ``"``, and as many backslashes before it as the opener carried escape that quote, so they are
-#: left with it (`_literal_end`): the key goes, and the escaped close stays to keep the JSON whole.
+#: the ``"``. **Whatever the value opened with, an odd run of backslashes before that quote is left
+#: whole** (`_literal_end`, issue #937): the run escapes the quote, how much of it is the value's own
+#: depends on a depth no reading of the run can tell, and every JSON string the line held parses only
+#: while it stays. So the key goes, and no string loses its close to the run. Until
+#: #937 a value with no escaped opener took the run, the escape of the line's own closing quote with
+#: it (``{"log": "{\"h\":\"api_key=x\\\\\"}"}``), and the line no longer parsed.
 #:
 #: **A literal rule reads on through a label its value ends in** (`_literal_spans`): a value stops
 #: where its run does (at a blank, a ``"`` or a ``&`` for ``api_key=``; a blank or a ``&`` for a
@@ -308,15 +312,14 @@ _API_KEY = re.compile(
     rf"(?:{_API_KEY_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_API_KEY_RUN}+))"
 )
 
-#: Each literal rule's label alone, and how far before a place in its span a label that would read
-#: on past the span can start (`_literal_spans`): the rule's longest label (``x-api-key=>``,
-#: ``?access_token=``, ``api_key=``) and the one scheme word its value may open with glued to it,
-#: the blank after that being where the span stops. Only these characters are searched, so each
-#: rule stays linear.
-_LITERAL_LABELS = {
-    _X_API_KEY: (re.compile(_X_API_LABEL), len("x-api-key") + len("=>") + len("bearer")),
-    _QUERY: (re.compile(_QUERY_LABEL), len("?access_token=") + len("bearer")),
-    _API_KEY: (re.compile(_API_KEY_LABEL), len("api_key=") + len("bearer")),
+#: How far before a place in a literal rule's span a label that would read on past the span can
+#: start (`_literal_spans`): the rule's longest label (``x-api-key=>``, ``?access_token=``,
+#: ``api_key=``) and the one scheme word its value may open with glued to it, the blank after that
+#: being where the span stops. Only these characters are searched, so each rule stays linear.
+_LITERAL_REACH = {
+    _X_API_KEY: len("x-api-key") + len("=>") + len("bearer"),
+    _QUERY: len("?access_token=") + len("bearer"),
+    _API_KEY: len("api_key=") + len("bearer"),
 }
 
 #: A bearer header: the scheme word in any case and its token, which is eight or more token
@@ -948,9 +951,10 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
     ``x,api_key=`` up to the quote; ``x-api-key: "x-api-key": "K9…"``, ``x-api-key: x-api-key:Bearer
     K9…``), and the value after it would then be matched by nothing, since each search starts past
     the last match (the review of #929, issue #934). So while a match whose label stands in the
-    value reaches further, it is read too, and the span ends where the last one does. Only three
+    value reaches further, it is read too, and the span ends where the last one does. Only two
     places hold such a label, because a label anywhere else is followed by the run the value
-    already read, which stops where the value stops:
+    already read, which stops where the value stops, and is left the same odd run of backslashes
+    before that stop (`_literal_end`, whatever either opened with: issue #937):
 
     - **Where the value stops**: the label ends there, before the backslashes that escape the stop
       (``api_key=x,api_key=\\"eyJ…``), or before the one scheme word its value may open with
@@ -958,16 +962,10 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
     - **Just before the value's glued scheme word**, when the value ended in one and its token
       (``api_key=\\"api_key=bearer<TAB>X-API-KEY=``): that label reads the scheme word as its own
       and then its run, which is wider than a token and goes on past it.
-    - **Anywhere in the value**, when the value opened with an escaped quote and so ends before
-      the backslashes of its escaped close (`_literal_end`): a label inside it has no escaped
-      opener of its own, and reads its run to the stop, backslashes and all
-      (``api_key=\\"api-key=eyJ…\\"``). The first such label is enough, since every one reads to
-      the same stop.
 
-    So only `_LITERAL_LABELS`' reach before the first two is searched, and the value once for the
-    third, and the rule stays linear. In order, since each span starts no earlier than the one
-    before it ends."""
-    (label, reach), labelled = _LITERAL_LABELS[rule], "label" in rule.groupindex
+    So only `_LITERAL_REACH` before each is searched, and the rule stays linear. In order, since each
+    span starts no earlier than the one before it ends."""
+    reach, labelled = _LITERAL_REACH[rule], "label" in rule.groupindex
     pos = 0
     while (match := rule.search(text, pos)) is not None:
         last, end = match, _literal_end(match)
@@ -978,8 +976,6 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
             places: list[Iterable[int]] = [range(max(floor, stop - reach), end)]
             if (glued := last.start("glued")) >= 0:
                 places.append(range(max(floor, glued - reach), glued))
-            if end < last.end() and (inside := label.search(text, floor, stop)) is not None:
-                places.append((inside.start(),))
             inner = next(
                 (
                     m
@@ -998,20 +994,26 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
 
 
 def _literal_end(match: re.Match[str]) -> int:
-    """Where a literal rule's `match` ends as a span: its end, but before the escape of the quote its
-    value stops at, when the value opened with an escaped quote (issue #934). The close is escaped
-    as deeply as the opener, so as many backslashes as the opener carried are left with it, and no
-    more: one before them is the value's own escaped backslash. The key goes and its escaped close
-    stays, so a JSON string the key was quoted in still parses (``{"h":"api_key=\\"K9…\\""}``
-    scrubs to ``{"h":"[redacted]\\""}``)."""
+    """Where a literal rule's `match` ends as a span: its end, but before the odd run of backslashes
+    that escapes the quote its value stops at, whatever the value opened with (issues #934, #937).
+
+    After an odd run the quote is escaped, and the run is left whole: how much of it is the quote's
+    escape and how much the value's own escaped backslashes depends on how deeply the quote is
+    nested, which no reading of the run can tell, and every JSON string the line held parses as it
+    did only while the run stays. So the key goes and no string it was nested in loses its close to
+    the run, the line's own or one inside it (``{"h":"api_key=\\"K9…\\""}`` scrubs to
+    ``{"h":"[redacted]\\""}``, and ``{"log": "{\\"h\\":\\"api_key=x\\\\\\\\\\"}"}`` to
+    ``{"log": "{\\"h\\":\\"[redacted]\\\\\\\\\\"}"}``). After an even run the quote is a real one, the
+    backslashes escaping each other, and they go with the value. A backslash is never a key's. (An
+    inner string's real close after an even run, none included, reaches the line as an odd run and
+    is read as an escaped opener: that inner string loses its close, the limit `_ESCAPE` states.)"""
     end, text = match.end(), match.string
-    depth = len(match.groupdict().get("opener") or "") - 1
-    if depth <= 0 or text[end : end + 1] != '"':
+    if text[end : end + 1] != '"':
         return end
-    floor = max(match.start("value"), end - depth)
-    while end > floor and text[end - 1] == "\\":
-        end -= 1
-    return end
+    run = end
+    while run > match.start("value") and text[run - 1] == "\\":
+        run -= 1
+    return run if (end - run) % 2 else end
 
 
 def _bearer_spans(text: str) -> Iterator[tuple[int, int]]:

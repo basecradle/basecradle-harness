@@ -796,8 +796,9 @@ FAKE_JWT = "eyJfabricatedSecretValue01"
         ("?token=x?token=Bearer abc n", "[redacted] n"),
         # A label just before the glued scheme word a value ended in, with its wider run after it.
         ('api_key=\\"api_key=bearer\tX-API-KEY= n', "[redacted] n"),
-        # A label inside a value in escaped quotes has no escaped opener: it reads to the stop.
-        (f'api_key=\\"api-key={SHAPELESS_KEY}\\" n', '[redacted]" n'),
+        # A label inside a value in escaped quotes reads to the same stop and leaves the same escape
+        # (issue #937: until then it took the escape, and the line no longer parsed).
+        (f'api_key=\\"api-key={SHAPELESS_KEY}\\" n', '[redacted]\\" n'),
         # The header's read-on is the same piece (the review of #929).
         (f'x-api-key: "x-api-key": "{SHAPELESS_KEY}"', '[redacted]"'),
     ],
@@ -831,11 +832,12 @@ def test_a_quote_after_an_even_run_of_backslashes_is_no_opener(value, separators
     assert json.loads(scrub(line)) == {"h": "[redacted]", "k": "v"}
 
 
-def test_the_close_is_escaped_as_deeply_as_the_opener_and_no_deeper():
-    # The value ends in its own escaped backslash: only the close's one backslash stays with it.
-    assert scrub('api_key=\\"K9fabricated\\\\\\" n') == '[redacted]\\" n'
+def test_the_odd_run_before_the_close_stays_whole():
+    # The value ends in its own escaped backslash, and the run before the close is left whole
+    # (issue #937): which of its backslashes are the close's depends on a depth the run cannot tell.
+    assert scrub('api_key=\\"K9fabricated\\\\\\" n') == '[redacted]\\\\\\" n'
     line = json.dumps({"h": 'api_key="K9fabricated\\" sent'})
-    assert json.loads(scrub(line)) == {"h": '[redacted]" sent'}
+    assert json.loads(scrub(line)) == {"h": '[redacted]\\" sent'}
 
 
 def test_no_chain_of_labels_or_escapes_lets_an_api_key_through():
@@ -926,7 +928,7 @@ def test_a_header_quote_after_an_even_run_of_backslashes_is_no_opener(value, sep
 def test_a_nested_even_run_leaves_the_outermost_line_parseable(value, depth):
     # The stated limit (the review of #935): an encoding pass turns an inner string's even run into
     # an odd one, so that inner string can lose its close. The line itself always parses. (An
-    # unquoted `api_key=` value nested so breaks the line itself, filed as #937.)
+    # unquoted `api_key=` value nested so keeps every string whole since #937.)
     line = json.dumps({"h": f"x-api-key: {value}", "k": "v"}, separators=(",", ":"))
     for _ in range(depth):
         line = json.dumps({"log": line})
@@ -967,6 +969,105 @@ def test_the_escaped_header_rule_is_linear():
     scrub(f"x-api-key{ESCAPED_2}: " * 20_000)
     scrub(f"x-api-key: x,x-api-key{ESCAPED_2}: " * 10_000)
     bounded(f"x-api-key{ESCAPED_2}: {ESCAPED_2}" * 10_000, 100_000)
+    assert time.monotonic() - started < 2.0
+
+
+# --- an `api_key=` value leaves the odd run before the quote it stops at (issue #937) -----------
+
+#: Values ending in backslashes after something else, and one holding a key.
+BACKSLASH_VALUES = ["x\\", "K9\\\\", f"{SHAPELESS_KEY}\\", f"{SHAPELESS_KEY}\\\\\\"]
+
+
+def _levels(line: str) -> list[dict]:
+    """Every JSON object `line` holds, outermost first, each nested in the one before as ``log``."""
+    objects = [json.loads(line)]
+    while isinstance(objects[-1].get("log"), str):
+        objects.append(json.loads(objects[-1]["log"]))
+    return objects
+
+
+def test_the_issue_line_keeps_its_closing_quote():
+    # Until 0.198.3 the run took the backslash escaping the line's own closing quote.
+    line = json.dumps({"log": json.dumps({"h": "api_key=x\\", "k": "v"}, separators=(",", ":"))})
+    assert scrub(line) == '{"log": "{\\"h\\":\\"[redacted]\\\\\\\\\\",\\"k\\":\\"v\\"}"}'
+
+
+@pytest.mark.parametrize("value", BACKSLASH_VALUES)
+@pytest.mark.parametrize("depth", [0, 1, 2, 3])
+@pytest.mark.parametrize("separators", [(",", ":"), (", ", ": ")])
+def test_a_value_ending_in_backslashes_keeps_every_string_it_is_nested_in(value, depth, separators):
+    # The run is left whole when it is odd, so every enclosing string parses, not only the line's,
+    # and the value's own backslashes stay with it. At depth 0 the run before the close is even, the
+    # value's own, and goes with the value.
+    line = json.dumps({"h": f"api_key={value}", "k": "v"}, separators=separators)
+    for _ in range(depth):
+        line = json.dumps({"log": line})
+    scrubbed = scrub(line)
+    assert SHAPELESS_KEY not in scrubbed
+    assert scrub(scrubbed) == scrubbed
+    *_, inner = _levels(scrubbed)
+    assert inner == {
+        "h": "[redacted]" + ("\\" * (len(value) - len(value.rstrip("\\"))) if depth else ""),
+        "k": "v",
+    }
+
+
+@pytest.mark.parametrize("value", ["\\", "\\\\"])
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_a_nested_value_of_backslashes_alone_leaves_the_line_parseable(value, depth):
+    # The stated limit (#934, #935): nested, a value that is backslashes alone reaches the line as an
+    # odd run before its real close, which is read as an escaped opener, so that inner string loses
+    # its close. The line itself parses.
+    line = json.dumps({"h": f"api_key={value}", "k": "v"}, separators=(",", ":"))
+    for _ in range(depth):
+        line = json.dumps({"log": line})
+    assert set(json.loads(scrub(line))) == {"log"}
+
+
+@pytest.mark.parametrize("value", ["\\", "K9\\"])
+@pytest.mark.parametrize("separators", [(",", ":"), (", ", ": ")])
+def test_an_escaped_opener_before_a_real_close_leaves_no_backslash_behind(value, separators):
+    # #934's escaped opener left as many backslashes as it carried, even before a real quote, so the
+    # one it left escaped the string's close and the line no longer parsed.
+    line = json.dumps({"h": f'api_key="{value}', "k": "v"}, separators=separators)
+    assert json.loads(scrub(line)) == {"h": "[redacted]", "k": "v"}
+
+
+def test_no_api_key_value_breaks_the_line_or_a_string_nested_in_it():
+    # No key ships and the line parses. Where nothing before the value can be read as an escaped
+    # opener (no quote, no backslash), every JSON string the line held parses too. Bearer scheme
+    # words and credential names are left out: their rules read a shell word, which may run past a
+    # quote, and the scrub errs toward redaction there (`_past_marker`). So is ``&``: ``&api_key=``
+    # is a query label, whose run takes quotes and backslashes alike. So is an empty value, which
+    # opens at the string's own close.
+    rng = random.Random(937)
+    clean = ["api_key=", "api-key=", "x", "abc", ",", " "]
+    pieces = [*clean, '"', "\\", "\\\\", '\\"']
+    for _ in range(20_000):
+        whole = rng.random() < 0.5
+        head = "".join(rng.choice(clean if whole else pieces) for _ in range(rng.randint(0, 5)))
+        opener = "" if whole else rng.choice(["", '"'])
+        key = rng.choice([SHAPELESS_KEY, "x"])
+        tail = rng.choice(["", " n", '"', "\\" * rng.randint(1, 4)])
+        line = json.dumps(
+            {"h": f"{head}api_key={opener}{key}{tail}", "k": "v"},
+            separators=rng.choice([(",", ":"), (", ", ": ")]),
+        )
+        for _ in range(rng.randint(0, 3)):
+            line = json.dumps({"log": line})
+        scrubbed = scrub(line)
+        assert SHAPELESS_KEY not in scrubbed, repr(line)
+        assert set(json.loads(scrubbed)) == set(json.loads(line)), repr(line)
+        if whole:
+            assert _levels(scrubbed)[-1]["k"] == "v", repr(line)
+
+
+def test_the_odd_run_is_read_in_linear_time():
+    started = time.monotonic()
+    scrub("api_key=x" + "\\" * 200_001 + '"')
+    scrub("api_key=x" + "\\" * 200_000 + '"')
+    scrub('api_key=x\\",' * 20_000)
+    scrub('api_key=x,api_key=\\\\\\"' * 20_000)
     assert time.monotonic() - started < 2.0
 
 
