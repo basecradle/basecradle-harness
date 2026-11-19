@@ -865,6 +865,99 @@ def test_the_read_on_is_linear():
     assert time.monotonic() - started < 2.0
 
 
+# --- an `x-api-key` header escaped more than once (issue #935) ----------------------------------
+
+#: A quote escaped as JSON inside two nested JSON strings writes it: three backslashes.
+ESCAPED_2 = "\\" * 3 + '"'
+
+
+@pytest.mark.parametrize("depth", range(4))
+def test_an_x_api_key_header_is_redacted_at_any_json_depth(depth):
+    # Until 0.198.3 the label and the opener took a quote escaped once, so depths 2 and 3 shipped.
+    line = json.dumps({"x-api-key": SHAPELESS_KEY})
+    for _ in range(depth):
+        line = json.dumps({"log": line})
+    scrubbed = scrub(line)
+    assert SHAPELESS_KEY not in scrubbed
+    assert scrub(scrubbed) == scrubbed
+    for _ in range(depth):
+        scrubbed = json.loads(scrubbed)["log"]  # every enclosing JSON string still parses
+    assert scrubbed == '{"[redacted]"}'
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        # The issue's header dump, its value in quotes escaped twice over.
+        (f"x-api-key: {ESCAPED_2}{SHAPELESS_KEY}{ESCAPED_2} n", f"[redacted]{ESCAPED_2} n"),
+        (f"x-api-key{ESCAPED_2}=>{ESCAPED_2}{SHAPELESS_KEY}{ESCAPED_2}", f"[redacted]{ESCAPED_2}"),
+        (f"x-api-key{ESCAPED_3}, {ESCAPED_3}{SHAPELESS_KEY}{ESCAPED_3}", f"[redacted]{ESCAPED_3}"),
+        (f"x-api-key: b{ESCAPED_2}{SHAPELESS_KEY}", "[redacted]"),
+        # A value ending where the next header, escaped deeper, begins is read on through it.
+        (
+            f"x-api-key: x,x-api-key{ESCAPED_2}: {ESCAPED_2}{SHAPELESS_KEY}{ESCAPED_2} n",
+            f"[redacted]{ESCAPED_2} n",
+        ),
+        # The differential's stated case: the header's span now starts before the credential name
+        # inside it, so it is written `[redacted]`, never the marker whose re-reading took `tail`,
+        # which follows a real quote and is no rule's value.
+        (
+            f"x-api-key\\\\\\':A_TOKEN=x-api-key\\' :{SHAPELESS_KEY}x-api-key\\\\\",tail",
+            '[redacted]\\\\",tail',
+        ),
+    ],
+)
+def test_an_x_api_key_header_escaped_deeper_than_once_is_redacted(text, scrubbed):
+    assert scrub(text) == scrubbed
+    assert scrub(scrubbed) == scrubbed
+
+
+@pytest.mark.parametrize("value", ["\\", "\\\\", "x\\", "K9\\\\"])
+@pytest.mark.parametrize("separators", [(",", ":"), (", ", ": ")])
+def test_a_header_quote_after_an_even_run_of_backslashes_is_no_opener(value, separators):
+    # As for `api_key=` (#934): the quote after an even run closes the JSON string, and taken as an
+    # escaped opener the value ran on past it, and the line no longer parsed.
+    line = json.dumps({"h": f"x-api-key: {value}", "k": "v"}, separators=separators)
+    assert json.loads(scrub(line))["k"] == "v"
+
+
+def test_no_header_escaped_at_any_depth_lets_its_key_through():
+    rng = random.Random(935)
+    escapes = ["", "\\", "\\" * 3, "\\" * 7]
+    pieces = [
+        "x-api-key: ", "x-api-key", "api_key=", "x", "abc", ",", '"', '\\"', ESCAPED_2, ESCAPED_3,
+        "Bearer ", "bearer\t", "KBearer", "&", ": ", "=>",
+    ]  # fmt: skip
+    for _ in range(20_000):
+        head = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 6)))
+        quote = rng.choice("\"'")
+        label = rng.choice(
+            [
+                "x-api-key: ",
+                "X_API_KEY=> ",
+                f"x-api-key{rng.choice(escapes)}{quote}{rng.choice([':', ': ', '=>', ',', ' ='])}",
+            ]
+        )
+        opener = rng.choice(["", " ", "b"]) + rng.choice(escapes) + rng.choice(["", quote])
+        if opener.endswith("\\"):
+            opener = ""  # a backslash with no quote after it opens nothing
+        scheme = rng.choice(["", "Bearer ", "bearer\t"])
+        tail = rng.choice(["", " n", rng.choice(escapes) + quote])
+        text = f"{head}{label}{opener}{scheme}{SHAPELESS_KEY}{tail}"
+        assert SHAPELESS_KEY not in scrub(text), repr(text)
+
+
+def test_the_escaped_header_rule_is_linear():
+    started = time.monotonic()
+    scrub("x-api-key" + "\\" * 200_000 + '":')
+    scrub("x-api-key" + "\\" * 200_001 + "x")
+    scrub("x-api-key: " + "\\" * 200_000 + '"')
+    scrub(f"x-api-key{ESCAPED_2}: " * 20_000)
+    scrub(f"x-api-key: x,x-api-key{ESCAPED_2}: " * 10_000)
+    bounded(f"x-api-key{ESCAPED_2}: {ESCAPED_2}" * 10_000, 100_000)
+    assert time.monotonic() - started < 2.0
+
+
 # --- the cut treats a literal label as one token (issue #931) -----------------------------------
 
 #: Every literal rule's label, in each spelling its rule allows: a query parameter, an ``api_key=``
@@ -882,7 +975,7 @@ LABELS = [
     *(
         name + separator
         for name in ("x-api-key", "X_API_KEY", "x-apikey")
-        for separator in (":", " :", "=>", " =>", '":', "'=", '\\":', "',")
+        for separator in (":", " :", "=>", " =>", '":', "'=", '\\":', "',", '\\\\\\":')
     ),
     "https://h.example.com/heartbeat/",
     "h/heartbeat/",
