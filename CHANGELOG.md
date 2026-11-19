@@ -7,6 +7,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.198.4] - 2026-11-18
+
+### Fixed: No `api_key=` or `x-api-key` value opens at the close of the JSON string it sits in (issue #939)
+
+Where an `api_key=` label or an `x-api-key` header ended a JSON string, the string's own close was read as the value's opener, and the value ran on into the line's structure, so the line no longer parsed: `{"h":"api_key=","k":"v"}` scrubbed to `{"h":"[redacted]"k":"v"}`. No key shipped.
+
+- **An opener at a string's close opens nothing** (`_observability._closes`). JSON follows a close with structure (`,`, `:`, `}` or `]`), so a value opened by a `"`, escaped or not, that is structure and nothing else is no value. `{"h":"api_key=","k":"v"}` and `{"h": "x-api-key: ", "k": "v"}` scrub to themselves, and an inner string's real close, read as an escaped opener after an even run of backslashes, keeps its close where the next member is a string. Before a number, a literal, an object or an array the opener still opens (`["api_key=",1]`), as on 0.198.3, and `docs/telemetry.md` states it.
+- **The query rule is unchanged, and its break is stated**: `{"h":"url?api_key=K9…","k":"v"}` still scrubs to `{"h":"url[redacted]`. Stopping its value at a `"` kept 9,793 keys that 0.198.3 took in an adversarial differential of 400,000 texts, and stopping it only at a `"` that structure follows still kept 1,780, a value in doubled CSV quotes among them. No reader in the fleet parses JSON inside a harness message.
+- **Three more readings that take a close are stated**: a credential-named assignment's value, read as the router reads it; the marker read again (`_past_marker`); and the `x-api-key` label's own quote and an empty bearer header (issue #941), whose drop kept 222 keys that 0.198.3 took. The box's `api[-_]?key=` rule opens at a close too, and that is stated as its limit.
+- **What dropping an opener costs** is stated with its line: a key 0.198.3 reached only by reading its marker on through the dropped opener (`A_TOKEN=x-api-key: "]\K9…`), 4 in the 400,000 texts, and every kept key an independent review's fuzzer found was in that shape. The issue's own differential of 1,000,000 texts, regenerated, keeps no key 0.198.3 took and breaks no line it parsed, and a wider one of 1,000,000 keeps none and brings the JSON lines that do not parse from 305,431 to 290,395.
+
 ## [0.198.3] - 2026-11-18
 
 ### Fixed: An `api_key=` value in escaped quotes, or after a label its value ends in, is redacted, and the router's reading is re-pinned at `a8e8f5f` (issue #934, basecradle-router#510)
