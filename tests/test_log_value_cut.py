@@ -1075,35 +1075,30 @@ def test_the_odd_run_is_read_in_linear_time():
 
 # --- no value opens at the close of the JSON string it sits in (issue #939) ---------------------
 
-#: A literal label of each rule whose value may open with a quote, each ending a URL or a word.
-CLOSE_LABELS = ["?api_key=", "&access_token=", "?token=", "api_key=", "Api-Key=", "x-api-key: "]
+#: A literal label of each rule whose value may open with a ``"``, each ending a word.
+CLOSE_LABELS = ["api_key=", "Api-Key=", "x-api-key: "]
 
 
 @pytest.mark.parametrize(
     ("text", "scrubbed"),
     [
-        # The issue's lines: a key in a query took the string's close, and an empty value opened at
-        # it.
-        ('{"h":"url?api_key=K9fabricated","k":"v"}', '{"h":"url[redacted]","k":"v"}'),
+        # The issue's empty value, whose opener was the string's own close.
         ('{"h":"api_key=","k":"v"}', '{"h":"api_key=","k":"v"}'),
         ('{"h": "see api_key=", "k": "v"}', '{"h": "see api_key=", "k": "v"}'),
-        ('{"h":"see ?token=","k":"v"}', '{"h":"see ?token=","k":"v"}'),
         # The review's: a read-on reaching an inner label whose opener is the string's close, and a
         # header whose opener is.
         ('{"msg": "x,Api-Key=apikey=", "k": "v"}', '{"msg": "x,[redacted]", "k": "v"}'),
         ('{"h": "x-api-key\\\\\\":"}', '{"h": "x-api-key\\\\\\":"}'),
         ('{"h": "x-api-key: ", "k": "v"}', '{"h": "x-api-key: ", "k": "v"}'),
-        ("{'h': 'x-api-key: ', 'k': 'v'}", "{'h': 'x-api-key: ', 'k': 'v'}"),
-        # A URL in quotes keeps its closing quote, and a query value in quotes still goes.
-        ('GET "https://h.example.com/p?api_key=K9fabricated" 200', 'GET "https://h.example.com/p[redacted]" 200'),
-        (f'?token="{SHAPELESS_KEY}" n', '[redacted]" n'),
-        (f'?token=\\"{SHAPELESS_KEY}\\" n', '[redacted]\\" n'),
-        (f"?token={ESCAPED_3}{SHAPELESS_KEY}{ESCAPED_3} n", f"[redacted]{ESCAPED_3} n"),
-        (f'?token=Bearer "{SHAPELESS_KEY}"', "[redacted]"),
-        # A value that is structure and more is a value.
+        # A value that is structure and more is a value. A `'` closes no JSON string, so it opens:
+        # dropped, the header's span no longer reaches the marker's re-reading, and the key shipped.
         (f'api_key=",{SHAPELESS_KEY}" n', '[redacted]" n'),
+        (
+            f'OPENAI_API_KEY=Bearer ="x-api-key": \',\\\\{SHAPELESS_KEY} n',
+            f"OPENAI_API_KEY={REDACTED_VALUE} n",
+        ),
     ],
-)  # fmt: skip
+)
 def test_no_value_opens_at_the_close_of_the_string_it_sits_in(text, scrubbed):
     assert scrub(text) == scrubbed
     assert scrub(scrubbed) == scrubbed
@@ -1114,7 +1109,7 @@ def test_no_value_opens_at_the_close_of_the_string_it_sits_in(text, scrubbed):
 @pytest.mark.parametrize("depth", range(4))
 @pytest.mark.parametrize("separators", [(",", ":"), (", ", ": ")])
 def test_a_literal_value_keeps_every_string_it_is_nested_in(label, value, depth, separators):
-    line = json.dumps({"h": f"url{label}{value}", "k": "v"}, separators=separators)
+    line = json.dumps({"h": f"url {label}{value}", "k": "v"}, separators=separators)
     for _ in range(depth):
         line = json.dumps({"log": line}, separators=separators)
     scrubbed = scrub(line)
@@ -1123,52 +1118,53 @@ def test_a_literal_value_keeps_every_string_it_is_nested_in(label, value, depth,
     levels = _levels(scrubbed)
     assert len(levels) == depth + 1  # the line and every string nested in it parse
     assert levels[-1] == {
-        "h": "url[redacted]" + ('"' if value.startswith('"') else "") if value else f"url{label}",
+        "h": "url [redacted]" + ('"' if value.startswith('"') else "") if value else f"url {label}",
         "k": "v",
     }
 
 
 def test_a_credential_named_assignment_reads_a_shell_word_across_the_close():
-    # The stated limit (#939): the value is read as the router reads it, a shell word, which spans
+    # A stated limit (#939): the value is read as the router reads it, a shell word, which spans
     # quotes. Inside a JSON string the two readings of that quote cannot both be right, and the one
     # that takes more is the safe one, so the line loses its close and no key ships.
     line = json.dumps({"h": 'A_TOKEN=x,api_key="K9fabricated"', "k": "v"}, separators=(",", ":"))
     assert scrub(line) == redact_credentials(line) == '{"h":"A_TOKEN=' + REDACTED_VALUE
 
 
-#: The query rule as 0.198.3 spelled it: a run that takes a ``"``, and no opener (the empty group
-#: is only there for `_observability._closes` to read).
-_QUERY_AT_0_198_3 = re.compile(
-    f"(?P<label>{_observability._QUERY_LABEL})(?P<opener>)(?P<value>{_observability._SCHEME_WORDS}"
-    r"(?:[^&\s]*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{8,}|[^&\s]+))"
-)
+def test_a_key_in_a_query_still_takes_the_close():
+    # A stated limit (#939): the query value's run takes a `"`. Stopping it at one gave up keys the
+    # run took (a value in doubled CSV quotes, `?token=x"K9…`, the next JSON member), and no reader
+    # in the fleet parses JSON inside a message, so the field is the price and the key is not.
+    assert scrub('{"h":"url?api_key=K9fabricated","k":"v"}') == '{"h":"url[redacted]'
+    csv = f'GET,"https://h.example.com/v1?token=""{SHAPELESS_KEY}""",200'
+    assert scrub(csv) == 'GET,"https://h.example.com/v1[redacted]'
 
 
-def test_a_query_value_stopping_at_a_quote_keeps_no_key_and_breaks_no_line(monkeypatch):
-    # A differential against the query rule's 0.198.3 spelling. Credential names and bearer scheme
-    # words are left out: their rules read a shell word or an escaped token, which may run past a
-    # quote (the limit stated above, `_past_marker`, and #939's review), and what the old query
-    # value swallowed of them it hid.
+def test_dropping_an_opener_at_a_close_keeps_no_key_and_breaks_no_line(monkeypatch):
+    # A differential against the reading before #939, where every opener opened. Credential names
+    # and bearer scheme words are left out: their rules read a shell word or an escaped token, which
+    # may run past a quote (the limits stated above), and a key 0.198.3 reached only by reading its
+    # marker on past such an opener is stated in `docs/telemetry.md`.
     rng = random.Random(939)
     pieces = [
-        *CLOSE_LABELS, "url", "x", "abc", ",", " ", "&", ":", "}", '"', "'", '\\"', ESCAPED_2, "\\",
-        "\\\\",
+        *CLOSE_LABELS, "url", "x", "abc", ",", " ", "&", ":", "}", "]", '"', "'", '\\"', ESCAPED_2,
+        "\\", "\\\\", '""',
     ]  # fmt: skip
     cases = []
     for _ in range(10_000):
-        inner = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 6)))
-        inner += rng.choice(CLOSE_LABELS) + rng.choice(["", '"', '\\"', ESCAPED_2])
-        inner += rng.choice([SHAPELESS_KEY, ""]) + rng.choice(["", '"', " n", "&x"])
-        line = json.dumps({"h": inner, "k": "v"}, separators=rng.choice([(",", ":"), (", ", ": ")]))
+        parts = [rng.choice(pieces) for _ in range(rng.randint(1, 7))]
+        parts.insert(rng.randint(0, len(parts)), rng.choice(CLOSE_LABELS))
+        parts.insert(rng.randint(1, len(parts)), SHAPELESS_KEY)
+        line = json.dumps(
+            {"h": "".join(parts), "k": "v"}, separators=rng.choice([(",", ":"), (", ", ": ")])
+        )
         for _ in range(rng.randint(0, 3)):
             line = json.dumps({"log": line})
         cases.append((line, scrub(line)))
-    reach = _observability._LITERAL_REACH[_observability._QUERY]
-    monkeypatch.setitem(_observability._LITERAL_REACH, _QUERY_AT_0_198_3, reach)
-    monkeypatch.setattr(_observability, "_QUERY", _QUERY_AT_0_198_3)
+    monkeypatch.setattr(_observability, "_closes", lambda match: False)
     for line, new in cases:
         old = _observability.scrub(line)
-        assert SHAPELESS_KEY not in new, repr(line)
+        assert SHAPELESS_KEY in old or SHAPELESS_KEY not in new, repr(line)
         assert _depth_parsed(new) >= _depth_parsed(old), repr(line)
 
 
@@ -1188,11 +1184,10 @@ def _depth_parsed(line: str) -> int:
 
 def test_an_opener_at_a_close_is_skipped_in_linear_time():
     started = time.monotonic()
-    scrub('?token=","' * 20_000)
     scrub('api_key=","' * 20_000)
     scrub('x-api-key: ","' * 20_000)
     scrub('api_key=\\",\\"' * 20_000)
-    scrub("?token=" + '"' * 200_000)
+    scrub("api_key=" + '",' * 100_000)
     assert time.monotonic() - started < 2.0
 
 

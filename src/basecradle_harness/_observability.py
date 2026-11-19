@@ -249,22 +249,18 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: #937 a value with no escaped opener took the run, the escape of the line's own closing quote with
 #: it (``{"log": "{\"h\":\"api_key=x\\\\\"}"}``), and the line no longer parsed.
 #:
-#: **A key in a query stops at a ``"``, and may open with one, as an ``api_key=`` value does** (issue
-#: #939). A URL holds no raw ``"``, so a quote ends the query's value; the run once took it, and a
-#: URL logged inside a JSON string (``{"h":"url?api_key=K9…","k":"v"}``) lost the string's close and
-#: the rest of the line. The value opens with the same `_LITERAL_OPENER`, so ``?token="K9…"`` and
-#: ``?token=\"K9…\"`` still lose their key. What follows a raw quote glued to the value
-#: (``?token=x"K9…``) is no part of the URL and is now kept, as it is after any other quote.
-#:
-#: **An opener at the close of the string it sits in opens nothing** (`_closes`, issue #939). Every
-#: literal rule's value may open with a quote, so where the label ends a JSON string, the string's
-#: own close was read as the opener and the value ran on into the line's structure:
+#: **An opener at the close of the string it sits in opens nothing** (`_closes`, issue #939). The
+#: ``api_key=`` and header values may open with a ``"``, so where the label ends a JSON string, the
+#: string's own close was read as the opener and the value ran on into the line's structure:
 #: ``{"h":"api_key=","k":"v"}`` scrubbed to ``{"h":"[redacted]"k":"v"}``. A close is followed by
 #: structure, and a value that is structure and nothing else is no key, so such a match is no value.
+#: **A key in a query still takes the close** (``{"h":"url?api_key=K9…","k":"v"}`` scrubs to
+#: ``{"h":"url[redacted]``): its run takes a ``"``, and stopping it at one gave up keys the run
+#: took, a value in doubled CSV quotes among them, for a parse no reader in the fleet performs.
 #:
 #: **A literal rule reads on through a label its value ends in** (`_literal_spans`): a value stops
-#: where its run does (at a blank, a ``"`` or a ``&`` for ``api_key=`` and a query; a blank, a
-#: quote, a backslash or a ``&`` for a header), and the label of the next value can stand just before that stop,
+#: where its run does (at a blank, a ``"`` or a ``&`` for ``api_key=``; a blank or a ``&`` for a
+#: query; a blank, a quote, a backslash or a ``&`` for a header), and the label of the next value can stand just before that stop,
 #: so the value ends in the next label (``api_key=x,api_key="eyJ…"``, whose value is ``x,api_key=``
 #: up to the quote; ``x-api-key: "x-api-key": "K9…"``, the review of #929). Each search starts past
 #: the last match, so the value after that label once went to no rule. The span now ends where the
@@ -312,17 +308,17 @@ _X_API_KEY = re.compile(
     f"{_X_API_LABEL}(?P<opener>{_X_API_OPENER})(?P<value>{_SCHEME_WORDS}"
     rf"(?:{_X_API_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_X_API_RUN}+))"
 )
-_LITERAL_OPENER = f'(?:{_ESCAPE}")?'
 _QUERY_LABEL = r"[?&](?i:api[-_]?key|access[-_]?token|token|key)="
-_QUERY_RUN = r"[^&\s\"]"
+_QUERY_RUN = r"[^&\s]"
 _QUERY = re.compile(
-    f"(?P<label>{_QUERY_LABEL})(?P<opener>{_LITERAL_OPENER})(?P<value>{_SCHEME_WORDS}"
+    f"(?P<label>{_QUERY_LABEL})(?P<value>{_SCHEME_WORDS}"
     rf"(?:{_QUERY_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_QUERY_RUN}+))"
 )
 _API_KEY_LABEL = r"(?i:api[-_]?key=)"
+_API_KEY_OPENER = f'(?:{_ESCAPE}")?'
 _API_KEY_RUN = r"[^&\s\"]"
 _API_KEY = re.compile(
-    f"(?P<label>{_API_KEY_LABEL})(?P<opener>{_LITERAL_OPENER})(?P<value>{_SCHEME_WORDS}"
+    f"(?P<label>{_API_KEY_LABEL})(?P<opener>{_API_KEY_OPENER})(?P<value>{_SCHEME_WORDS}"
     rf"(?:{_API_KEY_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_API_KEY_RUN}+))"
 )
 
@@ -803,8 +799,8 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
 #: since the box's rule reads any run holding one, and the marker, as the URL's secret.
 _OPEN_LABELS = (
     re.compile(f"(?P<label>{_X_API_LABEL}){_X_API_OPENER}{_SCHEME_WORDS}{_X_API_RUN}*"),
-    re.compile(f"(?P<label>{_QUERY_LABEL}){_LITERAL_OPENER}{_SCHEME_WORDS}{_QUERY_RUN}*"),
-    re.compile(f"(?P<label>{_API_KEY_LABEL}){_LITERAL_OPENER}{_SCHEME_WORDS}{_API_KEY_RUN}*"),
+    re.compile(f"(?P<label>{_QUERY_LABEL}){_SCHEME_WORDS}{_QUERY_RUN}*"),
+    re.compile(f"(?P<label>{_API_KEY_LABEL}){_API_KEY_OPENER}{_SCHEME_WORDS}{_API_KEY_RUN}*"),
     re.compile(r"(?<!\S)(?P<label>\S*?" + _HEARTBEAT + r")\S*"),
 )
 
@@ -1021,15 +1017,17 @@ def _literal_search(rule: re.Pattern[str], text: str, pos: int) -> re.Match[str]
 def _closes(match: re.Match[str]) -> bool:
     """Whether a literal rule's `match` opened its value at the close of the string it sits in.
 
-    So it did when the opener is a quote, escaped or not, and the value it opens is JSON's structure
+    So it did when the opener is a ``"``, escaped or not, and the value it opens is JSON's structure
     and nothing else (`_STRUCTURE`) before any backslashes that escape the quote it stops at:
     ``{"h":"api_key=","k":"v"}``, whose ``"`` after the label is the string's own close and whose
     value is the ``,`` after it (issue #939). A close is followed by structure, and no key is a run
-    of it, so the quote opens nothing, and the match is no value. A value of backslashes alone
-    follows a real opener (``api_key=\\"\\\\"``, a quote and an escaped backslash), since structure,
-    never a backslash, follows a close."""
-    opener = match.group("opener")
-    if not opener or opener[-1] not in "\"'":
+    of it, so the quote opens nothing, and the match is no value. A ``'`` closes no JSON string, so
+    an opener that is one still opens. A value of backslashes alone follows a real opener
+    (``api_key=\\"\\\\"``, a quote and an escaped backslash), since structure, never a backslash,
+    follows a close. The query rule's value has no opener (issue #939 left it as it was), so this
+    never judges it."""
+    opener = match.groupdict().get("opener")
+    if not opener or opener[-1] != '"':
         return False
     value = match.group("value").rstrip("\\")
     return bool(value) and set(value) <= _STRUCTURE
