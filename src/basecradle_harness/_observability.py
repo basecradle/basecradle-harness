@@ -236,7 +236,22 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: (the review of #857): ``API_KEY="…"`` once matched nothing, because the value could not start at
 #: the quote, and ``api_key=KBearer eyJ…`` or ``?token=KBearer eyJ…`` ended the value at the scheme
 #: word and left its token to no rule. Each value is two alternatives, the first a value ending in a
-#: glued ``bearer`` and its token, written without lookaround for the box's VRL.
+#: glued ``bearer`` and its token, written without lookaround for the box's VRL. **An ``api_key=``
+#: value may open with an escaped quote, at any depth, and ends at its escaped close** (issue #934):
+#: ``api_key=\"K9…\"`` once matched ``api_key=\`` alone and shipped the key, and in a JSON string
+#: (``{"h":"api_key=\"K9…\""}``) the line no longer parsed. A quote is escaped by an odd run of
+#: backslashes; after an even run it is a real quote, the backslashes escaping each other
+#: (``{"h":"api_key=\\","k":"v"}``), and is never taken as an opener. The value's run still stops at
+#: the ``"``, and as many backslashes before it as the opener carried escape that quote, so they are
+#: left with it (`_literal_end`): the key goes, and the escaped close stays to keep the JSON whole.
+#:
+#: **A literal rule reads on through a label its value ends in** (`_literal_spans`): a value stops
+#: where its run does (at a blank, a ``"`` or a ``&`` for ``api_key=``; a blank or a ``&`` for a
+#: query; a blank, a quote, a backslash or a ``&`` for a header), and the label of the next value can stand just before that stop,
+#: so the value ends in the next label (``api_key=x,api_key="eyJ…"``, whose value is ``x,api_key=``
+#: up to the quote; ``x-api-key: "x-api-key": "K9…"``, the review of #929). Each search starts past
+#: the last match, so the value after that label once went to no rule. The span now ends where the
+#: last such label's own reading does, as the union of every label's own reading would.
 #:
 #: **An ``x-api-key`` header value is redacted by its name, never its shape** (issue #861), because
 #: the vendor that sends a key there states no shape for it: Wiro's documentation gives its key no
@@ -264,25 +279,32 @@ _X_API_RUN = r"[^\s\"'&\\]"
 _SCHEME_WORDS = r"(?:(?i:bearer)\s+)*"
 _X_API_KEY = re.compile(
     _X_API_LABEL + _X_API_OPENER + f"(?P<value>{_SCHEME_WORDS}"
-    rf"(?:{_X_API_RUN}*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{{8,}}|{_X_API_RUN}+))"
+    rf"(?:{_X_API_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_X_API_RUN}+))"
 )
-#: How far before a header's span end a label that would read on past it can start: the longest
-#: label (``x-api-key``), its separator (``=>``), and the one scheme word its value may open with
-#: glued to them, the blank after it being where the span stops (`_x_api_key_spans`).
-_X_API_LABEL_REACH = len("x-api-key") + len("=>") + len("bearer")
 _QUERY_LABEL = r"[?&](?i:api[-_]?key|access[-_]?token|token|key)="
 _QUERY_RUN = r"[^&\s]"
 _QUERY = re.compile(
-    f"(?P<label>{_QUERY_LABEL}){_SCHEME_WORDS}"
-    rf"(?:{_QUERY_RUN}*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{{8,}}|{_QUERY_RUN}+)"
+    f"(?P<label>{_QUERY_LABEL})(?P<value>{_SCHEME_WORDS}"
+    rf"(?:{_QUERY_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_QUERY_RUN}+))"
 )
 _API_KEY_LABEL = r"(?i:api[-_]?key=)"
-_API_KEY_OPENER = r"\"?"
+_API_KEY_OPENER = r'(?:(?:\\(?:\\\\)*)?")?'
 _API_KEY_RUN = r"[^&\s\"]"
 _API_KEY = re.compile(
-    f"(?P<label>{_API_KEY_LABEL}){_API_KEY_OPENER}{_SCHEME_WORDS}"
-    rf"(?:{_API_KEY_RUN}*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{{8,}}|{_API_KEY_RUN}+)"
+    f"(?P<label>{_API_KEY_LABEL})(?P<opener>{_API_KEY_OPENER})(?P<value>{_SCHEME_WORDS}"
+    rf"(?:{_API_KEY_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_API_KEY_RUN}+))"
 )
+
+#: Each literal rule's label alone, and how far before a place in its span a label that would read
+#: on past the span can start (`_literal_spans`): the rule's longest label (``x-api-key=>``,
+#: ``?access_token=``, ``api_key=``) and the one scheme word its value may open with glued to it,
+#: the blank after that being where the span stops. Only these characters are searched, so each
+#: rule stays linear.
+_LITERAL_LABELS = {
+    _X_API_KEY: (re.compile(_X_API_LABEL), len("x-api-key") + len("=>") + len("bearer")),
+    _QUERY: (re.compile(_QUERY_LABEL), len("?access_token=") + len("bearer")),
+    _API_KEY: (re.compile(_API_KEY_LABEL), len("api_key=") + len("bearer")),
+}
 
 #: A bearer header: the scheme word in any case and its token, which is eight or more token
 #: characters, so a diagnosis like "Bearer token missing" keeps its words, or a token that opens
@@ -397,12 +419,12 @@ _NAME_END_REACH = max(len(word) for word in CREDENTIAL_WORDS) + len(CREDENTIAL_T
 
 # --- the router's reading (basecradle-router `logfmt`, issue #929) --------------------------------
 #
-# A credential's value is read here exactly as the router reads it (basecradle-router#506, merged as
-# `153fb58`: `logfmt._shell_word_end` and `logfmt._value_end`), so both writers on a box leave the
-# same bytes where a value stood; `tests/router_reading.py` carries the router's functions verbatim
-# and `tests/test_credential_assignment.py` holds the two readings equal on fuzzed text. The one
-# addition is `limit`, which only `bounded` passes: the reading goes no further than it, and a value
-# that reaches it is reported as ending there.
+# A credential's value is read here exactly as the router reads it (basecradle-router#506 and #510,
+# merged as `a8e8f5f`: `logfmt._shell_word_end` and `logfmt._value_end`; issue #934), so both
+# writers on a box leave the same bytes where a value stood; `tests/router_reading.py` carries the
+# router's functions verbatim and `tests/test_credential_assignment.py` holds the two readings
+# equal on fuzzed text. The one addition is `limit`, which only `bounded` passes: the reading goes
+# no further than it, and a value that reaches it is reported as ending there.
 
 
 def _shell_word_end(text: str, start: int, limit: int | None = None) -> tuple[int, bool]:
@@ -491,18 +513,20 @@ def _shell_word_end(text: str, start: int, limit: int | None = None) -> tuple[in
     return min(i, n), False
 
 
-#: The characters a bearer header's scheme word may be glued to (``KBearer``, ``api_key=Bearer``):
-#: a token's, as a header value spells one. The router's `logfmt.SCHEME_GLUE`, byte for byte
-#: (basecradle-router#497), so both writers on a box read the same scheme word.
-_SCHEME_GLUE = "A-Za-z0-9._~+/%:=-"
-
-#: A run of the characters a scheme word may be glued to: one word, as `_bearer_end` reads it.
-_GLUE_RUN = re.compile(f"[{_SCHEME_GLUE}]*")
+#: The word `_bearer_end` reads after a token run, to see whether it ends in a scheme word: a
+#: token's characters and the ``%``, ``:`` and ``=`` a header value glues them with. A word it
+#: stops short of is no loss: the bearer rule's search reads on past the token it took.
+_GLUE_RUN = re.compile("[A-Za-z0-9._~+/%:=-]*")
 
 #: A bearer header's scheme word, which is never a credential's whole value: the token after it is
-#: (issue #926, basecradle-router#497). Alone it is the word in any case; glued to a value only as
-#: HTTP spells it, so a value merely ending in the letters (``abc-bearer``) is no header.
-_SCHEME_WORD = re.compile(f"(?i:bearer)|[{_SCHEME_GLUE}]*Bearer")
+#: (issue #926, basecradle-router#497). The fleet's one definition (docs/telemetry.md → Credential
+#: Scrubbing): ``bearer`` in any case, glued to anything before it, so a word is a scheme word when
+#: it ends in these six letters, whatever comes before them (``Bearer``, ``abc-bearer``,
+#: ``x"q"bearer``, ``(a)Bearer``). The router's `logfmt._SCHEME_WORD`, byte for byte in what it
+#: matches (basecradle-router#510, merged as `a8e8f5f`; issue #934).
+_SCHEME_LETTERS = "bearer"
+_SCHEME_WORD = re.compile(f"(?i:{_SCHEME_LETTERS})")
+_SCHEME_WORD_LENGTH = len(_SCHEME_LETTERS)
 
 #: What stands between a scheme word and its token: blanks, never a newline, as the box reads them.
 _SCHEME_BLANKS = re.compile("[ \t]+")
@@ -562,13 +586,15 @@ def _reached(text: str, at: int) -> bool:
     return at < len(text) and text[at] not in _UNREACHED
 
 
-def _token_after_a_glued_scheme_word(text: str, floor: int, end: int) -> int | None:
-    """Where the token starts, when a value read from `floor` ends at `end` just after a bearer
-    scheme word a tab glues to it (``(a)<TAB>Bearer tok``: the canary's run takes the scheme word),
-    with a word on its record after its blanks; else ``None``. A value never ends between a scheme
-    word and its token, whatever stands before the tab (basecradle-router#502's review)."""
-    tab = text.rfind("\t", floor, end)
-    if tab < 0 or not _SCHEME_WORD.fullmatch(text, tab + 1, end):
+def _token_after_a_scheme_word(text: str, floor: int, end: int) -> int | None:
+    """Where the token starts, when what was read from `floor` ends at `end` in a bearer scheme word
+    (`_SCHEME_WORD`), with a word on its record after its blanks; else ``None``. A value never ends
+    between a scheme word and its token, whatever the scheme word is glued to: a word the shell
+    reads (``x"q"bearer``), or one a tab glues to the value (``(a)<TAB>Bearer``, the canary's run
+    taking the scheme word, basecradle-router#502's review)."""
+    if end - floor < _SCHEME_WORD_LENGTH or not _SCHEME_WORD.fullmatch(
+        text, end - _SCHEME_WORD_LENGTH, end
+    ):
         return None
     if (blanks := _SCHEME_BLANKS.match(text, end)) is None or not _reached(text, blanks.end()):
         return None
@@ -590,11 +616,11 @@ def _value_end(text: str, start: int, limit: int | None = None) -> int:
     1. **Across a tab** to the next word, while the word is a lead word (`_LEAD_WORD`): the canary's
        run crosses a tab, so a word after one is still the value's (basecradle-router#502). The next
        word must start where a run could go on (`_reached`).
-    2. **Across blanks** to the next word, while the word is a bearer scheme word (`_SCHEME_WORD`),
-       so a doubled scheme word goes with the token after both (issue #926), and wherever the value
-       would end just after a scheme word a tab glues to it, whatever stands before the tab
-       (`_token_after_a_glued_scheme_word`). A scheme word with nothing after it on its record is
-       the value alone.
+    2. **Across blanks** to the next word, while the word ends in a bearer scheme word
+       (`_SCHEME_WORD`, glued to anything before it, basecradle-router#510), so a doubled scheme
+       word goes with the token after both (issue #926), and wherever the value would end just after
+       one, a scheme word a tab glues to it included (`_token_after_a_scheme_word`). A scheme word
+       with nothing after it on its record is the value alone.
     3. **Into a value of its own** at a credential name's ``=`` outside every quote in the word
        (``x,DB_PASSWORD=<TAB>…``): the redactor's next search starts past that ``=``, so the name's
        value is read here, by this same reading, and goes with this one (the review of #926).
@@ -622,21 +648,17 @@ def _value_end(text: str, start: int, limit: int | None = None) -> int:
             end = max(end, word_end)
             if at_a_name or end >= stop:
                 break  # a credential name's `=`: its value is read as one from here
-            if _SCHEME_WORD.fullmatch(text, at, word_end) and (
-                blanks := _SCHEME_BLANKS.match(text, word_end)
-            ):
-                token = blanks.end()
-                if _reached(text, token):  # a word after the blanks, on the same record
-                    at = token
-                    if at >= run_end:
-                        run_end = _run_end(text, at, stop)
-                        end = max(end, run_end)
-                    continue
+            if (token := _token_after_a_scheme_word(text, at, word_end)) is not None:
+                at = token  # a word after the blanks, on the same record
+                if at >= run_end:
+                    run_end = _run_end(text, at, stop)
+                    end = max(end, run_end)
+                continue
             lead = _LEAD_WORD.match(text, at)
             if lead is None or word_end > lead.end() or not _reached(text, lead.end()):
                 # No lead word, one the shell reads past, or nothing after its tabs: the value ends,
-                # unless it ends just after a scheme word a tab glues to it.
-                if (token := _token_after_a_glued_scheme_word(text, floor, end)) is None:
+                # unless it ends just after a scheme word.
+                if (token := _token_after_a_scheme_word(text, floor, end)) is None:
                     return end
                 at = floor = token
                 if at >= run_end:
@@ -860,9 +882,9 @@ def scrub(text: str) -> str:
     spans = heapq.merge(
         assignments,
         (_heartbeat_span(match) for match in _HEARTBEAT_RUN.finditer(text)),
-        _x_api_key_spans(text),
-        _label_spans(_QUERY, text, values),
-        _label_spans(_API_KEY, text, values),
+        _literal_spans(_X_API_KEY, text, values),
+        _literal_spans(_QUERY, text, values),
+        _literal_spans(_API_KEY, text, values),
         _bearer_spans(text),
         (match.span() for match in _PREFIX_RULES.finditer(text) if not _is_word(match)),
     )
@@ -893,54 +915,90 @@ def _past_marker(text: str, at: int) -> int:
     A span another rule ends can end where a value would not (``OPENAI_API_KEY=x-api-key:
     `$'sk-)``: the header's value stops at the ``'``), and a marker written there is read again
     with what follows it as one shell word. So the span takes what that reading takes: the rest of
-    the word the marker begins, then the value of a credential name it ends at, or the token after a
-    scheme word a tab glues into it, each read as `_value_end` reads one. A value `_value_end` reads
+    the word the marker begins, then the value of a credential name it ends at, or the token after
+    the scheme word it ends in, each read as `_value_end` reads one. A value `_value_end` reads
     ends where a marker ends one, so a marker `scrub` writes reads back as itself."""
     if at == len(text) or text[at] in _MARKER_ENDS:
         return at
     word_end, at_a_name = _shell_word_end(text, at)
     if at_a_name:
         return _value_end(text, word_end)
-    token = _token_after_a_glued_scheme_word(text, at, word_end)
+    token = _token_after_a_scheme_word(text, at, word_end)
     return word_end if token is None else max(word_end, _value_end(text, token))
 
 
-def _label_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterator[tuple[int, int]]:
-    """Every match of a literal rule, its label left out when a credential's value starts after it
-    (`scrub`). In order, since each starts no earlier than the match before it ends."""
-    labelled = "label" in rule.groupindex
-    for match in rule.finditer(text):
-        label_end = match.end("label") if labelled else -1
-        yield (label_end if label_end in values else match.start()), match.end()
+def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterator[tuple[int, int]]:
+    """Every match of a literal rule, read on through a label its value ends in, its label left out
+    when a credential's value starts after it (`scrub`).
 
+    A value can end in the next value's own label (``api_key=x,api_key="eyJ…"``, whose value is
+    ``x,api_key=`` up to the quote; ``x-api-key: "x-api-key": "K9…"``, ``x-api-key: x-api-key:Bearer
+    K9…``), and the value after it would then be matched by nothing, since each search starts past
+    the last match (the review of #929, issue #934). So while a match whose label stands in the
+    value reaches further, it is read too, and the span ends where the last one does. Only three
+    places hold such a label, because a label anywhere else is followed by the run the value
+    already read, which stops where the value stops:
 
-def _x_api_key_spans(text: str) -> Iterator[tuple[int, int]]:
-    """Every ``x-api-key`` header's span, read on through a header its value opens with.
+    - **Where the value stops**: the label ends there, before the backslashes that escape the stop
+      (``api_key=x,api_key=\\"eyJ…``), or before the one scheme word its value may open with
+      (``api_key=x,api_key=Bearer abc``).
+    - **Just before the value's glued scheme word**, when the value ended in one and its token
+      (``api_key=\\"api_key=bearer<TAB>X-API-KEY=``): that label reads the scheme word as its own
+      and then its run, which is wider than a token and goes on past it.
+    - **Anywhere in the value**, when the value opened with an escaped quote and so ends before
+      the backslashes of its escaped close (`_literal_end`): a label inside it has no escaped
+      opener of its own, and reads its run to the stop, backslashes and all
+      (``api_key=\\"api-key=eyJ…\\"``). The first such label is enough, since every one reads to
+      the same stop.
 
-    A value can end in the next header's own label (``x-api-key: "x-api-key": "K9…"``, whose value
-    is ``x-api-key`` up to the quote; ``x-api-key: abc-x-api-key: K9…``, whose value ends at
-    ``x-api-key:``), and the header after it would then be matched by nothing, since each search
-    starts past the last match (the review of #929). So while a header whose label ends where the
-    span does reaches further, it is read too, and the span ends where the last one does. Only such
-    a label can: a header starting earlier in the value stops where the value stops, at the same
-    space, quote, backslash or ``&``, and a bearer header that crosses one is the bearer rule's.
-    The label must end where the span does, or before its separator (``:``, ``=>``) and the one
-    scheme word an inner value may open with glued to it (``x-api-key: x-api-key:Bearer K9…``,
-    whose value stops at the blank after ``Bearer``), so only `_X_API_LABEL_REACH` characters are
-    searched for it, and the rule stays linear."""
+    So only `_LITERAL_LABELS`' reach before the first two is searched, and the value once for the
+    third, and the rule stays linear. In order, since each span starts no earlier than the one
+    before it ends."""
+    (label, reach), labelled = _LITERAL_LABELS[rule], "label" in rule.groupindex
     pos = 0
-    while (match := _X_API_KEY.search(text, pos)) is not None:
-        start, end, floor = match.start(), match.end(), match.start("value")
+    while (match := rule.search(text, pos)) is not None:
+        last, end = match, _literal_end(match)
         while True:
-            tail = range(max(floor, end - _X_API_LABEL_REACH), end)
+            floor, stop = last.start("value"), end
+            while stop > floor and text[stop - 1] == "\\":
+                stop -= 1
+            places: list[Iterable[int]] = [range(max(floor, stop - reach), end)]
+            if (glued := last.start("glued")) >= 0:
+                places.append(range(max(floor, glued - reach), glued))
+            if end < last.end() and (inside := label.search(text, floor, stop)) is not None:
+                places.append((inside.start(),))
             inner = next(
-                (m for i in tail if (m := _X_API_KEY.match(text, i)) and m.end() > end), None
+                (
+                    m
+                    for place in places
+                    for i in place
+                    if (m := rule.match(text, i)) and _literal_end(m) > end
+                ),
+                None,
             )
             if inner is None:
                 break
-            end, floor = inner.end(), inner.start("value")
-        yield start, end
+            last, end = inner, _literal_end(inner)
+        label_end = match.end("label") if labelled else -1
+        yield (label_end if label_end in values else match.start()), end
         pos = end
+
+
+def _literal_end(match: re.Match[str]) -> int:
+    """Where a literal rule's `match` ends as a span: its end, but before the escape of the quote its
+    value stops at, when the value opened with an escaped quote (issue #934). The close is escaped
+    as deeply as the opener, so as many backslashes as the opener carried are left with it, and no
+    more: one before them is the value's own escaped backslash. The key goes and its escaped close
+    stays, so a JSON string the key was quoted in still parses (``{"h":"api_key=\\"K9…\\""}``
+    scrubs to ``{"h":"[redacted]\\""}``)."""
+    end, text = match.end(), match.string
+    depth = len(match.groupdict().get("opener") or "") - 1
+    if depth <= 0 or text[end : end + 1] != '"':
+        return end
+    floor = max(match.start("value"), end - depth)
+    while end > floor and text[end - 1] == "\\":
+        end -= 1
+    return end
 
 
 def _bearer_spans(text: str) -> Iterator[tuple[int, int]]:
