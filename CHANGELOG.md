@@ -7,6 +7,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed: A key in a query stops at a `"`, and no literal value opens at the close of the JSON string it sits in (issue #939)
+
+A scrubbed line logged inside a JSON string could lose the string's close and the rest of the line, with no key shipped. The commonest shape was a URL with a key in its query: `{"h":"url?api_key=K9…","k":"v"}` scrubbed to `{"h":"url[redacted]`. An empty value did the same: `{"h":"api_key=","k":"v"}` scrubbed to `{"h":"[redacted]"k":"v"}`.
+
+- **The query rule's value stops at a `"`, as an `api_key=` value does, and opens as one does**: with a `"`, or an escaped one at any depth. A URL holds no raw `"`, so `?token=x"K9…` keeps `"K9…`, as text after any quote is kept; `?token="K9…"` and `?token=\"K9…\"` still lose the key.
+- **An opener at a string's close opens nothing** (`_observability._closes`), for the `api_key=`, query and `x-api-key` rules alike. JSON follows a close with structure (`,`, `:`, `}` or `]`), and a value that is structure and nothing else is no value. So `{"h":"api_key=","k":"v"}` and `{"h": "x-api-key: ", "k": "v"}` scrub to themselves. An inner string's real close, read as an escaped opener after an even run of backslashes, now keeps its close too, which ends the limit `docs/telemetry.md` stated for it.
+- **Two readings still take a string's close, and `docs/telemetry.md` states both**: a credential-named assignment's value, a shell word read as the router reads it, and the marker read again (`_past_marker`). Neither ships a key. The box's `api[-_]?key=` rule opens at a close too, and that is stated as its limit.
+- **Measured.** The issue's own differential of 1,000,000 texts, regenerated, finds no key kept that 0.198.3 took, no line newly broken and no nested string lost. None of the 847 lines it found breaks on the query rule: 54 parse again, and the rest break on the two stated readings. A wider differential of 1,000,000 texts also keeps no key that 0.198.3 took and brings the JSON lines that do not parse from 305,431 to 231,062. In it, 298 lines that 0.198.3 parsed no longer do, and 202 more lose a nested string, each through the marker read again, which the query value had hidden.
+
 ## [0.198.3] - 2026-11-18
 
 ### Fixed: An `api_key=` value in escaped quotes, or after a label its value ends in, is redacted, and the router's reading is re-pinned at `a8e8f5f` (issue #934, basecradle-router#510)
