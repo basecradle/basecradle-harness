@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.198.4] - 2026-11-18
 
+### Added: A credential-named JSON member loses its string value, for an exact list of names (issue #943)
+
+No rule read a JSON member, so a shapeless secret in one shipped on every version of every scrub in the fleet: `{"api_key":"K9…"}` and `{"password":"…"}` went out as written, and only a secret with a vendor's prefix was caught. Decided by `@origin` (2026-11-19).
+
+- **The names are an exact list**: `api_key`, `apikey`, `access_token`, `refresh_token`, `client_secret`, `password`, `secret` and `authorization`, in any case, with `-`, `_` or nothing between the words. Never a bare `key` or `token`, which are everywhere and almost never a secret; `max_tokens` and `total_tokens` are untouched.
+- **Only a string value goes, read to its own close** (`_observability._MEMBER`, `_string_close`): the member's quotes escaped at any depth, by the same run, the value's escaped quotes and backslashes taken with it, and the close kept, so `{"password": "p\"w\\", "k": "v"}` scrubs to `{"password": "[redacted]", "k": "v"}` and every enclosing JSON string still parses. A number, `null`, an object or an array is left alone, and a Python `repr`'s single-quoted member is not read. `bounded` cuts a member whole, as it cuts every literal label.
+- **A differential of 800,000 texts against 0.198.3** changes 548,154 and takes a key 0.198.3 left in 217,930. It keeps 24 keys in 22 texts that 0.198.3 took, every one only by reading an assignment's marker on past the member's close, the class #935 accepted; `docs/telemetry.md` states exactly what the rule reads for the router's differential and the NOC's `scrub-parity`, and that class with its line. The box does not read a member until basecradle-router#516 lands.
+
 ### Fixed: No `api_key=` or `x-api-key` value opens at the close of the JSON string it sits in (issue #939)
 
 Where an `api_key=` label or an `x-api-key` header ended a JSON string, the string's own close was read as the value's opener, and the value ran on into the line's structure, so the line no longer parsed: `{"h":"api_key=","k":"v"}` scrubbed to `{"h":"[redacted]"k":"v"}`. No key shipped.

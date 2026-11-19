@@ -323,6 +323,74 @@ _API_KEY = re.compile(
     rf"(?:{_API_KEY_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_API_KEY_RUN}+))"
 )
 
+#: **A credential-named JSON member's string value** (issue #943, @origin, 2026-11-19): a member
+#: whose name is exactly ``api_key``, ``apikey``, ``access_token``, ``refresh_token``,
+#: ``client_secret``, ``password``, ``secret`` or ``authorization``, in any case, with ``-``, ``_``
+#: or nothing between the words. The list is exact by his decision: never a bare ``key`` or
+#: ``token``, names that are everywhere and almost never a secret. The name and the value's quotes
+#: stay, and the value goes, read to the string's close (`_string_close`), so the line still parses.
+#: The member's quotes are escaped at any depth (`_ESCAPE`), the name's and the value's opener alike
+#: (``{"log": "{\\"password\\": \\"…\\"}"}``), and the run before the name's opening quote is taken
+#: whole, never from inside a longer one. A value that is not a string (a number, ``null``, an
+#: object, an array) is left alone, and only ``"`` quotes a member: a Python ``repr``'s
+#: ``{'password': '…'}`` is no JSON member.
+_MEMBER_NAME = (
+    r"(?i:api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret"
+    r"|authorization)"
+)
+_MEMBER = re.compile(rf'(?<!\\)(?P<escape>{_ESCAPE})"{_MEMBER_NAME}(?P=escape)"\s*:\s*(?P=escape)"')
+_STRING_STOP = re.compile(r'["\\\x00-\x1f]')
+_BACKSLASHES = re.compile(r"\\*")
+
+
+def _string_close(text: str, at: int, escape: int, stop: int | None = None) -> tuple[int, int]:
+    """Where the JSON string whose value starts at `at` ends, and where the text after it resumes:
+    the start of the run of `escape` backslashes before its closing quote and the place past that
+    quote, or, when the string never closes, `stop` (the text's end when ``None``) or the first
+    control character before it, twice, since no JSON string holds one raw.
+
+    A string ``d`` levels deep opens with a quote escaped by ``escape = 2**d - 1`` backslashes. One
+    encoding pass turns a run of ``n`` before a quote into ``2n + 1``, so its close is a quote after
+    a run of ``escape + (2 * escape + 2) * m``, the ``m`` being the escaped backslashes that end the
+    value, and a quote inside the value after a run ``2**d`` longer than one of those, never one. The
+    value's own escaped backslashes before the close go with it, and the close's own run stays, so
+    every string the line holds parses as it did. An escape no depth gives (five backslashes) is read
+    by the same arithmetic, and a value that never closes runs to the stop: a reading that takes
+    more costs a field, and one that takes less a secret."""
+    end = len(text) if stop is None else stop
+    while (found := _STRING_STOP.search(text, at, end)) is not None:
+        i = found.start()
+        if text[i] < " ":
+            return i, i
+        run_end = _BACKSLASHES.match(text, i, end).end()
+        run = run_end - i
+        if run_end < end and text[run_end] == '"':
+            if run >= escape and (run - escape) % (2 * escape + 2) == 0:
+                return run_end - escape, run_end + 1
+            run_end += 1
+        at = run_end
+    return end, end
+
+
+def _members(text: str, stop: int | None = None) -> Iterator[tuple[int, int, int]]:
+    """Every credential-named JSON member in ``text[:stop]`` (`_MEMBER`), in order: where it starts,
+    where its value starts and where the value's close begins (`_string_close`). Each search goes
+    on past the last close, so a name inside a value is that value's text, a closing quote never
+    opens the next name (the backslashes the value loses before it would let a second scrub read
+    one there), and the text is read once."""
+    end = len(text) if stop is None else stop
+    pos = 0
+    while (match := _MEMBER.search(text, pos, end)) is not None:
+        close, pos = _string_close(text, match.end(), len(match.group("escape")), end)
+        yield match.start(), match.end(), close
+
+
+def _member_spans(text: str) -> Iterator[tuple[int, int]]:
+    """Every credential-named JSON member's string value in `text`, from where it starts to where
+    its close begins, an empty value giving no span."""
+    return ((start, end) for _, start, end in _members(text) if end > start)
+
+
 #: What follows the close of a JSON string, at any depth of nesting: a ``,`` or a ``:`` before the
 #: next member, a ``}`` or a ``]`` ending what holds it (`_closes`).
 _STRUCTURE = frozenset(",:}]")
@@ -820,12 +888,14 @@ def _whole_values(text: str, cut: int) -> tuple[int, int | None]:
       it. The assignments are the ones `redact_credentials` reads, found as it finds them, so a name
       inside another's value (``A_TOKEN='B_TOKEN=x y …``) is that value's text and never stands for
       it.
-    - **A literal rule's label** (issue #931): ``?token=``, ``api_key=``, an ``x-api-key:`` header
-      or a heartbeat URL, reached when the head, its trailing blanks gone, ends past the label and
-      inside what its value may take (`_OPEN_LABELS`): ``?token= tail`` cut to ``?token=…`` scrubs
-      to ``[redacted]``, ten characters for a cap of nine. A blank between the label and the marker
-      would keep the label for some rules and not for others (an ``x-api-key:`` value and a scheme
-      word's token are read across blanks), so a reached label goes whole, as a name does.
+    - **A literal rule's label** (issue #931): ``?token=``, ``api_key=``, an ``x-api-key:`` header,
+      a heartbeat URL or a credential-named JSON member up to its value's opener (issue #943),
+      reached when the head, its trailing blanks gone, ends past the label and inside what its
+      value may take (`_OPEN_LABELS`; a member's value to its close, `_members`): ``?token= tail``
+      cut to ``?token=…`` scrubs to ``[redacted]``, ten characters for a cap of nine. A blank
+      between the label and the marker would keep the label for some rules and not for others (an
+      ``x-api-key:`` value and a scheme word's token are read across blanks), so a reached label
+      goes whole, as a name does.
 
     Every reading goes no further than the first cut, and each search goes on from where the last
     reading ended, so each rule reads the head once, as `scrub` reads the text (issue #929: backing
@@ -846,7 +916,7 @@ def _whole_values(text: str, cut: int) -> tuple[int, int | None]:
         ((m.start(), m.end("label"), m.end()) for m in rule.finditer(text, 0, cut))
         for rule in _OPEN_LABELS
     )  # each label's start, its end, and where the reading after it ends
-    items = list(heapq.merge(found, *labels))
+    items = list(heapq.merge(found, *labels, _members(text, cut)))
     end = _head_end(text, cut)
     kept: int | None = None
     for start, label_end, reach in reversed(items):
@@ -877,8 +947,9 @@ def scrub(text: str) -> str:
     """`text` with every credential shape the scrub knows redacted.
 
     Five rules, each reading `text` as it came: the heartbeat URL (`_HEARTBEAT_RUN`), the literal
-    rules (`_X_API_KEY`, `_QUERY`, `_API_KEY`, `_BEARER`), the value of every credential-named
-    assignment (`_credential_spans`, which `redact_credentials` renders alone), and the prefix rules
+    rules (`_X_API_KEY`, `_QUERY`, `_API_KEY`, a credential-named JSON member's string value
+    (`_MEMBER`), `_BEARER`), the value of every credential-named assignment (`_credential_spans`,
+    which `redact_credentials` renders alone), and the prefix rules
     (`_PREFIXED`). **What the scrub takes is the union of what the rules take** (issue #929): the
     spans they match are merged where they overlap or touch, and each merged span is written once —
     as `REDACTED_VALUE` when it starts where a credential name's value starts, the name kept, and
@@ -916,6 +987,7 @@ def scrub(text: str) -> str:
         _literal_spans(_X_API_KEY, text, values),
         _literal_spans(_QUERY, text, values),
         _literal_spans(_API_KEY, text, values),
+        _member_spans(text),
         _bearer_spans(text),
         (match.span() for match in _PREFIX_RULES.finditer(text) if not _is_word(match)),
     )

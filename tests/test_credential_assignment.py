@@ -577,10 +577,8 @@ def test_the_routed_shapes_are_read_as_the_router_reads_them(text, redacted, can
         (f'{{"a":"Bearer \\"tok1, b: Bearer \\"{FAKE_JWT}\\""}}', '{"a":"[redacted] b: [redacted]'),
         (f'Bearer \\\\\\"{FAKE_JWT}\\\\\\" next=1', "[redacted] next=1"),
         (f'Bearer \\"{FAKE_JWT}', "[redacted]"),
-        (
-            f'"Authorization": "Bearer \\"{FAKE_JWT}\\"", "x": 1',
-            '"Authorization": "[redacted] "x": 1',
-        ),
+        # Under a name on the member list the member rule reads it too (issue #943, below).
+        (f'"auth": "Bearer \\"{FAKE_JWT}\\"", "x": 1', '"auth": "[redacted] "x": 1'),
         # The review of #929: an `x-api-key` value that is the next header's own label is read on
         # through that header, beside a credential's value or a heartbeat URL alike.
         (f"x-api-key: x-api-key: {FAKE_JWT} next", "[redacted] next"),
@@ -602,6 +600,18 @@ def test_scrub_ships_no_token_whatever_order_the_rules_would_run_in(text, scrubb
     assert scrub(scrubbed) == scrubbed
     assert FAKE_JWT not in scrub(text) and "secretsecret" not in scrub(text)
     assert silent(canary, scrubbed)
+
+
+def test_a_bearer_token_in_escaped_quotes_under_a_member_name_is_taken_and_reread(canary):
+    # The member rule reads the value to its close (issue #943); the bearer rule's escaped token is
+    # the rest of its word, so it takes the close and the `,` (a limit stated in
+    # `docs/telemetry.md`, issue #941). A second scrub then reads the member on to the next quote,
+    # which costs the blank before it and nothing else.
+    text = f'"Authorization": "Bearer \\"{FAKE_JWT}\\"", "x": 1'
+    once = scrub(text)
+    assert once == '"Authorization": "[redacted] "x": 1'
+    assert scrub(once) == '"Authorization": "[redacted]"x": 1' == scrub(scrub(once))
+    assert silent(canary, once)
 
 
 def test_no_run_of_scheme_words_lets_a_token_through_scrubbed(canary):
