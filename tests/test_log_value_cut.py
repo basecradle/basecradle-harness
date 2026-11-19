@@ -1131,6 +1131,24 @@ def test_a_credential_named_assignment_reads_a_shell_word_across_the_close():
     assert scrub(line) == redact_credentials(line) == '{"h":"A_TOKEN=' + REDACTED_VALUE
 
 
+def test_an_opener_before_a_value_that_is_not_a_string_still_opens():
+    # A stated limit (the review of #939): the value is read to where its run stops, so structure
+    # running on into a number, a literal, an object or an array is more than structure, and the
+    # opener still opens, as on 0.198.3. Nested, the line parses and the inner string loses its close.
+    assert scrub('["api_key=",1]') == '["[redacted]'
+    assert scrub('{"api_key=":1}') == '{"[redacted]'
+    nested = json.dumps({"log": json.dumps(["api_key=\\", 2], separators=(",", ":"))})
+    assert set(json.loads(scrub(nested))) == {"log"}
+
+
+def test_a_key_reached_only_through_a_dropped_opener_is_kept():
+    # What dropping an opener costs (#939), stated in `docs/telemetry.md`: 0.198.3 read the marker
+    # on through the header's opener, a close by `_closes`, to the text after it. No other kept key
+    # was found, by two adversarial differentials.
+    text = f'A_TOKEN=x-api-key: "]\\{SHAPELESS_KEY}'
+    assert scrub(text) == f'A_TOKEN={REDACTED_VALUE} "]\\{SHAPELESS_KEY}'
+
+
 def test_a_key_in_a_query_still_takes_the_close():
     # A stated limit (#939): the query value's run takes a `"`. Stopping it at one gave up keys the
     # run took (a value in doubled CSV quotes, `?token=x"K9…`, the next JSON member), and no reader

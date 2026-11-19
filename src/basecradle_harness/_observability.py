@@ -295,9 +295,10 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: backslash, so the escaped close stays as deep as it came and the JSON still parses. **The
 #: even-run reading is exact for the outermost string only**: one encoding pass turns a run of
 #: ``n`` before a quote into ``2n + 1``, so an inner string whose value ends in an even run reaches
-#: the text as an odd one, and its real close is read as an opener. Structure follows that close,
-#: so the opener opens nothing (`_closes`, issue #939) and the inner string keeps it; until then
-#: the outermost string parsed and that inner string lost its close. A quote escaped at every level
+#: the text as an odd one, and its real close is read as an opener. Where structure and the next
+#: string's quote follow that close, the opener opens nothing (`_closes`, issue #939) and the inner
+#: string keeps it; before a number, a literal, an object or an array the outermost string parses
+#: and that inner string loses its close. A quote escaped at every level
 #: is a run of exactly ``2**d - 1``, a set no regular expression states for every depth.
 _ESCAPE = r"(?:\\(?:\\\\)*)?"
 _X_API_LABEL = rf"(?i:x[-_]api[-_]?key)(?:{_ESCAPE}[\"']\s*(?:=>|[:=,])|\s*(?::|=>))"
@@ -1046,7 +1047,8 @@ def _literal_end(match: re.Match[str]) -> int:
     ``{"log": "{\\"h\\":\\"[redacted]\\\\\\\\\\"}"}``). After an even run the quote is a real one, the
     backslashes escaping each other, and they go with the value. A backslash is never a key's. (An
     inner string's real close after an even run, none included, reaches the line as an odd run and
-    is read as an escaped opener, which opens nothing, structure following it: `_closes`.)"""
+    is read as an escaped opener, which opens nothing where structure and the next string follow it
+    (`_closes`), and loses its close before any other value.)"""
     end, text = match.end(), match.string
     if text[end : end + 1] != '"':
         return end
