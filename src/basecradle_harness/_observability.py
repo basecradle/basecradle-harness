@@ -279,7 +279,12 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: escaped that deep once matched neither, so the whole header shipped. Both read the piece the
 #: ``api_key=`` opener reads (`_ESCAPE`): none, or an odd run of backslashes; after an even run the
 #: quote is a real one (``{"x-api-key":"\\","k":"v"}``), never taken. The value's run stops at a
-#: backslash, so the escaped close stays as deep as it came and the JSON still parses.
+#: backslash, so the escaped close stays as deep as it came and the JSON still parses. **The
+#: even-run reading is exact for the outermost string only**: one encoding pass turns a run of
+#: ``n`` before a quote into ``2n + 1``, so an inner string whose value ends in an even run reaches
+#: the text as an odd one, and its real close is read as an opener. The outermost string still
+#: parses and nothing ships; that inner string loses its close. A quote escaped at every level is a
+#: run of exactly ``2**d - 1``, a set no regular expression states for every depth.
 _ESCAPE = r"(?:\\(?:\\\\)*)?"
 _X_API_LABEL = rf"(?i:x[-_]api[-_]?key)(?:{_ESCAPE}[\"']\s*(?:=>|[:=,])|\s*(?::|=>))"
 _X_API_OPENER = rf"\s*(?:b?{_ESCAPE}[\"'])?"

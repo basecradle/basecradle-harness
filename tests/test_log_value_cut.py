@@ -921,6 +921,18 @@ def test_a_header_quote_after_an_even_run_of_backslashes_is_no_opener(value, sep
     assert json.loads(scrub(line))["k"] == "v"
 
 
+@pytest.mark.parametrize("value", ["\\", "\\\\", "x\\", "K9\\\\"])
+@pytest.mark.parametrize("depth", [1, 2, 3])
+def test_a_nested_even_run_leaves_the_outermost_line_parseable(value, depth):
+    # The stated limit (the review of #935): an encoding pass turns an inner string's even run into
+    # an odd one, so that inner string can lose its close. The line itself always parses. (An
+    # unquoted `api_key=` value nested so breaks the line itself, filed as #937.)
+    line = json.dumps({"h": f"x-api-key: {value}", "k": "v"}, separators=(",", ":"))
+    for _ in range(depth):
+        line = json.dumps({"log": line})
+    assert set(json.loads(scrub(line))) == {"log"}
+
+
 def test_no_header_escaped_at_any_depth_lets_its_key_through():
     rng = random.Random(935)
     escapes = ["", "\\", "\\" * 3, "\\" * 7]
