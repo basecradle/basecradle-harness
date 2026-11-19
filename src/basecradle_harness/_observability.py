@@ -273,8 +273,21 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: ``X-API-KEY=…``): where the assignment rule finds a name ending at the label's ``=``, the label
 #: stays and its value becomes `REDACTED_VALUE`, as every credential-named assignment's does; any
 #: other label (``api_key=``, ``?token=``) goes with its value as ``[redacted]``.
-_X_API_LABEL = r"(?i:x[-_]api[-_]?key)(?:\\?[\"']\s*(?:=>|[:=,])|\s*(?::|=>))"
-_X_API_OPENER = r"\s*(?:b?\\?[\"'])?"
+#:
+#: **A quote is escaped at any depth, in the header's label and its value's opener alike** (issue
+#: #935): JSON inside two nested JSON strings writes ``\\\"`` (three backslashes), and a header
+#: escaped that deep once matched neither, so the whole header shipped. Both read the piece the
+#: ``api_key=`` opener reads (`_ESCAPE`): none, or an odd run of backslashes; after an even run the
+#: quote is a real one (``{"x-api-key":"\\","k":"v"}``), never taken. The value's run stops at a
+#: backslash, so the escaped close stays as deep as it came and the JSON still parses. **The
+#: even-run reading is exact for the outermost string only**: one encoding pass turns a run of
+#: ``n`` before a quote into ``2n + 1``, so an inner string whose value ends in an even run reaches
+#: the text as an odd one, and its real close is read as an opener. The outermost string still
+#: parses and nothing ships; that inner string loses its close. A quote escaped at every level is a
+#: run of exactly ``2**d - 1``, a set no regular expression states for every depth.
+_ESCAPE = r"(?:\\(?:\\\\)*)?"
+_X_API_LABEL = rf"(?i:x[-_]api[-_]?key)(?:{_ESCAPE}[\"']\s*(?:=>|[:=,])|\s*(?::|=>))"
+_X_API_OPENER = rf"\s*(?:b?{_ESCAPE}[\"'])?"
 _X_API_RUN = r"[^\s\"'&\\]"
 _SCHEME_WORDS = r"(?:(?i:bearer)\s+)*"
 _X_API_KEY = re.compile(
@@ -288,7 +301,7 @@ _QUERY = re.compile(
     rf"(?:{_QUERY_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_QUERY_RUN}+))"
 )
 _API_KEY_LABEL = r"(?i:api[-_]?key=)"
-_API_KEY_OPENER = r'(?:(?:\\(?:\\\\)*)?")?'
+_API_KEY_OPENER = f'(?:{_ESCAPE}")?'
 _API_KEY_RUN = r"[^&\s\"]"
 _API_KEY = re.compile(
     f"(?P<label>{_API_KEY_LABEL})(?P<opener>{_API_KEY_OPENER})(?P<value>{_SCHEME_WORDS}"

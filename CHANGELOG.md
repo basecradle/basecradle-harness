@@ -18,6 +18,13 @@ The router and the NOC found two shapes the `api_key=` rule shipped at 0.198.2. 
 - **The router's reading is re-pinned at `a8e8f5f`.** A bearer scheme word is `bearer` glued to anything before it, the fleet's one definition, so `A_TOKEN=abc-bearer eyJ…` loses its token. `tests/router_reading.py` carries the new excerpt, and `_value_end` and `redact_credentials` are held equal to it at every start and limit of fuzzed text.
 - **The box takes neither `api_key=` shape**, and `docs/telemetry.md` states that as its limit. A differential of 1,000,000 texts against 0.198.2 finds no key the literal rules leave that 0.198.2 redacted; what reads less is stated there, the re-pin's share being the router's own bytes.
 
+### Fixed: An `x-api-key` header escaped more than once is redacted (issue #935)
+
+The `x-api-key` rule took a quote escaped once, in its label and in its value's opener. JSON inside two nested JSON strings escapes a quote three times (`\\\"`), so a header nested that deep matched neither and shipped whole, as did `x-api-key: \\\"K9…\\\"` in a header dump.
+
+- **The label and the opener take a quote escaped at any depth**, by the piece the `api_key=` opener reads (`_observability._ESCAPE`): none, or an odd run of backslashes. A quote after an even run is a real quote and never taken, so `{"x-api-key":"\\","k":"v"}` still parses. The value still stops at a backslash, so its escaped close stays and every enclosing JSON string parses, at depths 1 to 3. The even-run reading is exact for the outermost string only, as it is for the `api_key=` opener: an inner JSON string whose header value ends in an even run reaches the line as an odd run and loses its close. The line still parses and nothing ships, and `docs/telemetry.md` states the case.
+- **The box takes a header escaped once**, and `docs/telemetry.md` states that as its limit until the router's first pass becomes one alternation (basecradle-router#516). A differential of 1,000,000 texts against `main` and against 0.198.2 finds no token kept that either took, except tokens the older scrub took only by reading its marker again; that case is stated there.
+
 ## [0.198.2] - 2026-11-18
 
 ### Fixed: A bounded text no longer grows past its cap when the formatter scrubs a literal label again (issue #931)
