@@ -1294,3 +1294,176 @@ def test_a_bound_over_many_labels_is_linear():
     ):
         bounded(text, len(text) - 1)
     assert time.monotonic() - started < 2.0
+
+
+# --- a credential-named JSON member (issue #943) ------------------------------------------------
+
+#: Every name on @origin's exact list, in each separator its words may take, and in each case.
+MEMBER_NAMES = [
+    *(
+        spelled
+        for first, second in (
+            ("api", "key"),
+            ("access", "token"),
+            ("refresh", "token"),
+            ("client", "secret"),
+        )
+        for joiner in ("_", "-", "")
+        for spelled in (f"{first}{joiner}{second}", f"{first}{joiner}{second}".upper())
+    ),
+    *(
+        spelled
+        for name in ("password", "secret", "authorization")
+        for spelled in (name, name.title())
+    ),
+]
+
+
+def _nested(obj: object, depth: int) -> str:
+    line = json.dumps(obj)
+    for _ in range(depth):
+        line = json.dumps({"log": line, "n": 1})
+    return line
+
+
+def _innermost(line: str, depth: int) -> dict:
+    """`line` parsed back through every enclosing string to the object `_nested` began with."""
+    obj = json.loads(line)
+    for _ in range(depth):
+        obj = json.loads(obj["log"])
+    return obj
+
+
+@pytest.mark.parametrize("name", MEMBER_NAMES)
+@pytest.mark.parametrize("depth", [0, 1, 2])
+def test_a_credential_named_member_loses_its_string_value_at_any_depth(name, depth):
+    line = _nested({"id": 7, name: SHAPELESS_KEY, "k": "v"}, depth)
+    scrubbed = scrub(line)
+    assert SHAPELESS_KEY not in scrubbed
+    assert _innermost(scrubbed, depth) == {"id": 7, name: "[redacted]", "k": "v"}
+
+
+@pytest.mark.parametrize("separators", [(",", ":"), (", ", ": "), (",", " : "), (",\n", ":\t")])
+def test_a_member_is_read_across_the_blanks_json_allows(separators):
+    line = json.dumps({"password": SHAPELESS_KEY, "k": "v"}, separators=separators)
+    assert json.loads(scrub(line)) == {"password": "[redacted]", "k": "v"}
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2])
+@pytest.mark.parametrize(
+    "value",
+    [
+        f'{SHAPELESS_KEY}"tail',  # an escaped quote inside the value
+        f"{SHAPELESS_KEY}\\",  # an escaped backslash ending it, before the close
+        f"{SHAPELESS_KEY}\\\\\\",
+        f'\\"{SHAPELESS_KEY}\\\\"',
+        f"{SHAPELESS_KEY}\n tail",  # an escaped newline, and a separator JSON writes raw
+    ],
+)
+def test_a_members_value_is_read_to_its_own_close(depth, value):
+    for ensure_ascii in (True, False):
+        line = json.dumps({"secret": value, "k": "v"}, ensure_ascii=ensure_ascii)
+        for _ in range(depth):
+            line = json.dumps({"log": line}, ensure_ascii=ensure_ascii)
+        scrubbed = scrub(line)
+        assert SHAPELESS_KEY not in scrubbed, scrubbed
+        assert _innermost(scrubbed, depth) == {"secret": "[redacted]", "k": "v"}, scrubbed
+
+
+@pytest.mark.parametrize("value", [42, 3.5, None, True, {"a": "b"}, ["c"], ""])
+def test_a_member_whose_value_is_no_string_is_left_alone(value):
+    line = json.dumps({"api_key": value, "password": value, "k": "v"})
+    assert scrub(line) == line
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["key", "token", "max_tokens", "total_tokens", "Key", "TOKEN", "my_api_key", "passwords",
+     "secret_name", "my_password", "authorization_url", "api key", "api__key"],
+)  # fmt: skip
+def test_a_member_named_off_the_list_is_untouched(name):
+    line = json.dumps({name: "kept-value-07", "n": 1})
+    assert scrub(line) == line
+
+
+def test_a_quote_after_an_even_run_never_opens_a_members_name():
+    # The quote after `\\` is a real one (the backslashes escape each other), so it closes the
+    # string before it rather than opening a member's name, and nothing is read.
+    line = '{"h":"x\\\\"password":"kept"}'
+    assert scrub(line) == line
+
+
+def test_a_member_whose_value_never_closes_is_read_to_the_line_break():
+    # A line cut inside the value, or a value in no JSON at all: the value runs on to the end of the
+    # line, never past a raw line break, which no JSON string holds.
+    assert scrub(f'{{"password":"{SHAPELESS_KEY}') == '{"password":"[redacted]'
+    assert scrub(f'"password": "{SHAPELESS_KEY}\nnext') == '"password": "[redacted]\nnext'
+
+
+def test_a_closing_quote_never_opens_the_next_name():
+    # No JSON, but a second scrub must not read a name the first one did not: the backslashes the
+    # value loses before its close once left that close free to open `"password"`.
+    text = '"Secret" : "\\\\"password":"}'
+    assert scrub(text) == '"Secret" : "[redacted]"password":"}'
+    assert scrub(scrub(text)) == scrub(text)
+
+
+def test_a_member_in_another_members_value_is_that_values_text():
+    line = json.dumps({"password": '"secret": "x', "k": "v"})
+    assert json.loads(scrub(line)) == {"password": "[redacted]", "k": "v"}
+
+
+def test_a_python_repr_is_no_json_member():
+    # Stated (issue #943): only `"` quotes a member, by the decision's statement.
+    line = f"{{'password': '{SHAPELESS_KEY}'}}"
+    assert scrub(line) == line
+
+
+@pytest.mark.parametrize(
+    ("text", "cap", "cut"),
+    [
+        # Cut inside the member's `[redacted]` or just after it, before its close: a second scrub
+        # read the `…` into the value and wrote `[redacted]` past the cap, or dropped the `…`.
+        ('{"n":1,"password":"[redacted]","k":"v"}', 20, '{"n":1,…'),
+        ('{"n":1,"password":"[redacted]","k":"v"}', 30, '{"n":1,…'),
+        ('{"n":1,"password":"[redacted]","k":"v"}', 31, '{"n":1,"password":"[redacted]"…'),
+    ],
+)
+def test_a_bound_cuts_a_member_whole_when_the_marker_would_be_its_value(text, cap, cut):
+    assert bounded(text, cap) == cut
+    assert scrub(cut) == cut
+
+
+def test_no_member_lets_a_second_scrub_grow_a_bound_or_take_its_marker():
+    # Only texts a second scrub leaves as they are: where a value's own text holds a member whose
+    # outer member another rule's span erases, a second scrub takes more with no cut at all (stated
+    # in `docs/telemetry.md`), which is not the cut's doing.
+    rng = random.Random(943)
+    pieces = [
+        '"password":"', '\\"api_key\\": \\"', '"Secret" : "', "abc", '"', '\\"', "\\\\", ",", "}",
+        " ", "…", "[redacted]", "A_TOKEN=", "api_key=", "?token=",
+    ]  # fmt: skip
+    for _ in range(20_000):
+        text = scrub("".join(rng.choice(pieces) for _ in range(rng.randint(1, 8))))
+        if scrub(text) != text:
+            continue
+        cap = rng.randint(1, len(text) + 2)
+        cut = bounded(text, cap)
+        again = scrub(cut)
+        assert len(again) <= cap, (text, cap, cut, again)
+        if cut != text and cut:
+            assert again.endswith("…"), (text, cap, cut, again)
+
+
+def test_members_are_read_in_linear_time():
+    started = time.monotonic()
+    for text in (
+        '"password":"' * 30_000,
+        '{"password":"' + '\\\\\\"secret\\\\\\":\\\\\\"' * 20_000,
+        '"secret":"' + "\\" * 200_000 + "x",
+        '"secret":"' + '\\\\\\"' * 50_000,
+        '{"password":"x",' * 30_000,
+    ):
+        scrub(text)
+        bounded(text, len(text) - 1)
+    assert time.monotonic() - started < 2.0
