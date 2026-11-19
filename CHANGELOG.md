@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.198.4] - 2026-11-18
+
 ### Fixed: A key in a query stops at a `"`, and no literal value opens at the close of the JSON string it sits in (issue #939)
 
 A scrubbed line logged inside a JSON string could lose the string's close and the rest of the line, with no key shipped. The commonest shape was a URL with a key in its query: `{"h":"url?api_key=K9…","k":"v"}` scrubbed to `{"h":"url[redacted]`. An empty value did the same: `{"h":"api_key=","k":"v"}` scrubbed to `{"h":"[redacted]"k":"v"}`.
