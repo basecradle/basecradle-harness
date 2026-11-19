@@ -237,14 +237,17 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: the quote, and ``api_key=KBearer eyJ…`` or ``?token=KBearer eyJ…`` ended the value at the scheme
 #: word and left its token to no rule. Each value is two alternatives, the first a value ending in a
 #: glued ``bearer`` and its token, written without lookaround for the box's VRL. **An ``api_key=``
-#: value may open with an escaped quote, escaped any number of times, and ends at its escaped close**
-#: (issue #934): ``api_key=\"K9…\"`` once matched ``api_key=\`` alone and shipped the key, and in a
-#: JSON string (``{"h":"api_key=\"K9…\""}``) the line no longer parsed. The value's run still stops
-#: at the ``"``, and the backslashes before it escape that quote, so they are left with it
-#: (`_literal_end`): the key goes, and the escaped close stays to keep the JSON whole.
+#: value may open with an escaped quote, at any depth, and ends at its escaped close** (issue #934):
+#: ``api_key=\"K9…\"`` once matched ``api_key=\`` alone and shipped the key, and in a JSON string
+#: (``{"h":"api_key=\"K9…\""}``) the line no longer parsed. A quote is escaped by an odd run of
+#: backslashes; after an even run it is a real quote, the backslashes escaping each other
+#: (``{"h":"api_key=\\","k":"v"}``), and is never taken as an opener. The value's run still stops at
+#: the ``"``, and as many backslashes before it as the opener carried escape that quote, so they are
+#: left with it (`_literal_end`): the key goes, and the escaped close stays to keep the JSON whole.
 #:
-#: **A literal rule reads on through a label its value ends in** (`_literal_spans`): a value stops at
-#: a quote, a blank or a backslash, and the label of the next value can stand just before that stop,
+#: **A literal rule reads on through a label its value ends in** (`_literal_spans`): a value stops
+#: where its run does (at a blank, a ``"`` or a ``&`` for ``api_key=``; a blank or a ``&`` for a
+#: query; a blank, a quote, a backslash or a ``&`` for a header), and the label of the next value can stand just before that stop,
 #: so the value ends in the next label (``api_key=x,api_key="eyJ…"``, whose value is ``x,api_key=``
 #: up to the quote; ``x-api-key: "x-api-key": "K9…"``, the review of #929). Each search starts past
 #: the last match, so the value after that label once went to no rule. The span now ends where the
@@ -285,7 +288,7 @@ _QUERY = re.compile(
     rf"(?:{_QUERY_RUN}*?(?P<glued>(?i:bearer))\s+[A-Za-z0-9._~+/-]{{8,}}|{_QUERY_RUN}+))"
 )
 _API_KEY_LABEL = r"(?i:api[-_]?key=)"
-_API_KEY_OPENER = r'(?:\\*")?'
+_API_KEY_OPENER = r'(?:(?:\\(?:\\\\)*)?")?'
 _API_KEY_RUN = r"[^&\s\"]"
 _API_KEY = re.compile(
     f"(?P<label>{_API_KEY_LABEL})(?P<opener>{_API_KEY_OPENER})(?P<value>{_SCHEME_WORDS}"
@@ -932,7 +935,7 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
     ``x,api_key=`` up to the quote; ``x-api-key: "x-api-key": "K9…"``, ``x-api-key: x-api-key:Bearer
     K9…``), and the value after it would then be matched by nothing, since each search starts past
     the last match (the review of #929, issue #934). So while a match whose label stands in the
-    value reaches further, it is read too, and the span ends where the last one does. Only two
+    value reaches further, it is read too, and the span ends where the last one does. Only three
     places hold such a label, because a label anywhere else is followed by the run the value
     already read, which stops where the value stops:
 
@@ -982,14 +985,17 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
 
 
 def _literal_end(match: re.Match[str]) -> int:
-    """Where a literal rule's `match` ends as a span: its end, but before the backslashes that
-    escape the quote its value stops at, when the value opened with an escaped quote (issue #934).
-    The key goes and its escaped close stays, so a JSON string the key was quoted in still parses
-    (``{"h":"api_key=\\"K9…\\""}`` scrubs to ``{"h":"[redacted]\\""}``)."""
+    """Where a literal rule's `match` ends as a span: its end, but before the escape of the quote its
+    value stops at, when the value opened with an escaped quote (issue #934). The close is escaped
+    as deeply as the opener, so as many backslashes as the opener carried are left with it, and no
+    more: one before them is the value's own escaped backslash. The key goes and its escaped close
+    stays, so a JSON string the key was quoted in still parses (``{"h":"api_key=\\"K9…\\""}``
+    scrubs to ``{"h":"[redacted]\\""}``)."""
     end, text = match.end(), match.string
-    if not (match.groupdict().get("opener") or "").startswith("\\") or text[end : end + 1] != '"':
+    depth = len(match.groupdict().get("opener") or "") - 1
+    if depth <= 0 or text[end : end + 1] != '"':
         return end
-    floor = match.start("value")
+    floor = max(match.start("value"), end - depth)
     while end > floor and text[end - 1] == "\\":
         end -= 1
     return end

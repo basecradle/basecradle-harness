@@ -822,6 +822,22 @@ def test_an_api_key_in_a_json_string_leaves_the_line_parseable(depth):
     assert scrubbed == '[redacted]" sent'
 
 
+@pytest.mark.parametrize("value", ["\\", "\\\\", "x\\", "K9\\\\"])
+@pytest.mark.parametrize("separators", [(",", ":"), (", ", ": ")])
+def test_a_quote_after_an_even_run_of_backslashes_is_no_opener(value, separators):
+    # The review of #934: an even run escapes itself, so the quote after it closes the JSON string,
+    # and taken as an escaped opener it took that close and the line no longer parsed.
+    line = json.dumps({"h": f"api_key={value}", "k": "v"}, separators=separators)
+    assert json.loads(scrub(line)) == {"h": "[redacted]", "k": "v"}
+
+
+def test_the_close_is_escaped_as_deeply_as_the_opener_and_no_deeper():
+    # The value ends in its own escaped backslash: only the close's one backslash stays with it.
+    assert scrub('api_key=\\"K9fabricated\\\\\\" n') == '[redacted]\\" n'
+    line = json.dumps({"h": 'api_key="K9fabricated\\" sent'})
+    assert json.loads(scrub(line)) == {"h": '[redacted]" sent'}
+
+
 def test_no_chain_of_labels_or_escapes_lets_an_api_key_through():
     rng = random.Random(934)
     labels = ["api_key=", "api-key=", "APIKEY=", "X-API-KEY=", "?token=", "x-api-key: "]
