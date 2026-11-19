@@ -245,7 +245,7 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: the ``"``. **Whatever the value opened with, an odd run of backslashes before that quote is left
 #: whole** (`_literal_end`, issue #937): the run escapes the quote, how much of it is the value's own
 #: depends on a depth no reading of the run can tell, and every JSON string the line held parses only
-#: while it stays. So the key goes, and the line and every string nested in it still parse. Until
+#: while it stays. So the key goes, and no string loses its close to the run. Until
 #: #937 a value with no escaped opener took the run, the escape of the line's own closing quote with
 #: it (``{"log": "{\"h\":\"api_key=x\\\\\"}"}``), and the line no longer parsed.
 #:
@@ -962,6 +962,7 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
     - **Just before the value's glued scheme word**, when the value ended in one and its token
       (``api_key=\\"api_key=bearer<TAB>X-API-KEY=``): that label reads the scheme word as its own
       and then its run, which is wider than a token and goes on past it.
+
     So only `_LITERAL_REACH` before each is searched, and the rule stays linear. In order, since each
     span starts no earlier than the one before it ends."""
     reach, labelled = _LITERAL_REACH[rule], "label" in rule.groupindex
@@ -999,11 +1000,13 @@ def _literal_end(match: re.Match[str]) -> int:
     After an odd run the quote is escaped, and the run is left whole: how much of it is the quote's
     escape and how much the value's own escaped backslashes depends on how deeply the quote is
     nested, which no reading of the run can tell, and every JSON string the line held parses as it
-    did only while the run stays. So the key goes and every string it was nested in still parses,
-    the line's own and each inside it (``{"h":"api_key=\\"K9…\\""}`` scrubs to
+    did only while the run stays. So the key goes and no string it was nested in loses its close to
+    the run, the line's own or one inside it (``{"h":"api_key=\\"K9…\\""}`` scrubs to
     ``{"h":"[redacted]\\""}``, and ``{"log": "{\\"h\\":\\"api_key=x\\\\\\\\\\"}"}`` to
     ``{"log": "{\\"h\\":\\"[redacted]\\\\\\\\\\"}"}``). After an even run the quote is a real one, the
-    backslashes escaping each other, and they go with the value. A backslash is never a key's."""
+    backslashes escaping each other, and they go with the value. A backslash is never a key's. (An
+    inner string's real close after an even run, none included, reaches the line as an odd run and
+    is read as an escaped opener: that inner string loses its close, the limit `_ESCAPE` states.)"""
     end, text = match.end(), match.string
     if text[end : end + 1] != '"':
         return end
