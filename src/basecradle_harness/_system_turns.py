@@ -28,10 +28,11 @@ served, beside ``AI_MODEL``.
 `before_user` is the whole rule, and it is narrower than what the Anthropic and Google adapters do
 (they have no system role inside the conversation at all, so every system turn after the head reads
 as a labelled user turn). **A system turn keeps its role exactly where a user turn follows it** (a
-run of system turns counting as one, so ``developer, developer, user`` is kept whole): the brief, a
-leading system prompt, a compaction summary at the head of the kept conversation. **Every other one
-is sent as a user turn marked `SYSTEM_LABEL`**, so the model can still tell the harness's note from
-a peer's words. That covers the trailing step note and also every earlier step note in the
+run of system turns counting as one, so ``developer, developer, user`` is kept whole): the brief of a
+new turn, a leading system prompt, a compaction summary at the head of the kept conversation. A
+resumed turn has its brief spliced at the tail, before the step note, so there it is labelled too.
+**Every other one is sent as a user turn marked `SYSTEM_LABEL`**, so the model can still tell the
+harness's note from a peer's words. That covers the trailing step note and also every earlier step note in the
 transcript, which a later call finds followed by the assistant turn it preceded: a request then
 holds only the orders measured as accepted, never ``developer, assistant``, which was not measured.
 It also keeps a tool loop's prefix byte-stable: a note sent last is relabelled, and once the reply it

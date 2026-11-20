@@ -20,12 +20,19 @@ import httpx
 import pytest
 import respx
 
-from basecradle_harness import Engine, Message, Tool, ToolRegistry
+from basecradle_harness import Engine, Message, Tool, ToolCall, ToolRegistry
 from basecradle_harness import _basecradle as basecradle
 from basecradle_harness._basecradle import (
     _config_from_env,
     _provider_from_config,
     system_turns_from_env,
+)
+from basecradle_harness._describer import (
+    DESCRIBER_API_KEY_VAR,
+    DESCRIBER_MODEL_VAR,
+    DESCRIBER_PROVIDERS_VAR,
+    IMAGE_OUTPUT_BUDGET,
+    describer_from_env,
 )
 from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._openai_wire import chat_message_to_wire, message_to_input
@@ -233,20 +240,36 @@ def test_before_user_sends_the_step_notes_as_marked_user_turns(surface):
 
 @pytest.mark.parametrize("surface", ["responses", "chat"])
 def test_nothing_declared_leaves_the_wire_exactly_as_it_was(surface):
-    """Every request byte for byte what the adapter's own renderer makes of the transcript."""
+    """Every request byte for byte what the adapter's own renderer makes of the transcript.
+
+    Both steps: the second carries the first step's note before the assistant turn it preceded,
+    which is the turn `before_user` would relabel.
+    """
     first, second = _loop(surface, ANYWHERE)
     assert _roles(surface, first) == "USUS"
     assert _roles(surface, second) == "USUSATS"
-    transcript = _conversation()
+    key = "input" if surface == "responses" else "messages"
     render = (
         (lambda ms: [i for m in ms for i in message_to_input(m)])
         if surface == "responses"
         else (lambda ms: [chat_message_to_wire(m) for m in ms])
     )
-    key = "input" if surface == "responses" else "messages"
-    sent = first[key]
-    expected = render([*transcript, Message.system(_last_text(surface, first))])
-    assert sent == expected
+    note_1, note_2 = _last_text(surface, first), _last_text(surface, second)
+    call = ToolCall(id="call_0001", name="echo", arguments={})
+    transcript = [
+        *_conversation(),
+        Message.system(note_1),
+        Message.assistant(tool_calls=[call]),
+        Message.tool("call_0001", "echoed"),
+        Message.system(note_2),
+    ]
+    assert first[key] == render(transcript[:4])
+    assert second[key] == render(transcript)
+    # Nothing but the messages moved: the rest of the payload is the same between the two settings.
+    declared_first, _ = _loop(surface, BEFORE_USER)
+    assert {k: v for k, v in first.items() if k != key} == {
+        k: v for k, v in declared_first.items() if k != key
+    }
 
 
 def test_the_adapter_refuses_a_placement_it_does_not_know():
@@ -333,11 +356,17 @@ def test_every_openai_sdk_cell_honours_it(kimi_env, surface):
         built.close()
 
 
-def test_a_second_model_on_the_brains_stack_never_inherits_it(kimi_env):
-    """The describer builds through the same seam with no `system_turns`: a different model."""
+def test_the_describer_on_the_brains_stack_never_inherits_it(kimi_env):
+    """Built through the describer's own entry point, on the brain's SDK, under a declared brain."""
     kimi_env.setenv("AI_SYSTEM_TURNS", BEFORE_USER)
-    built = _provider_from_config(VENDOR, "openai", "chat", model="another-model")
+    kimi_env.setenv(DESCRIBER_MODEL_VAR, "another-model")
+    kimi_env.setenv(DESCRIBER_API_KEY_VAR, "abl_describer0123456789abcdefghijklmnopqrstuvwxyzAB")
+    kimi_env.setenv(DESCRIBER_PROVIDERS_VAR, VENDOR)
+    describer = describer_from_env()
+    assert describer is not None and describer.fault is None
+    built = describer._provider_for(IMAGE_OUTPUT_BUDGET)
     try:
+        assert built.model == "another-model"
         assert built.system_turns == ANYWHERE
     finally:
         built.close()
