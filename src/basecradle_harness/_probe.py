@@ -9,7 +9,8 @@ whose `probe=` hook all three reconcilers pass). The marker is identical across 
 the carrier field differs (a message body, a webhook payload, a task's instructions). This
 module is the recognition + ack half of all three contracts, and the recognition half of a second
 kind of marker, `MARKED_SCHEME` (``BCNOC2``): a real wake that runs as any other and is not mined
-(issue #950). That one is bound to the timeline it was posted on (`marked_payload`).
+(issue #950). That one is bound to the timeline it was posted on and to the account that posted it
+(`marked_payload`).
 
 It is the **verifying mirror** of basecradle-noc's ``src/basecradle_noc/marker.py`` (the
 sender half). The two live in separate repos — harness cannot import the NOC package, and
@@ -84,32 +85,41 @@ MARKED_SCHEME = "BCNOC2"
 _MARKED_RE = re.compile(rf"\b{MARKED_SCHEME} (?P<nonce>{_NONCE}) (?P<hmac>[0-9a-f]{{64}})\b")
 
 
-def marked_payload(nonce: str, timeline: str) -> bytes:
-    """The bytes a `MARKED_SCHEME` marker signs: the scheme, **the timeline it was posted on**, the nonce.
+def marked_payload(nonce: str, timeline: str, author: str) -> bytes:
+    """The bytes a `MARKED_SCHEME` marker signs: the scheme, the timeline, the author, the nonce.
 
-    Bound to the timeline so a marker copied into a message on any other timeline fails, and that
-    message is mined like any other: the signature proves the NOC minted the marker for the
-    timeline the harness is reading, not merely that it minted it once (issue #950). The one place
-    the signed bytes are decided, so the NOC's half (`marker.py`) and this one agree on one line.
+    ``BCNOC2 <timeline-uuid> <author-uuid> <nonce>``, both uuids in canonical lowercase. Bound to
+    **the timeline it was posted on and the account that posted it**, so a marker is good for one
+    message's author on one timeline and nothing else: a copy pasted into a message on any other
+    timeline, or into a message by anyone else on the same one, fails, and that message is mined
+    like any other (issue #950). The signature proves the NOC minted the marker for this message's
+    author here, not merely that it minted it once. The one place the signed bytes are decided, so
+    the NOC's half (`marker.py`) and this one agree on one line.
     """
-    return f"{MARKED_SCHEME} {timeline.strip().lower()} {nonce}".encode()
+    return f"{MARKED_SCHEME} {_canonical(timeline)} {_canonical(author)} {nonce}".encode()
 
 
-def verify_marked(body: str, secret: str, timeline: str) -> str | None:
-    """Return the nonce if ``body`` carries a valid `MARKED_SCHEME` marker for ``timeline``, else ``None``.
+def _canonical(uuid: str) -> str:
+    return uuid.strip().lower()
 
-    The first marker in ``body`` is the one judged, as `verify_probe` judges its first. The
-    signature is compared in constant time; an unsigned, wrongly-signed or other-timeline marker is
-    ``None``: an ordinary message in every respect. A `SCHEME` marker never matches here.
+
+def verify_marked(body: str, secret: str, timeline: str, author: str) -> str | None:
+    """The nonce of a valid `MARKED_SCHEME` marker for this ``timeline`` and ``author``, else ``None``.
+
+    ``author`` is the uuid of the account that posted ``body``, as the platform asserts it.
+
+    **Every** marker line in ``body`` is judged, each on its own, and the first that verifies is the
+    answer: one check message may carry a line for each of several agents, and every agent but the
+    first would otherwise read another agent's line and never its own. Accepting any is no wider
+    than accepting the first, because each line is verified alone. The signature is compared in
+    constant time; an unsigned, wrongly-signed, other-timeline or other-author marker is ``None``: an
+    ordinary message in every respect. A `SCHEME` marker never matches here.
     """
-    match = _MARKED_RE.search(body)
-    if match is None:
-        return None
-    expected = hmac.new(
-        secret.encode(), marked_payload(match.group("nonce"), timeline), sha256
-    ).hexdigest()
-    if hmac.compare_digest(expected, match.group("hmac")):
-        return match.group("nonce")
+    for match in _MARKED_RE.finditer(body):
+        payload = marked_payload(match.group("nonce"), timeline, author)
+        expected = hmac.new(secret.encode(), payload, sha256).hexdigest()
+        if hmac.compare_digest(expected, match.group("hmac")):
+            return match.group("nonce")
     return None
 
 

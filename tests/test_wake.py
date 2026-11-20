@@ -6961,16 +6961,19 @@ def test_an_undecodable_claim_reads_as_done_and_never_fails_the_wake(platform, t
 # timeline it is posted on. The wake runs as any other, model and reply included, and posts no
 # mechanical ack; the only difference is that the exchange is never handed to memory. Anything
 # that does not verify (forged, signed for another timeline, no secret on the box) is an ordinary
-# message, mined like any other: nobody can make an agent forget a real conversation.
+# message, mined like any other. Only a message's body is read for it.
 
 from basecradle_harness import MemoryProvider  # noqa: E402
 
 OTHER_TIMELINE = "019e7750-66ee-7f53-829f-13a8a710b6db"
 
 
-def marked_marker(nonce=PROBE_NONCE, secret=PROBE_SECRET, timeline=TIMELINE_UUID):
-    """A BCNOC2 line signed over "BCNOC2 <timeline> <nonce>" (mirrors the NOC's mint)."""
-    signed = f"BCNOC2 {timeline} {nonce}".encode()
+def marked_marker(nonce=PROBE_NONCE, secret=PROBE_SECRET, timeline=TIMELINE_UUID, author=JOHN_UUID):
+    """A BCNOC2 line signed over "BCNOC2 <timeline> <author> <nonce>" (mirrors the NOC's mint).
+
+    The fixtures' messages are John's, so John is the author a marker is good for by default.
+    """
+    signed = f"BCNOC2 {timeline} {author} {nonce}".encode()
     return f"BCNOC2 {nonce} {hmac.new(secret.encode(), signed, sha256).hexdigest()}"
 
 
@@ -7014,10 +7017,11 @@ def test_a_marked_real_wake_is_answered_and_not_mined(platform, tmp_path, caplog
     [
         (f"BCNOC2 {PROBE_NONCE} {'0' * 64}", PROBE_SECRET),  # forged
         (marked_marker(timeline=OTHER_TIMELINE), PROBE_SECRET),  # a real one, from elsewhere
+        (marked_marker(author=PEER_AI_UUID), PROBE_SECRET),  # a real one, pasted by John
         (marked_marker(), None),  # no secret on this box
         (marked_marker(), ""),  # a blank secret
     ],
-    ids=["forged", "another-timeline", "no-secret", "blank-secret"],
+    ids=["forged", "another-timeline", "another-author", "no-secret", "blank-secret"],
 )
 def test_a_marker_that_does_not_verify_is_an_ordinary_message(platform, tmp_path, marker, secret):
     serve_messages(platform, page(message(uuid=M0, body=f"Please remember this. {marker}")))
@@ -7031,15 +7035,16 @@ def test_a_marker_that_does_not_verify_is_an_ordinary_message(platform, tmp_path
     assert marker in memory.observed[0].user
 
 
-def test_a_batch_with_one_unmarked_message_is_mined_whole(platform, tmp_path):
-    """The forbidden harm is a real message forgotten, so a mixed turn is mined."""
+@pytest.mark.parametrize("marked_newest", [False, True])
+def test_a_batch_with_one_unmarked_message_is_mined_whole(platform, tmp_path, marked_newest):
+    """The forbidden harm is a real message forgotten, so a mixed turn is mined, in either order."""
     MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)
+    bodies = ["My birthday is March 3.", f"NOC check. {marked_marker()}"]
+    if marked_newest:
+        bodies.reverse()
     serve_messages(
         platform,
-        page(
-            message(uuid=M1, body="My birthday is March 3."),
-            message(uuid=M0, body=f"NOC check. {marked_marker()}"),
-        ),
+        page(message(uuid=M1, body=bodies[0]), message(uuid=M0, body=bodies[1])),
     )
     agent, _, memory = _marked_wake(tmp_path, probe_secret=PROBE_SECRET)
 
@@ -7066,8 +7071,8 @@ def test_a_marked_message_in_a_seeded_backlog_is_not_mined_and_the_rest_is(platf
     assert not any("BCNOC2" in user for user in mined)
 
 
-def test_a_marked_task_is_answered_and_not_mined(platform, tmp_path):
-    """The marker rides the same carrier fields as the probe (`_carrier`)."""
+def test_a_marker_outside_a_message_body_is_never_read(platform, tmp_path):
+    """The NOC posts BCNOC2 only in a message; any other carrier is surface nothing needs."""
     instructions = f"NOC task check: post ok.\n{marked_marker()}"
     serve_messages(platform, page())
     serve_tasks(platform, task_page(task(uuid=T0, instructions=instructions)))
@@ -7076,8 +7081,68 @@ def test_a_marked_task_is_answered_and_not_mined(platform, tmp_path):
     agent.wake()
 
     assert len(provider.prompts) == 1 and instructions in provider.prompts[0]
-    assert _posts(platform) == ["Hello, John."]
+    assert len(memory.observed) == 1
+    for kind, carrier in (
+        (wake_module._TASKS, {"instructions": marked_marker()}),
+        (wake_module._EVENTS, {"payload": marked_marker()}),
+        (wake_module._ASSETS, {"description": marked_marker()}),
+    ):
+        item = SimpleNamespace(
+            user=SimpleNamespace(uuid=JOHN_UUID), content=SimpleNamespace(**carrier)
+        )
+        assert agent._marked(item, kind) is False
+    marked_message = SimpleNamespace(
+        user=SimpleNamespace(uuid=JOHN_UUID), content=SimpleNamespace(body=marked_marker())
+    )
+    assert agent._marked(marked_message, wake_module._MESSAGES) is True
+
+
+def test_a_check_message_carrying_several_agents_lines_marks_each(platform, tmp_path):
+    """Every line is verified on its own, so the line for another agent never hides this one's."""
+    others = marked_marker(secret="another-agents-secret", nonce="ffff")
+    body = f"NOC check for two agents.\n{others}\n{marked_marker()}"
+    serve_messages(platform, page(message(uuid=M0, body=body)))
+    agent, _, memory = _marked_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    agent.wake()
+
     assert memory.observed == []
+
+
+@pytest.mark.parametrize("marked_first", [True, False])
+def test_a_resumed_turn_is_marked_only_when_it_carried_that_one_item(
+    platform, tmp_path, marked_first, caplog
+):
+    """End to end on the resume path: a dead marked turn alone is not mined; with a mate it is."""
+    marked_body = f"NOC check. {marked_marker()}"
+    alone = marked_first
+    items = [M0] if alone else [M0, M1]
+    listed = [message(uuid=M0, body=marked_body)]
+    if not alone:
+        listed.insert(0, message(uuid=M1, body="My birthday is March 3."))
+    serve_messages(platform, page(*listed))
+    crashed_wake_owning(tmp_path, *items)
+    session = Harness(CountingProvider(), home=tmp_path).session(f"timeline:{TIMELINE_UUID}")
+    session.history.append(Message(role="user", content="[t] john: the turn", items=items))
+    session.history.append(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="noop", arguments={})])
+    )
+    session.history.append(Message.tool(tool_call_id="c1", content="ok"))
+    session._save()
+    memory = _Mined()
+    agent, _ = build_wake(
+        tmp_path,
+        CountingProvider(speak=False),
+        memory_provider=memory,
+        probe_secret=PROBE_SECRET,
+    )
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert any("resuming" in r.getMessage() for r in caplog.records)  # the resume path ran
+    assert len(memory.observed) == (0 if alone else 1)
+    assert any("reason=marked" in r.getMessage() for r in caplog.records) is alone
 
 
 def test_the_synthetic_probe_is_unchanged_beside_the_marked_wake(platform, tmp_path):
@@ -7094,7 +7159,9 @@ def test_the_synthetic_probe_is_unchanged_beside_the_marked_wake(platform, tmp_p
 def test_a_recovered_turn_counts_as_marked_only_when_it_carried_that_one_item(platform, tmp_path):
     """A resumed or stalled turn may have answered a batch whose mates are known only by uuid."""
     agent, _, _ = _marked_wake(tmp_path, probe_secret=PROBE_SECRET)
-    item = SimpleNamespace(content=SimpleNamespace(uuid=M0, body=marked_marker()))
+    item = SimpleNamespace(
+        user=SimpleNamespace(uuid=JOHN_UUID), content=SimpleNamespace(uuid=M0, body=marked_marker())
+    )
     alone = Message.user(content="x")
     alone.items = [M0]
     batch = Message.user(content="x")

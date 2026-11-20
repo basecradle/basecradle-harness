@@ -3506,16 +3506,20 @@ class WakeAgent:
         A **marked real wake**: the NOC's own verification wake (a roll, a move, a check on demand,
         basecradle-noc#1636), which runs as any other wake, model included, and is not handed to
         memory (`_observe`). Off unless `NOC_PROBE_SECRET` was provisioned, exactly as the probe is:
-        with no secret nothing verifies, and a marked item is an ordinary one. The marker is read
-        from the same field as the probe's (`_carrier`) and bound to this timeline
-        (`_probe.marked_payload`), so a copy of a real marker pasted into a message anywhere else is
-        an ordinary message, mined like any other: nobody can make an agent forget a real
-        conversation by calling it a probe.
+        with no secret nothing verifies, and a marked item is an ordinary one.
+
+        **A message only.** The NOC posts the marker only in the body of a real platform message, so
+        a task's instructions, a webhook payload and an asset's description are never read for it:
+        each is a field someone who has seen a marker could paste it into, and nothing needs them.
+        The marker is bound to this timeline and to the message's author, as the platform asserts it
+        (`_probe.marked_payload`), so a copy in a message on any other timeline, or in a message by
+        anyone else on this one, is an ordinary message, mined like any other.
         """
-        if not self.probe_secret:
+        if kind != _MESSAGES or not self.probe_secret:
             return False
         secret = self.probe_secret.reveal()
-        return verify_marked(_carrier(item, kind), secret, self.timeline_uuid) is not None
+        carrier = _carrier(item, kind)
+        return verify_marked(carrier, secret, self.timeline_uuid, item.user.uuid) is not None
 
     def _turn_marked(self, turn: Message, item: object, kind: str) -> bool:
         """Whether a recovered turn (a resume, a stall) was a marked real wake and nothing else.
@@ -5483,9 +5487,9 @@ def _carrier(item: object, kind: str) -> str:
     """The field of an item a NOC marker rides in: one mapping, read by both marker kinds.
 
     A message's body, a task's instructions, a webhook delivery's payload, an asset's description
-    (`_asset_marker_carrier`). The synthetic probe (`BCNOC1`, `_probe_nonce`) and the marked real
-    wake (`BCNOC2`, `WakeAgent._marked`) read the same field of the same item, so the two can never
-    disagree about where a marker is.
+    (`_asset_marker_carrier`). The synthetic probe (`BCNOC1`, `_probe_nonce`) reads all four; the
+    marked real wake (`BCNOC2`, `WakeAgent._marked`) reads a message's, through the same mapping, so
+    the two can never disagree about where a message's marker is.
     """
     if kind == _ASSETS:
         return _asset_marker_carrier(item)

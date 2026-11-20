@@ -73,49 +73,67 @@ from basecradle_harness._probe import marked_payload, verify_marked  # noqa: E40
 
 TIMELINE = "019e7750-66ee-7f53-829f-13a8a710b6da"
 OTHER_TIMELINE = "019e7750-66ee-7f53-829f-13a8a710b6db"
-# The pinned vector for BCNOC2: HMAC-SHA256 over "BCNOC2 <timeline> <nonce>" under SECRET. The NOC's
-# mint must produce exactly this; do not regenerate without the NOC side agreeing on #950.
-MARKED_HMAC = "26a9203bd55f36a47731f03315514e40930eced3ec72f14377922a41c1a3400c"
+AUTHOR = "019e7750-66ee-7e50-9e54-3bf8c3d6a8f1"  # the account that posts the check message
+OTHER_AUTHOR = "019e7756-9f60-7a80-93a4-6f7081920314"
+# The pinned vector for BCNOC2: HMAC-SHA256 over "BCNOC2 <timeline> <author> <nonce>" under SECRET.
+# The NOC's mint must produce exactly this; do not regenerate without the NOC side agreeing on #950.
+MARKED_HMAC = "3440fafd154ebf299e6873ae65d8bb85d6917c469ce41a99ab05e7f759cb2008"
 MARKED = f"BCNOC2 {NONCE} {MARKED_HMAC}"
 
 
-def marked(nonce, timeline=TIMELINE, secret=SECRET):
-    sig = hmac.new(secret.encode(), marked_payload(nonce, timeline), sha256).hexdigest()
+def marked(nonce, timeline=TIMELINE, author=AUTHOR, secret=SECRET):
+    sig = hmac.new(secret.encode(), marked_payload(nonce, timeline, author), sha256).hexdigest()
     return f"BCNOC2 {nonce} {sig}"
 
 
-def test_the_marked_pinned_vector_verifies_on_its_timeline():
-    assert marked_payload(NONCE, TIMELINE) == f"BCNOC2 {TIMELINE} {NONCE}".encode()
-    assert verify_marked(f"NOC check.\n{MARKED}", SECRET, TIMELINE) == NONCE
+def _signed_over(text):
+    return f"BCNOC2 {NONCE} {hmac.new(SECRET.encode(), text.encode(), sha256).hexdigest()}"
 
 
-def test_a_marked_copy_on_another_timeline_does_not_verify():
-    """A real marker pasted elsewhere is an ordinary message: nobody can make an agent forget one."""
-    assert verify_marked(MARKED, SECRET, TIMELINE) == NONCE
-    assert verify_marked(MARKED, SECRET, OTHER_TIMELINE) is None
+def test_the_marked_pinned_vector_verifies_for_its_timeline_and_author():
+    assert marked_payload(NONCE, TIMELINE, AUTHOR) == f"BCNOC2 {TIMELINE} {AUTHOR} {NONCE}".encode()
+    assert verify_marked(f"NOC check.\n{MARKED}", SECRET, TIMELINE, AUTHOR) == NONCE
 
 
-def test_a_marker_signed_without_its_timeline_never_verifies():
-    """The signed bytes name the timeline; a line signed over "BCNOC2 <nonce>" alone is forged."""
-    unbound = hmac.new(SECRET.encode(), f"BCNOC2 {NONCE}".encode(), sha256).hexdigest()
-    for timeline in (TIMELINE, OTHER_TIMELINE):
-        assert verify_marked(f"BCNOC2 {NONCE} {unbound}", SECRET, timeline) is None
+def test_a_copy_on_another_timeline_or_by_another_author_does_not_verify():
+    """A real marker pasted anywhere else is an ordinary message: the bytes name both."""
+    assert verify_marked(MARKED, SECRET, TIMELINE, AUTHOR) == NONCE
+    assert verify_marked(MARKED, SECRET, OTHER_TIMELINE, AUTHOR) is None
+    assert verify_marked(MARKED, SECRET, TIMELINE, OTHER_AUTHOR) is None
 
 
-def test_the_timeline_is_read_as_the_harness_records_it():
-    assert verify_marked(MARKED, SECRET, f" {TIMELINE.upper()} ") == NONCE
+def test_a_marker_signed_without_its_timeline_or_its_author_never_verifies():
+    """A mutation that drops either binding is caught here, not only by a copy failing."""
+    for text in (
+        f"BCNOC2 {NONCE}",
+        f"BCNOC2 {TIMELINE} {NONCE}",
+        f"BCNOC2 {AUTHOR} {NONCE}",
+    ):
+        for timeline, author in ((TIMELINE, AUTHOR), (OTHER_TIMELINE, OTHER_AUTHOR)):
+            assert verify_marked(_signed_over(text), SECRET, timeline, author) is None
+
+
+def test_the_uuids_are_read_in_their_canonical_form():
+    assert verify_marked(MARKED, SECRET, f" {TIMELINE.upper()} ", AUTHOR.upper()) == NONCE
 
 
 def test_a_wrongly_signed_or_misshapen_marked_line_does_not_verify():
-    assert verify_marked(marked(NONCE, secret="another-secret"), SECRET, TIMELINE) is None
-    assert verify_marked(f"BCNOC2 {NONCE} {'0' * 64}", SECRET, TIMELINE) is None
-    assert verify_marked(f"BCNOC2 {NONCE}", SECRET, TIMELINE) is None
-    assert verify_marked("", SECRET, TIMELINE) is None
+    assert verify_marked(marked(NONCE, secret="another-secret"), SECRET, TIMELINE, AUTHOR) is None
+    assert verify_marked(f"BCNOC2 {NONCE} {'0' * 64}", SECRET, TIMELINE, AUTHOR) is None
+    assert verify_marked(f"BCNOC2 {NONCE}", SECRET, TIMELINE, AUTHOR) is None
+    assert verify_marked("", SECRET, TIMELINE, AUTHOR) is None
+
+
+def test_every_marker_line_is_judged_on_its_own():
+    """A forged or another agent's line first never hides a valid one after it."""
+    other = marked("ffff", secret="another-agents-secret")
+    assert verify_marked(f"{other}\n{MARKED}", SECRET, TIMELINE, AUTHOR) == NONCE
+    assert verify_marked(f"BCNOC2 {NONCE} {'0' * 64}\n{MARKED}", SECRET, TIMELINE, AUTHOR) == NONCE
+    assert verify_marked(f"{other}\n{other}", SECRET, TIMELINE, AUTHOR) is None
 
 
 def test_the_two_kinds_never_stand_in_for_each_other():
     """A BCNOC2 is never acked as a probe, and a BCNOC1 never marks a real wake."""
     assert verify_probe(MARKED, SECRET) is None
-    assert verify_marked(MARKER, SECRET, TIMELINE) is None
-    forged_as_probe = MARKED.replace("BCNOC2", "BCNOC1")
-    assert verify_probe(forged_as_probe, SECRET) is None
+    assert verify_marked(MARKER, SECRET, TIMELINE, AUTHOR) is None
+    assert verify_probe(MARKED.replace("BCNOC2", "BCNOC1"), SECRET) is None
