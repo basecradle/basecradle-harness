@@ -257,7 +257,7 @@ def your_home_text() -> str:
     """The "Your Home" section exactly as the package ships it — the file's text, unmodified.
 
     Read on demand rather than at import: a package missing its own data file is a broken install,
-    and the wake reports that loudly as one missing part (`_wake.WakeAgent._your_home`) rather than
+    and the wake reports that loudly as one missing part (`_wake._your_home_part`) rather than
     as an import error that would take every wake down with it.
     """
     return (

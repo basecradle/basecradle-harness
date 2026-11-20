@@ -217,7 +217,7 @@ def test_the_945_shape_is_refused_with_the_vendors_400_when_nothing_is_declared(
     assert "Invalid or unsupported request parameters" in verdict["error"]
     assert verdict["system_turns"] == "anywhere"
     assert (len(sent), verdict["rounds"]) == (1, 0)
-    assert FAKE_KEY not in out and USER_TURN not in out
+    assert FAKE_KEY not in out
 
 
 def test_the_945_shape_is_accepted_when_before_user_is_declared(agent, capsys, monkeypatch):
@@ -448,3 +448,136 @@ def test_what_a_fault_is_decides_its_verdict(agent, capsys, monkeypatch, raised,
     got, report, _ = _run(capsys)
     assert (got, report["verdict"]) == (code, verdict)
     assert str(raised) in report["error"]
+
+
+# --- the review's findings (issue #947) -----------------------------------------------------------
+
+
+def _install(agent) -> None:
+    from basecradle_harness._install import install
+
+    install(agent / "config", provider=VENDOR)
+
+
+def _count(sent: list[dict], text: str) -> int:
+    return sum((m.get("content") or "").count(text) for body in sent[:1] for m in body["messages"])
+
+
+def test_on_an_installed_home_the_charter_rides_the_brief_once(agent, capsys):
+    """A wake clears the turn-0 charter when onboarding is on (`seat_charter`); so must the check."""
+    _install(agent)
+    with respx.mock(assert_all_mocked=True) as router:
+        sent = _vendor(router, [_reply(content="Hello.")])
+        code, _, _ = _run(capsys)
+    assert code == 0
+    assert _roles(sent[0]) == "SUS"
+    assert _count(sent, "How to Operate Here") == 1
+
+
+def test_with_onboarding_off_the_installed_charter_is_the_turn_zero_seed(
+    agent, capsys, monkeypatch
+):
+    _install(agent)
+    monkeypatch.setenv("HARNESS_ONBOARD", "0")
+    with respx.mock(assert_all_mocked=True) as router:
+        sent = _vendor(router, [_reply(content="Hello.")])
+        _run(capsys)
+    assert _roles(sent[0]) == "SUS"
+    assert _count(sent, "How to Operate Here") == 1
+    assert "<initialize.md>" not in sent[0]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize("status", [503, 429])
+def test_a_vendor_that_could_not_answer_is_failed_with_its_status(agent, capsys, status):
+    """Overloaded or rate-limited after the retries is no verdict on the request."""
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        router.post(f"{HOST}/chat/completions").mock(
+            return_value=httpx.Response(status, json={"error": {"message": "try later"}})
+        )
+        code, verdict, _ = _run(capsys)
+    assert (code, verdict["verdict"], verdict["status"]) == (69, "failed", status)
+
+
+def test_a_transient_fault_is_retried_as_a_wake_retries_it(agent, capsys, monkeypatch):
+    monkeypatch.delenv("HARNESS_RESPONSE_RETRIES")
+    monkeypatch.setattr("basecradle_harness._engine.time.sleep", lambda seconds: None)
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        router.get(f"{HOST}/models").mock(
+            return_value=httpx.Response(200, json={"object": "list", "data": []})
+        )
+        route = router.post(f"{HOST}/chat/completions").mock(
+            side_effect=[
+                httpx.Response(503, json={"error": {"message": "busy"}}),
+                httpx.Response(200, json=_reply(content="Hello.")),
+            ]
+        )
+        code, verdict, _ = _run(capsys)
+    assert (code, verdict["rounds"], route.call_count) == (0, 1, 2)
+    assert [c["outcome"] for c in verdict["calls"]] == ["retrying", "ok"]
+    assert verdict["usage"]["calls"] == 1
+
+
+@pytest.mark.parametrize(
+    ("raised", "verdict", "code"),
+    [
+        # The `openai` SDK's closed signature on a model_params.json key it does not take.
+        (TypeError("create() got an unexpected keyword argument 'temprature'"), "config_error", 64),
+        # Anything else is the harness's own fault: still a verdict, named by its type.
+        (TypeError("'NoneType' object is not subscriptable"), "failed", 69),
+        (AttributeError("no attribute 'choices'"), "failed", 69),
+    ],
+)
+def test_every_fault_is_a_verdict_never_a_traceback(
+    agent, capsys, monkeypatch, raised, verdict, code
+):
+    def chat(self, messages, tools=None):
+        raise raised
+
+    monkeypatch.setattr(OpenAIProvider, "chat", chat)
+    got, report, _ = _run(capsys)
+    assert (got, report["verdict"]) == (code, verdict)
+    assert str(raised) in report["error"]
+
+
+def test_a_fault_while_building_is_a_verdict_too(agent, capsys, monkeypatch):
+    def unreadable():
+        raise PermissionError("prompts/system-prompt.md: Permission denied")
+
+    monkeypatch.setattr("basecradle_harness._wake.charter_from_env", unreadable)
+    code, verdict, _ = _run(capsys)
+    assert (code, verdict["verdict"]) == (64, "config_error")
+    assert "Permission denied" in verdict["error"]
+
+
+def test_a_step_budget_of_one_is_judged_by_its_reserve_call(agent, capsys, monkeypatch):
+    monkeypatch.setenv("HARNESS_MAX_STEPS", "1")
+    with respx.mock(assert_all_mocked=True) as router:
+        sent = _vendor(router, [_tool_reply(), _reply(content="Here is where I got to.")])
+        code, verdict, _ = _run(capsys)
+    assert (code, verdict["verdict"], verdict["rounds"], verdict["reserve"]) == (0, "ok", 2, True)
+    assert "tools" not in sent[1]
+
+
+def test_a_refused_reserve_call_is_refused_with_the_vendors_status(agent, capsys, monkeypatch):
+    monkeypatch.setenv("HARNESS_MAX_STEPS", "1")
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        router.get(f"{HOST}/models").mock(
+            return_value=httpx.Response(200, json={"object": "list", "data": []})
+        )
+        router.post(f"{HOST}/chat/completions").mock(
+            side_effect=[httpx.Response(200, json=_tool_reply()), httpx.Response(400, json=REFUSAL)]
+        )
+        code, verdict, _ = _run(capsys)
+    assert (code, verdict["verdict"], verdict["status"]) == (70, "refused", 400)
+
+
+def test_the_configured_key_is_removed_by_value_whatever_its_shape(agent, capsys, monkeypatch):
+    """A generic vendor's key may have no shape the scrub knows; it never reaches the verdict."""
+    odd = "zq7Hd9LmPx2Vb8Nc4Rt6Wy1Ka3Ej5Gs0"
+    monkeypatch.setenv("AI_API_KEY", odd)
+    echoed = {"error": {"message": f"key {odd} is not valid for this model"}}
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        router.post(f"{HOST}/chat/completions").mock(return_value=httpx.Response(400, json=echoed))
+        code, verdict, out = _run(capsys)
+    assert code == 70 and odd not in out
+    assert "is not valid for this model" in verdict["error"]

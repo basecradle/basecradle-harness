@@ -13,32 +13,39 @@ form, and the form is why it is stated:
   and the tool set a wake resolves — through the same functions (`_config_from_env`,
   `_resolve_tools`, `brain_from_config`). ``--model-params`` names a candidate file, read by the
   reader a wake uses, so a change is checked before it is written into the agent's home.
-- **The request is built by the engine, never copied.** A `Harness` built as a wake builds one,
-  an in-memory `Session` on it, and the brief composed by the wake's own composition
-  (`_wake.wake_brief_parts`): the charter, the brief before a fixed user turn, the step note after
-  it, every tool definition the resolved set exposes. A request assembled here would be a second
-  model of the wake's, and it would stop matching the day the first one changed, which is the
-  failure this check exists to catch. The two parts only a platform or a memory read can supply,
-  the live dashboard and the recalled memory, are absent, as they are on a wake whose dashboard
-  fetch failed and whose provider recalled nothing; both ride inside the brief, so the order of
-  roles a vendor judges is the wake's.
-- **At most two rounds.** When the model calls a tool, the call is answered with a fixed result
+- **The request is built by the engine, never copied.** The `Harness` comes from the wake's own
+  builder (`_wake.wake_harness`) under the wake's own charter rule (`_wake.seat_charter`), the
+  brief from the wake's own composition (`_wake.wake_brief_parts`), and an in-memory `Session` on
+  it sends the turn: the brief before a fixed user turn, the step note after it, every tool
+  definition the resolved set exposes. A request assembled here would be a second model of the
+  wake's, and it would stop matching the day the first one changed, which is the failure this check
+  exists to catch; the first draft of this module built its own `Harness` and sent the charter
+  twice, which is that failure. The two parts only a platform or a memory read can supply, the live
+  dashboard and the recalled memory, are absent, as they are on a wake whose dashboard fetch failed
+  and whose provider recalled nothing; both ride inside the brief, so the order of roles a vendor
+  judges is the wake's. It models a **first** wake: a standing agent's transcript is not replayed.
+- **At most two steps.** When the model calls a tool, the call is answered with a fixed result
   (`STAND_IN_RESULT`) and the engine sends its second step, so the order of a later step is tested
   too — the order #945's fix had to cover. A turn hook ends the run after a second reply that still
-  calls tools (`_Rounds`), before a third request can be sent; it never ends a run the model ended.
-- **It writes nothing and touches nothing.** No platform client is built, no transcript or claim is
-  written (the session has no path), no memory is read or written, and no tool runs: every resolved
-  tool is offered through a `StandIn` that carries its definition and returns the fixed result. The
-  config-home reconcile a wake runs first is skipped, because it writes; the overlay is read as it
-  stands, as ``--resolved-config`` reads it. MCP servers start only so their tool lists can be read,
-  and stop with the process.
-- **One JSON verdict on stdout, and the exit code says the same thing**: ``ok`` (0) with each
-  call's usage; ``refused`` (70) with the vendor's HTTP status and its error text, scrubbed as every
-  logged value is; ``config_error`` (64); ``failed`` (69) when no answer came at all (a timeout, a
-  dropped connection, a response nobody could read), which is not a refusal and not a
-  configuration fault, and which reporting as either would be a false verdict. No key and no prompt
-  text is ever in it. The journal lines a wake writes (``llm``, ``tool``, the step ledger) go to
-  stderr as they would on a wake.
+  calls tools (`_Rounds`), before a third step; it never ends a run the model ended. A step's
+  transient fault is retried as a wake retries it (``HARNESS_RESPONSE_RETRIES``), so one step may
+  be more than one request.
+- **It writes nothing and runs none of the agent's tools.** No platform client is built, no
+  transcript or claim is written (the session has no path), no memory is read or written, and every
+  resolved tool is offered through a `StandIn` that carries its definition and returns the fixed
+  result. A server-side built-in (a vendor's web search, code execution) is offered as a wake
+  offers it, so the vendor may run it, and bill it, inside the call. The config-home reconcile a
+  wake runs first is skipped, because it writes; the overlay is read as it stands, as
+  ``--resolved-config`` reads it. MCP servers start only so their tool lists can be read, and stop
+  with the process.
+- **One JSON verdict on stdout, whatever happens, and the exit code says the same thing**: ``ok``
+  (0) with each call's usage; ``refused`` (70) with the vendor's HTTP status and its error text;
+  ``config_error`` (64); ``failed`` (69) when no answer came (a timeout, a dropped connection, a
+  response nobody could read, the vendor's own 5xx or a rate limit outlasting the retries, or a
+  fault in the harness itself), which is not a refusal of the request and not a configuration
+  fault, so reporting it as either would be a false verdict. Error text is scrubbed as every logged
+  value is, and the configured key is removed by value as well. The journal lines a wake writes
+  (``llm``, ``tool``, the step ledger) go to stderr as they would on a wake.
 """
 
 from __future__ import annotations
@@ -54,30 +61,29 @@ from typing import Any
 from basecradle_harness._basecradle import (
     _config_from_env,
     _configure_logging,
-    _max_steps_from_env,
     _onboard_from_env,
-    _profile_from_env,
     _resolve_tools,
-    _response_retries_from_env,
     brain_from_config,
     system_turns_from_env,
 )
 from basecradle_harness._brief import brief_section_sizes, join_brief
 from basecradle_harness._exceptions import (
+    EngineError,
     HarnessError,
     ProviderAPIError,
     ProviderConnectionError,
+    ProviderRateLimitError,
     ProviderResponseError,
+    ProviderServerError,
     ProviderToolSchemaError,
 )
 from basecradle_harness._harness import Harness
-from basecradle_harness._install import charter_from_env
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import FAILED, RETRYING, scrub, tally_llm_calls
 from basecradle_harness._plugins import ResolvedTools
 from basecradle_harness._provider import Provider
 from basecradle_harness._tools import Tool
-from basecradle_harness._wake import wake_brief_parts
+from basecradle_harness._wake import seat_charter, wake_brief_parts, wake_harness
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -90,7 +96,7 @@ FAILED_VERDICT = "failed"
 #: ``EX_UNAVAILABLE`` for a call that got no answer, and ``EX_SOFTWARE`` for a vendor's refusal.
 EXIT_CODES = {OK: 0, CONFIG_ERROR: 64, FAILED_VERDICT: 69, REFUSED: 70}
 
-#: The most model calls one check makes: the first step, and the second when the first called a tool.
+#: The most engine steps one check runs: the first, and the second when the first called a tool.
 ROUNDS = 2
 
 #: The session the check's turn runs in. Only an adapter that routes by conversation reads it.
@@ -109,12 +115,19 @@ USER_TURN = (
 STAND_IN_RESULT = "Done."
 
 #: What a configuration fault raises while the brain is built or before a request is sent. A plain
-#: `ProviderError` is one: an adapter raises it for a request its SDK would not send.
-_CONFIG_FAULTS = (HarnessError, ValueError, KeyError, ImportError)
+#: `ProviderError` (a `HarnessError`) is one: an adapter raises it for a request its SDK would not
+#: send. An `OSError` is a prompt file that cannot be read.
+_CONFIG_FAULTS = (HarnessError, ValueError, KeyError, ImportError, OSError)
 
-#: What a call that got no usable answer raises: a timeout or a dropped connection
-#: (`ProviderConnectionError`), or a response nobody could read (`ProviderResponseError`).
-_NO_ANSWER = (ProviderConnectionError, ProviderResponseError)
+#: What a call that got no usable answer raises: a timeout or a dropped connection, a response
+#: nobody could read, the vendor's own 5xx, and a rate limit that outlasted the retries. None of
+#: them is the vendor judging the request, so none is a refusal.
+_NO_ANSWER = (
+    ProviderConnectionError,
+    ProviderResponseError,
+    ProviderServerError,
+    ProviderRateLimitError,
+)
 
 
 class StandIn(Tool):
@@ -123,7 +136,8 @@ class StandIn(Tool):
     The definition is the real tool's, read through it (`to_spec`), so the request offers exactly
     what a wake's does; its capabilities and its load refusal are the real tool's too, so the policy
     admits the same set. Only `run` differs, and that is the point: a check that ran the real tool
-    would post, spend or write.
+    would post, spend or write. It takes any arguments, so a malformed call gets the fixed result
+    where a wake would refuse it: that changes the second step's content, never its order.
     """
 
     def __init__(self, real: Tool) -> None:
@@ -153,8 +167,8 @@ class _Rounds:
 
     The engine calls it after each step's tool calls are answered. It returns ``False`` (extend
     nothing) until `ROUNDS` replies have come back; a reply after that which still calls tools
-    would send a third request, so it raises instead. A reply that ends the turn ends it as it
-    would on a wake.
+    would send a third step, so it raises instead. A reply that ends the turn ends it as it would
+    on a wake.
     """
 
     def __init__(self) -> None:
@@ -170,8 +184,20 @@ class _Rounds:
 
 
 def check(model_params: str | os.PathLike[str] | None = None) -> dict[str, Any]:
-    """Run the check and return its verdict (see the module docstring for what each one means)."""
+    """Run the check and return its verdict (see the module docstring for what each one means).
+
+    Every outcome is a verdict, a fault in the harness itself included: the command's contract is
+    one JSON object on stdout, and a traceback in its place is a verdict nobody can read.
+    """
     report: dict[str, Any] = {}
+    try:
+        return _check(model_params, report)
+    except Exception as error:  # noqa: BLE001 - the command always states a verdict
+        _log.error("The brain check failed inside the harness.", exc_info=True)
+        return _verdict(FAILED_VERDICT, report, error=f"{type(error).__name__}: {_text(error)}")
+
+
+def _check(model_params: str | os.PathLike[str] | None, report: dict[str, Any]) -> dict[str, Any]:
     try:
         provider_name, sdk, surface = _config_from_env()
         report.update(
@@ -199,23 +225,17 @@ def check(model_params: str | os.PathLike[str] | None = None) -> dict[str, Any]:
 def _send(provider: Provider, resolved: ResolvedTools, report: dict[str, Any]) -> dict[str, Any]:
     rounds = _Rounds()
     try:
-        _, policy = _profile_from_env()
-        # Built as `WakeAgent.from_env` builds its `Harness`, with three differences, each one of
-        # the check's: stand-in tools, no home (nothing persists), and its own turn hook in place
-        # of the code-execution bridge's (which creates Assets) — and no compactor, so nothing but
-        # the one turn can call the model.
-        harness = Harness(
+        onboard = _onboard_from_env()
+        harness = wake_harness(
             provider,
-            system_prompt=charter_from_env(),
+            resolved,
             tools=[StandIn(tool) for tool in resolved.tools],
-            policy=policy,
-            max_steps=_max_steps_from_env(),
-            response_retries=_response_retries_from_env(),
-            server_builtins=resolved.builtins,
-            withheld_tools=resolved.withheld,
+            home=None,
             turn_hook=rounds,
+            compactor=None,
         )
-        brief, sections = _brief(harness, resolved) if _onboard_from_env() else (None, None)
+        seat_charter(harness, onboard=onboard)
+        brief, sections = _brief(harness, resolved) if onboard else (None, None)
     except _CONFIG_FAULTS as error:
         return _verdict(CONFIG_ERROR, report, error=_text(error))
     report["tools_offered"] = len(harness.tools.specs())
@@ -224,23 +244,50 @@ def _send(provider: Provider, resolved: ResolvedTools, report: dict[str, Any]) -
             harness.session(SOURCE).send(USER_TURN, brief=brief, brief_sections=sections)
         except _RoundsSpent:
             pass
-        except (ProviderAPIError, ProviderToolSchemaError) as error:
-            return _verdict(
-                REFUSED,
-                report,
-                rounds,
-                calls,
-                status=getattr(error, "status_code", None),
-                error=_text(error),
-            )
-        except _NO_ANSWER as error:
+        except EngineError as error:
+            # The reserve summary (a step budget of one, spent on a tool call): its own call. An
+            # empty answer is still an answer; a failed one is judged by what it failed on.
+            if error.reason == "reserve_empty":
+                return _verdict(OK, report, rounds, calls, reserve=True)
+            cause = error.__cause__
+            if isinstance(cause, Exception):
+                return _fault(cause, report, rounds, calls)
             return _verdict(FAILED_VERDICT, report, rounds, calls, error=_text(error))
-        except _CONFIG_FAULTS as error:
-            # A fault the build could not see, raised by the adapter as it shaped the request: a
-            # `model_params.json` key the SDK does not take is the common one (OpenRouter's typed
-            # SDK raises a plain `ProviderError` naming the file, a `HarnessError`).
-            return _verdict(CONFIG_ERROR, report, rounds, calls, error=_text(error))
-    return _verdict(OK, report, rounds, calls)
+        except Exception as error:  # noqa: BLE001 - classified by `_fault`, never swallowed
+            return _fault(error, report, rounds, calls)
+    reserve = harness.engine.reserve_used
+    return _verdict(OK, report, rounds, calls, **({"reserve": True} if reserve else {}))
+
+
+def _fault(
+    error: Exception,
+    report: dict[str, Any],
+    rounds: _Rounds,
+    calls: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """The verdict on a fault the turn raised: what kind of fault it is decides, never who raised it."""
+    status = getattr(error, "status_code", None)
+    fields: dict[str, Any] = {"error": _text(error)}
+    if status is not None:
+        fields["status"] = status
+    if isinstance(error, _NO_ANSWER):
+        return _verdict(FAILED_VERDICT, report, rounds, calls, **fields)
+    if isinstance(error, (ProviderAPIError, ProviderToolSchemaError)):
+        return _verdict(REFUSED, report, rounds, calls, **{"status": status, **fields})
+    if isinstance(error, _CONFIG_FAULTS) or _unexpected_keyword(error):
+        # A fault the build could not see, raised as the adapter shaped the request: a
+        # `model_params.json` key the SDK does not take is the common one. OpenRouter's adapter
+        # names it in a `ProviderError`; the `openai` SDK's closed signature raises a bare
+        # `TypeError`.
+        return _verdict(CONFIG_ERROR, report, rounds, calls, **fields)
+    _log.error("The brain check failed inside the harness.", exc_info=error)
+    fields["error"] = f"{type(error).__name__}: {fields['error']}"
+    return _verdict(FAILED_VERDICT, report, rounds, calls, **fields)
+
+
+def _unexpected_keyword(error: Exception) -> bool:
+    """An SDK call refusing a keyword it does not take — the only `TypeError` that is config's."""
+    return isinstance(error, TypeError) and "unexpected keyword argument" in str(error)
 
 
 def _brief(harness: Harness, resolved: ResolvedTools) -> tuple[str | None, dict[str, int] | None]:
@@ -256,8 +303,8 @@ def _brief(harness: Harness, resolved: ResolvedTools) -> tuple[str | None, dict[
             defects=resolved.broken,
             safety=resolved.notices,
             mcp_about=resolved.mcp_about,
-            dashboard=None,
-            memory=None,
+            dashboard=lambda: None,
+            memory=lambda: None,
         )
         return join_brief(parts), brief_section_sizes(parts)
     except Exception:  # noqa: BLE001 - the brief never breaks a wake, so it never breaks the check
@@ -276,7 +323,7 @@ def _verdict(
 ) -> dict[str, Any]:
     out = {"verdict": verdict, **report, **fields}
     if rounds is not None:
-        out["rounds"] = rounds.replies
+        out["rounds"] = rounds.replies + (1 if fields.get("reserve") else 0)
         out["tool_called"] = rounds.tool_called
         out["calls"] = list(calls)
         out["usage"] = _usage(calls)
@@ -301,8 +348,16 @@ def _usage(calls: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _text(error: BaseException) -> str:
-    """An error's text for the verdict: scrubbed as every logged value is, and never empty."""
-    return scrub(str(error)) or type(error).__name__
+    """An error's text for the verdict: never the configured key, scrubbed, and never empty.
+
+    The scrub knows credential *shapes*; a vendor echoing a key of a shape it does not know would
+    pass it. So the key this process was configured with is removed by value first.
+    """
+    text = str(error)
+    key = (os.environ.get("AI_API_KEY") or "").strip()
+    if len(key) >= 8:
+        text = text.replace(key, "[redacted]")
+    return scrub(text) or type(error).__name__
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -311,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Send one wake-shaped request to the configured brain and print a JSON verdict: "
             "ok (exit 0), refused (70), config_error (64) or failed (69). Writes nothing; "
-            "calls no platform API, reads no memory and runs no tool."
+            "calls no platform API, reads no memory and runs none of the agent's tools."
         ),
     )
     parser.add_argument(
