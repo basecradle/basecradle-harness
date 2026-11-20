@@ -198,11 +198,11 @@ The harness's members (`_observability._VERDICT_VALUES` for the `outcome=` pairs
 |---|---|---|
 | Success | `wake start`, `wake continuing`, `wake billing_recovered`, `Wake breaker RESET`, `palace scrub` (an apply that found nothing to remove) | `ok` |
 | Bookend | `wake end` | — |
-| Warning | `wake skipped`, `wake deferred`, `wake truncated_turn`, `wake stalled`, `wake billing_blocked`, `degraded`, `Wake breaker TRIPPED`, `palace scrub` (a dry run) | `degraded`, `retrying`, `refused`, `fallback` |
+| Warning | `wake skipped`, `wake deferred`, `wake truncated_turn`, `wake stalled`, `wake billing_blocked`, `degraded`, `Wake breaker TRIPPED`, `palace scrub` (a dry run) | `degraded`, `retrying`, `refused`, `fallback`, `deferred` |
 | Operator's Choice | `wake stopped` | `stopped` |
 | Failure | `wake failed`, `wake reported_failure`, `post failed`, `cleanup failed`, `cleanup blocked`, `palace scrub failed`, `palace scrub` (an apply that removed what the harness mined) | `error`, `failed` |
 
-The Operator's Choice tier's members across the fleet today: `outcome=stopped` (the router's `stage=wake` line, and the harness's `wake end`), `event=wake_stopped` (the router), and the harness's `wake stopped`. The router's members of the other tiers are its own `logfmt.PALETTE`, pinned by its `tests/test_logfmt.py`; its Warning tier includes `outcome=deferred`, a wake that exited `75` and is scheduled to be tried again (basecradle-router#527, the router's half of harness issue #951). The harness writes no `outcome=deferred`: a wake that gives up on an outage still ends `wake end … outcome=error`. `tests/test_telemetry_contract.py` holds the harness to this section: the SGR of every tier, and the `outcome=` vocabulary in both directions.
+The Operator's Choice tier's members across the fleet today: `outcome=stopped` (the router's `stage=wake` line, and the harness's `wake end`), `event=wake_stopped` (the router), and the harness's `wake stopped`. The router's members of the other tiers are its own `logfmt.PALETTE`, pinned by its `tests/test_logfmt.py`; its Warning tier includes `outcome=deferred`, a wake that exited `75` and is scheduled to be tried again (basecradle-router#527, the router's half of harness issue #951). The harness's `wake end` says the same word for the same ending (issue #957): a wake that gives up on an outage while another attempt follows ends `outcome=deferred`, and only the last attempt, or a wake no attempt follows, ends `outcome=error`. `tests/test_telemetry_contract.py` holds the harness to this section: the SGR of every tier, and the `outcome=` vocabulary in both directions.
 
 ## Model Calls
 
@@ -265,10 +265,10 @@ Each outcome has a strict set of fields it requires and a set it never carries, 
 
 **Severity is a rule of the line, and every producer follows it** (capital ruling, 2026-11-03, issue #786). A `failed` line is ERROR in exactly two cases:
 
-- **A harness brain call the engine gave up on** after a transient fault exhausted its retries. It replaces the prose ERROR give-up line it retired, one for one, so the page that line raised is unchanged. This is the case the ruling names.
+- **A harness brain call the engine gave up on** after a transient fault exhausted its retries. It replaces the prose ERROR give-up line it retired, one for one, so the page that line raised is unchanged. This is the case the ruling names. **Except while the router's next attempt follows** (issue #957, `_attempts.another_attempt_follows`): the give-up ends the wake on an outage, which exits `75` and is tried again, so the line is WARNING. A give-up the engine catches itself (the reserve summary's) never reaches the wake, no attempt follows it, and it stays ERROR on every attempt.
 - **A harness second model's `config:` failure** (the reranker, the describer, search grounding), the first in a wake; a repeat in the same wake is DEBUG. A config-class fault is dead until a human acts, so it pages once. This is the second-model rule (`CLAUDE.md` → Second Models), which the ruling leaves as it stands.
 
-Every other `failed` line is WARNING: a brain call that ended any other way (the wake's own lines carry the verdict a human acts on, `wake reported_failure` and `wake failed`), a second model's runtime-class failure, and **every failed call a Claude Code builder makes**, its auxiliary `purpose=helper` calls and their `config:` causes included, until basecradle#726's open question, whether a builder's failed call pages, is ruled. A `retrying` line is always WARNING, and so are `refused` and an unreadable answer's `fallback`. A wake that dies of a model call therefore writes two lines about two units: the call's `llm … outcome=failed timeline=… step=…`, and the wake's own `wake failed`.
+Every other `failed` line is WARNING: a brain call that ended any other way (the wake's own lines carry the verdict a human acts on, `wake reported_failure` and `wake failed`), a second model's runtime-class failure, and **every failed call a Claude Code builder makes**, its auxiliary `purpose=helper` calls and their `config:` causes included, until basecradle#726's open question, whether a builder's failed call pages, is ruled. A `retrying` line is always WARNING, and so are `refused` and an unreadable answer's `fallback`. A wake that dies of a model call therefore writes two lines about two units: the call's `llm … outcome=failed timeline=… step=…`, and the wake's own `wake failed`. On an outage another of the router's attempts follows, the call's line is WARNING and the wake writes no `wake failed`; its `wake end … outcome=deferred` is the wake's line (issue #957). A resume's timeout on the harness's own budget is the turn's fault, not an outage: its wake exits `0`, so its give-up stays ERROR on every attempt (`Engine.resuming`).
 
 The NOC's reading (basecradle-noc#1212): every series that counts, times or prices **calls** reads the billed lines, `llm provider=` lines whose `outcome` is neither `retrying` nor `failed`. The match is unanchored, because the verdict token is colored on every box. Retries and failures are series of their own, by `provider` and `purpose`.
 
@@ -525,7 +525,7 @@ Another pass of the same wake, because work arrived while it ran.
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
 | `timeline` | Common. | The wake. | Never. |
-| `outcome` | `ok` (every reconcile returned), `error`, or `stopped` (the wake received SIGTERM — the router's `stop-wake` — and settled what it held; it matches the router's own `stage=wake outcome=stopped`, and is not a failure: the fleet's `wake_failed` reads `outcome=error` only). | The wake. | Never. |
+| `outcome` | `ok` (every reconcile returned, or the wake held for its outage notice: `wake skipped reason=outage_notice`), `error`, `deferred` (the wake gave up on an outage and exits `75`, and another of the router's attempts follows, `BASECRADLE_WAKE_ATTEMPT` below `BASECRADLE_WAKE_ATTEMPTS`; it matches the router's own `stage=wake outcome=deferred`, and is not a failure, issue #957), or `stopped` (the wake received SIGTERM — the router's `stop-wake` — and settled what it held; it matches the router's own `stage=wake outcome=stopped`, and is not a failure: the fleet's `wake_failed` reads `outcome=error` only). An outage on the last attempt, or on a wake run with neither attempt variable, is `error`. | The wake. | Never. |
 | `signal` | The signal that stopped the wake, without its `SIG` prefix: `TERM`. | The wake. | `outcome` is not `stopped`. |
 | `turns` | Turns the engine ran. | The engine. | Never. |
 | `steps` | Model steps used, as `used/budget`. | The engine. | Never. |
@@ -587,7 +587,7 @@ An item a stopped wake held in flight, settled so no later wake resumes or re-dr
 
 A permanent, billing or outage model failure reported to the timeline (`_wake._report_provider_failure`, `_report.billing_onset_line`, `_wake.WakeAgent._gave_up`). NOC-alarmed on `kind=billing` only (*LLM Vendor Payment Failed*, basecradle-noc#317).
 
-`kind=outage` (issue #951) is written once per outage per timeline, by the router's last attempt at a delivery (`BASECRADLE_WAKE_ATTEMPT` equal to `BASECRADLE_WAKE_ATTEMPTS`), and only when its notice posted: a temporary fault outlasted every in-call retry and the wake is giving up with its work pending. The same wake still writes `wake failed` when the fault propagated, and exits `75`.
+`kind=outage` (issue #951) is written once per outage per timeline, by the router's last attempt at a delivery (`BASECRADLE_WAKE_ATTEMPT` equal to `BASECRADLE_WAKE_ATTEMPTS`), and only when its notice posted: a temporary fault outlasted every in-call retry and the wake is giving up with its work pending. The same wake still writes `wake failed` when the fault propagated, and exits `75`. The marker holds the notice's own uuid (issue #957), so the wake the notice's delivery starts can tell it apart: on a timeline whose outage is announced, a wake that finds no peer item that no wake has tried (no message, asset or webhook event above the notice in uuid order, none past its kind's mark left unclaimed, and no activated task that no wake has claimed or recorded) does no model work, writes `wake skipped reason=outage_notice`, and exits `0`, so the notice starts no second chain of attempts. A marker with no uuid (written before #957), or a listing the platform will not give, attempts the work as before.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
@@ -624,13 +624,13 @@ The debounced repeat for every later wake an out-of-funds account blocks (`_repo
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
-| `timeline` | Common. | The entrypoint. | Never. |
+| `timeline` | Common. | The entrypoint, or the wake. | Never. |
 | `delivery` | Common. | The environment. | As Common. |
-| `reason` | `timeline_deleted`. | The entrypoint. | Never. |
+| `reason` | `timeline_deleted` (the entrypoint: the delivery's timeline is gone), or `outage_notice` (the wake: an outage was announced on this timeline and no peer item is there that no wake has tried, so the waiting work is not attempted, issue #957; see [`wake reported_failure`](#wake-reported_failure)). | The entrypoint, or the wake. | Never. |
 
 ### `wake failed`
 
-A wake that ended on a fault. The entrypoint exits `75` (`EX_TEMPFAIL`) when that fault is a temporary provider fault that outlasted every in-call retry (an outage, issue #951), and `1` for every other.
+A wake that ended on a fault. The entrypoint exits `75` (`EX_TEMPFAIL`) when that fault is a temporary provider fault that outlasted every in-call retry (an outage, issue #951), and `1` for every other. **An outage another attempt follows writes no `wake failed`**, at any level (issue #957): the wake was deferred, which its `wake end … outcome=deferred` says, and the call's own `llm … outcome=failed` (WARNING) says why. It is never re-headed as `wake deferred`, the per-item line.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|

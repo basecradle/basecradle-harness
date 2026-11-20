@@ -67,6 +67,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
+from uuid import UUID
 
 from basecradle_harness._exceptions import (
     TRANSIENT_FAILURES,
@@ -432,7 +433,8 @@ class TimelineNotice:
     An account-level or vendor-level outage is noticed *per timeline* — each conversation (and each
     peer AI on it) deserves to be told once, and no more. So the debounce is a marker file per
     timeline beside the wake's other stores (`marks/`, `seen/`, `claims/`, `breaker/`) under the
-    agent's home, holding the time the outage was first announced there. Each kind of notice is one
+    agent's home, holding the time the outage was first announced there (the outage marker holds
+    the notice's uuid instead, `OutageState`, issue #957). Each kind of notice is one
     subclass naming its folder and suffix, and the orphan sweep purges each by that exact name
     (`_cleanup.enumerate_artifacts`), so a new kind is one subclass and one line there.
 
@@ -526,3 +528,36 @@ class OutageState(TimelineNotice):
 
     FOLDER = "outage"
     SUFFIX = ".notified"
+
+    def note(self, timeline: str, *, notice: str | None = None) -> None:
+        """Record that this outage has been announced on `timeline`, by the notice `notice`.
+
+        The marker holds the notice's own uuid (issue #957), which is what lets a later wake tell
+        the delivery of the harness's own notice from a peer's new item (`notice`). Without one it
+        holds the time, as every marker before #957 did. A write failure is logged.
+        """
+        if notice is None:
+            super().note(timeline)
+            return
+        path = self._path(timeline)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(notice)
+        except OSError as error:
+            _log.warning("Could not persist the %s marker for %s: %s", self.FOLDER, timeline, error)
+
+    def notice(self, timeline: str) -> str | None:
+        """The uuid of the notice that announced the outage on `timeline`, or ``None`` (issue #957).
+
+        ``None`` when no outage is announced here, and also when the marker holds no uuid: one
+        written before #957 (it holds the time), or one that cannot be read. Each of those reads as
+        "no notice to compare with", so the wake does what it did before, and attempts the work.
+        """
+        try:
+            text = self._path(timeline).read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        try:
+            return str(UUID(text))
+        except ValueError:
+            return None

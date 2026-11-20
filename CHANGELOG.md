@@ -7,6 +7,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.204.0] - 2026-11-20
+
+### Changed: A retried attempt is not a failure, and the outage notice does not start a new chain (issue #957)
+
+Two findings from the live proof of issue #951. `@origin`, on the first: *"'fail' shouldn't alarm until it has failed! NOT while it is still trying!"*
+
+- **An attempt another follows is deferred, not failed.** A wake that gives up on an outage while the router's next attempt follows (`BASECRADLE_WAKE_ATTEMPT` below `BASECRADLE_WAKE_ATTEMPTS`) ends `wake end … outcome=deferred`, the router's own word for the same ending. It writes no `ERROR` line of any kind: the exhausted call's `llm … outcome=failed` is `WARNING`, a resume's absorbed outage traceback is `WARNING`, and no `wake failed` line is written (the capital's amendment; it is never re-headed as the per-item `wake deferred`). The exit stays `75`. Before, every attempt paged as a failure, 36 minutes before the wake had failed for good.
+- **The last attempt, and a wake outside the router, are unchanged:** `outcome=error`, the `ERROR` lines, the one notice. A broken attempt pair promises no next attempt, so it is unchanged too.
+- **A give-up the engine catches itself stays `ERROR` on every attempt.** The reserve summary's call never reaches the wake, so no attempt follows it (`Engine._chat(…, deferrable=False)`).
+- **The notice's own delivery does not attempt the waiting work.** The outage marker now holds the notice's uuid, and a wake on a timeline whose outage is announced first asks whether a peer's item is there that no wake has tried: a message, asset or webhook event above the notice in uuid order, or any peer item past its kind's mark that no wake has claimed (one that landed while the last attempt sat in its retries), or an activated task no wake has claimed or recorded. When none is, it does no model work, logs `wake skipped reason=outage_notice`, and exits `0`, so the notice starts no second chain. What is waiting is untouched for the next wake a new message or event starts. A marker written before this release, or a listing the platform will not give, attempts the work as before.
+- **A resume's timeout on the harness's own budget keeps its ERROR** on every attempt (`Engine.resuming`, set by `Session.resume`): the wake judges it the turn's fault and exits `0`, so no attempt follows it.
+- **New module `_attempts`** holds the router's attempt pair (`last_attempt`, moved from `_wake`, and `another_attempt_follows`), so the engine and the wake read one decision.
+- **Telemetry contract:** `deferred` joins the Warning tier's `outcome=` values; `wake end`, `wake failed`, `wake skipped` (`reason=outage_notice`), `wake reported_failure` and the `llm` severity rule state the new behavior.
+- **Fleet effect:** after the NOC converges this release, an outage pages once, at the end, and the notice is followed by one held wake instead of a second round of four attempts.
+
 ## [0.203.0] - 2026-11-20
 
 ### Removed: A `BCNOC1` probe marker in a platform item is no longer acked; it is ordinary content (issue #955)

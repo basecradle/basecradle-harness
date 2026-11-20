@@ -19,6 +19,7 @@ import logging
 import httpx
 import pytest
 import respx
+from basecradle import BaseCradleError
 
 from basecradle_harness import (
     Message,
@@ -34,7 +35,14 @@ from basecradle_harness import (
     ProviderTimeoutError,
     ToolCall,
 )
+from basecradle_harness import _attempts as attempts_module
 from basecradle_harness import _wake as wake_module
+from basecradle_harness._attempts import (
+    WAKE_ATTEMPT_ENV,
+    WAKE_ATTEMPTS_ENV,
+    another_attempt_follows,
+    last_attempt,
+)
 from basecradle_harness._cleanup import enumerate_artifacts
 from basecradle_harness._exceptions import TRANSIENT_FAILURES, ProviderAPIError
 from basecradle_harness._observability import RED, RESET
@@ -47,36 +55,42 @@ from basecradle_harness._report import (
 from basecradle_harness._stop import WakeStopped
 from basecradle_harness._wake import (
     EX_TEMPFAIL,
-    WAKE_ATTEMPT_ENV,
-    WAKE_ATTEMPTS_ENV,
     ClaimStore,
     MarkStore,
-    last_attempt,
 )
 from tests.conftest import plain
 from tests.test_wake import (
+    A1,
     BC_URL,
+    E1,
     M0,
+    M1,
     M4,
     PNG_BYTES,
     REPLY,
+    T0,
     TIMELINE_UUID,
     CountingProvider,
     RaisingProvider,
     _locked_problem,
     _posts,
+    asset,
     asset_page,
     build_wake,
     dashboard,
+    event,
     event_page,
     message,
     page,
     serve_messages,
+    task,
     task_page,
     timeline,
 )
 
 MESSAGES_URL = f"/timelines/{TIMELINE_UUID}/messages"
+#: A peer's message newer than every fixture message, `REPLY` (the posted notice) and `M4` included.
+M5 = "019e7757-2b3c-7d4e-8f50-6b7c8d9e0f1a"
 DOWN = "Upstream provider returned 503: service temporarily unavailable"
 NOTICE = "Automatic notice from this agent's harness"
 
@@ -251,6 +265,7 @@ def test_an_attempt_past_the_count_is_read_as_last(attempt):
 )
 def test_a_broken_attempt_pair_is_not_last_and_says_so(monkeypatch, caplog, number, of):
     """The router's contract broken costs a notice not posted, never one posted early."""
+    monkeypatch.setattr(attempts_module, "_reported", set())
     monkeypatch.setenv(WAKE_ATTEMPT_ENV, number)
     monkeypatch.setenv(WAKE_ATTEMPTS_ENV, of)
 
@@ -322,8 +337,14 @@ def test_the_last_attempt_tells_the_timeline_once(platform, tmp_path, attempt, c
 def test_one_outage_is_told_once_across_deliveries(platform, tmp_path, attempt):
     """A later delivery's last attempt during the same outage stays quiet."""
     attempt(4)
-    for _ in range(3):
-        serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    with pytest.raises(ProviderServerError):
+        _agent(tmp_path, RaisingProvider(_down())).wake()
+    # Two later deliveries, each a peer's new message: each is attempted, neither is told again.
+    timeline_so_far = [message(uuid=M0, body="are you there?")]
+    for newer in (M4, M5):
+        timeline_so_far.insert(0, message(uuid=newer, body="hello?"))
+        serve_messages(platform, page(*timeline_so_far))
         with pytest.raises(ProviderServerError):
             _agent(tmp_path, RaisingProvider(_down())).wake()
 
@@ -337,8 +358,12 @@ def test_success_resets_the_debounce_so_the_next_outage_is_told(platform, tmp_pa
         _agent(tmp_path, RaisingProvider(_down())).wake()
     assert OutageState(tmp_path).noted(TIMELINE_UUID)
 
-    # The vendor answers again: the pending message is answered and the marker cleared.
-    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    # The vendor answers again, and a peer's new message starts the wake: the pending message is
+    # answered with it and the marker cleared.
+    serve_messages(
+        platform,
+        page(message(uuid=M4, body="still there?"), message(uuid=M0, body="are you there?")),
+    )
     healthy = CountingProvider()
     _agent(tmp_path, healthy).wake()
     assert healthy.prompts != []
@@ -346,7 +371,7 @@ def test_success_resets_the_debounce_so_the_next_outage_is_told(platform, tmp_pa
 
     # The next outage is a new one, and the timeline is told again.
     serve_messages(
-        platform, page(message(uuid=M4, body="and now?"), message(uuid=M0, body="are you there?"))
+        platform, page(message(uuid=M5, body="and now?"), message(uuid=M4, body="still there?"))
     )
     with pytest.raises(ProviderServerError):
         _agent(tmp_path, RaisingProvider(_down())).wake()
@@ -581,3 +606,313 @@ def test_the_orphan_sweep_purges_a_deleted_timelines_outage_marker(tmp_path):
     artifacts = enumerate_artifacts(tmp_path)
 
     assert artifacts[TIMELINE_UUID] == [tmp_path / "outage" / f"{TIMELINE_UUID}.notified"]
+
+
+# --- a retried attempt is not a failure (issue #957) ---------------------------------------------
+#
+# `@origin`, on the live proof of #951: *"'fail' shouldn't alarm until it has failed! NOT while it
+# is still trying!"* While another attempt follows, a wake that gives up on an outage is deferred:
+# `wake end … outcome=deferred`, the exhausted call's `llm … outcome=failed` at WARNING, and no
+# ERROR line of any kind (the capital's amendment adds `wake failed` to the two the issue named).
+
+
+def _errors(caplog) -> list[str]:
+    return [plain(r.getMessage()) for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def _lines(caplog, prefix: str) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if plain(r.getMessage()).startswith(prefix)]
+
+
+def test_no_attempt_variables_is_no_promise_of_another(attempt):
+    assert not another_attempt_follows()
+
+
+@pytest.mark.parametrize(
+    ("number", "of", "follows"), [(1, 4, True), (3, 4, True), (4, 4, False), (5, 4, False)]
+)
+def test_another_attempt_follows_every_attempt_but_the_last(attempt, number, of, follows):
+    attempt(number, of)
+
+    assert another_attempt_follows() is follows
+
+
+@pytest.mark.parametrize(("number", "of"), [("four", "4"), ("0", "4"), ("", "4"), ("2", "")])
+def test_a_broken_attempt_pair_promises_no_other_attempt(monkeypatch, number, of):
+    """Nothing promises the next attempt, so the outage stays the failure it was."""
+    monkeypatch.setenv(WAKE_ATTEMPT_ENV, number)
+    monkeypatch.setenv(WAKE_ATTEMPTS_ENV, of)
+
+    assert not another_attempt_follows()
+
+
+@pytest.mark.parametrize("number", [1, 2, 3])
+def test_a_non_final_attempt_that_gives_up_is_deferred_and_writes_no_error(
+    platform, tmp_path, monkeypatch, attempt, caplog, number
+):
+    attempt(number)
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, RaisingProvider(_down())))
+
+    assert code == EX_TEMPFAIL
+    assert _errors(caplog) == []
+    (end,) = _lines(caplog, "wake end ")
+    assert "outcome=deferred" in plain(end.getMessage())
+    (failed,) = [r for r in _lines(caplog, "llm ") if "outcome=failed" in r.getMessage()]
+    assert failed.levelno == logging.WARNING
+    assert "reason=server_error" in plain(failed.getMessage())
+    # Not a `wake failed` at any level, and never re-headed as the per-item `wake deferred`.
+    assert _lines(caplog, "wake failed") == []
+    assert _lines(caplog, "wake deferred") == []
+    assert _notices(platform) == []
+    claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
+    assert claim is not None and claim.phase == "in-flight"  # kept for the next attempt
+
+
+def test_a_non_final_attempt_whose_resume_absorbed_the_outage_is_deferred_too(
+    platform, tmp_path, monkeypatch, attempt, caplog
+):
+    _died_mid_tool_chain(platform, tmp_path, _down())
+
+    attempt(2)
+    serve_messages(platform, page(message(uuid=M0, body="audit the repo")))
+    brain = _SpeaksThenFails(_down(), speaks=False)
+    caplog.clear()  # only this wake's lines
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, brain))
+
+    assert code == EX_TEMPFAIL
+    assert brain.calls >= 1  # it did resume
+    assert _errors(caplog) == []
+    (end,) = _lines(caplog, "wake end ")
+    assert "outcome=deferred" in plain(end.getMessage())
+    # The resume's traceback is kept, at WARNING.
+    (resume,) = _lines(caplog, "Resuming the interrupted turn failed")
+    assert resume.levelno == logging.WARNING and resume.exc_info is not None
+
+
+@pytest.mark.parametrize("last", [True, False], ids=["last_attempt", "outside_the_router"])
+def test_the_last_attempt_and_a_wake_outside_the_router_still_fail(
+    platform, tmp_path, monkeypatch, attempt, caplog, last
+):
+    """Nothing changes where no attempt follows: `outcome=error`, the ERROR lines, exit 75."""
+    if last:
+        attempt(4)
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, RaisingProvider(_down())))
+
+    assert code == EX_TEMPFAIL
+    (end,) = _lines(caplog, "wake end ")
+    assert "outcome=error" in plain(end.getMessage())
+    (failed,) = [r for r in _lines(caplog, "llm ") if "outcome=failed" in r.getMessage()]
+    assert failed.levelno == logging.ERROR
+    (wake_failed,) = _lines(caplog, "wake failed")
+    assert wake_failed.levelno == logging.ERROR
+    assert len(_notices(platform)) == (1 if last else 0)
+
+
+def test_a_give_up_the_engine_catches_itself_keeps_its_error_on_any_attempt(
+    platform, tmp_path, attempt, caplog
+):
+    """The reserve summary's give-up never reaches the wake, so no attempt follows it."""
+    attempt(1)
+    serve_messages(platform, page())
+    engine = _agent(tmp_path, RaisingProvider(_down())).harness.engine
+
+    for deferrable, level in ((True, logging.WARNING), (False, logging.ERROR)):
+        caplog.clear()
+        with (
+            caplog.at_level(logging.DEBUG, logger="basecradle_harness"),
+            pytest.raises(ProviderServerError),
+        ):
+            engine._chat([Message.user("hello")], None, deferrable=deferrable)
+        (failed,) = [r for r in _lines(caplog, "llm ") if "outcome=failed" in r.getMessage()]
+        assert failed.levelno == level
+
+
+# --- the notice does not start a chain of its own (issue #957) -----------------------------------
+
+
+def _notice_item():
+    return message(uuid=REPLY, body=f"{NOTICE} — its model did not write this.", mine=True)
+
+
+def _told(platform, home, attempt) -> None:
+    """The router's last attempt gives up and posts the notice (uuid `REPLY`)."""
+    attempt(4)
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    with pytest.raises(ProviderServerError):
+        _agent(home, RaisingProvider(_down())).wake()
+    assert OutageState(home).notice(TIMELINE_UUID) == REPLY
+
+
+def test_the_notices_own_delivery_does_not_attempt_the_waiting_work(
+    platform, tmp_path, monkeypatch, attempt, caplog
+):
+    _told(platform, tmp_path, attempt)
+
+    # The notice's delivery: the router's first attempt at it, nothing on the timeline after it.
+    attempt(1)
+    serve_messages(platform, page(_notice_item(), message(uuid=M0, body="are you there?")))
+    brain = RaisingProvider(_down())
+    caplog.clear()  # only this wake's lines
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, brain))
+
+    assert code == 0  # no 75, so no second chain
+    assert brain.calls == 0  # the waiting work was not attempted
+    assert _errors(caplog) == []
+    (skipped,) = _lines(caplog, "wake skipped ")
+    assert "reason=outage_notice" in plain(skipped.getMessage())
+    (end,) = _lines(caplog, "wake end ")
+    assert "outcome=ok" in plain(end.getMessage())
+    # Kept exactly as the notice says, for the next wake.
+    claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
+    assert claim is not None and claim.phase == "in-flight"
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) is None
+    assert OutageState(tmp_path).notice(TIMELINE_UUID) == REPLY
+    assert len(_notices(platform)) == 1
+
+
+def test_a_peers_new_message_after_the_notice_starts_the_waiting_work(platform, tmp_path, attempt):
+    _told(platform, tmp_path, attempt)
+
+    attempt(1)
+    serve_messages(
+        platform,
+        page(
+            message(uuid=M4, body="hello?"),
+            _notice_item(),
+            message(uuid=M0, body="are you there?"),
+        ),
+    )
+    healthy = CountingProvider()
+    _agent(tmp_path, healthy).wake()
+
+    assert healthy.prompts != []  # the vendor is back, and both messages were answered
+    assert not OutageState(tmp_path).noted(TIMELINE_UUID)
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").settled
+
+
+@pytest.mark.parametrize("kind", ["asset", "webhook_event", "task"])
+def test_any_new_kind_of_item_after_the_notice_starts_the_waiting_work(
+    platform, tmp_path, attempt, kind
+):
+    """A later event starts the next wake too, not only a message."""
+    _told(platform, tmp_path, attempt)
+    if kind == "asset":
+        newer = asset(uuid=A1, filename="notes.txt", content_type="text/plain")
+        platform.get("/assets").mock(return_value=httpx.Response(200, json=asset_page(newer)))
+    elif kind == "webhook_event":
+        newer = event(uuid=E1, payload={"ping": 1})
+        platform.get("/webhook_events").mock(
+            return_value=httpx.Response(200, json=event_page(newer))
+        )
+    else:
+        newer = task(uuid=T0, instructions="check the build")
+        platform.get("/tasks").mock(return_value=httpx.Response(200, json=task_page(newer)))
+
+    attempt(1)
+    serve_messages(platform, page(_notice_item(), message(uuid=M0, body="are you there?")))
+    brain = RaisingProvider(_down())
+    with pytest.raises(ProviderServerError):
+        _agent(tmp_path, brain).wake()
+
+    assert brain.calls > 0  # attempted, and the outage is still on
+
+
+def test_a_marker_from_before_issue_957_attempts_the_work(platform, tmp_path, attempt):
+    """A marker that holds the time, not the notice's uuid, has nothing to compare with."""
+    _told(platform, tmp_path, attempt)
+    OutageState(tmp_path).note(TIMELINE_UUID)  # rewritten in the pre-#957 shape
+    assert OutageState(tmp_path).noted(TIMELINE_UUID)
+    assert OutageState(tmp_path).notice(TIMELINE_UUID) is None
+
+    attempt(1)
+    serve_messages(platform, page(_notice_item(), message(uuid=M0, body="are you there?")))
+    healthy = CountingProvider()
+    _agent(tmp_path, healthy).wake()
+
+    assert healthy.prompts != []
+
+
+def test_a_listing_the_platform_will_not_give_attempts_the_work(platform, tmp_path, attempt):
+    """A check that cannot be made leaves the wake to do what it did before."""
+    _told(platform, tmp_path, attempt)
+    platform.get("/webhook_events").mock(return_value=httpx.Response(503, json={}))
+
+    attempt(1)
+    serve_messages(platform, page(_notice_item(), message(uuid=M0, body="are you there?")))
+    healthy = CountingProvider()
+    agent = _agent(tmp_path, healthy)
+    with pytest.raises(BaseCradleError):  # the events reconcile reads the same listing, and fails
+        agent.wake()
+
+    assert healthy.prompts != []
+
+
+def test_a_peers_message_that_landed_during_the_last_attempt_is_not_held(
+    platform, tmp_path, attempt
+):
+    """`M1` arrived after the last attempt read the timeline and before its notice posted, so its
+    uuid sorts below the notice's; no wake ever claimed it, so it is new."""
+    _told(platform, tmp_path, attempt)
+
+    attempt(1)
+    serve_messages(
+        platform,
+        page(
+            _notice_item(),
+            message(uuid=M1, body="hello? anyone?"),
+            message(uuid=M0, body="are you there?"),
+        ),
+    )
+    brain = RaisingProvider(_down())
+    with pytest.raises(ProviderServerError):
+        _agent(tmp_path, brain).wake()
+
+    assert brain.calls > 0
+
+
+def test_a_later_attempt_of_a_delivery_from_before_the_notice_holds(platform, tmp_path, attempt):
+    """Its item is claimed, by its own first attempt: it is what the notice says is waiting."""
+    _told(platform, tmp_path, attempt)
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages")
+
+    attempt(2)
+    serve_messages(
+        platform,
+        page(
+            _notice_item(),
+            message(uuid=M1, body="hello? anyone?"),
+            message(uuid=M0, body="are you there?"),
+        ),
+    )
+    brain = RaisingProvider(_down())
+    assert _agent(tmp_path, brain).wake() == []
+
+    assert brain.calls == 0
+
+
+def test_a_resume_that_timed_out_on_the_turn_keeps_its_error_on_any_attempt(
+    platform, tmp_path, monkeypatch, attempt, caplog
+):
+    """The turn's fault, not an outage: the wake exits 0, so no attempt follows its give-up."""
+    timed_out = ProviderTimeoutError("did not answer in time")
+    _died_mid_tool_chain(platform, tmp_path, timed_out)
+
+    attempt(1)
+    serve_messages(platform, page(message(uuid=M0, body="audit the repo")))
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, _SpeaksThenFails(timed_out, speaks=False)))
+
+    assert code == 0
+    (failed,) = [r for r in _lines(caplog, "llm ") if "outcome=failed" in r.getMessage()]
+    assert failed.levelno == logging.ERROR
+    (end,) = _lines(caplog, "wake end ")
+    assert "outcome=ok" in plain(end.getMessage())

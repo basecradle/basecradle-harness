@@ -122,6 +122,9 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
         "retrying": YELLOW,
         "refused": YELLOW,
         "fallback": YELLOW,
+        # A wake that gave up on an outage while the router's next attempt follows (issue #957):
+        # nothing has failed yet, so it is the Warning tier, as on the router's own line.
+        "deferred": YELLOW,
         # A wake SIGTERM stopped (issue #798): the Operator's Choice tier (issue #799), never RED.
         "stopped": YELLOW,
     },
