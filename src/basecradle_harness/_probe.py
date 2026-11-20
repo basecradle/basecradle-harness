@@ -7,7 +7,10 @@ those heartbeats to run **token-free at rest**, a woken harness must recognize a
 and ack it **at the reconcile layer, before any model call** (see `_wake.py` → `_act_on`,
 whose `probe=` hook all three reconcilers pass). The marker is identical across seams; only
 the carrier field differs (a message body, a webhook payload, a task's instructions). This
-module is the recognition + ack half of all three contracts.
+module is the recognition + ack half of all three contracts, and the recognition half of a second
+kind of marker, `MARKED_SCHEME` (``BCNOC2``): a real wake that runs as any other and is not mined
+(issue #950). That one is bound to the timeline it was posted on and to the account that posted it
+(`marked_payload`).
 
 It is the **verifying mirror** of basecradle-noc's ``src/basecradle_noc/marker.py`` (the
 sender half). The two live in separate repos — harness cannot import the NOC package, and
@@ -70,6 +73,53 @@ def verify_probe(body: str, secret: str) -> str | None:
     expected = _signature(match.group("nonce"), secret)
     if hmac.compare_digest(expected, match.group("hmac")):
         return match.group("nonce")
+    return None
+
+
+#: The second kind of the signed marker (issue #950, basecradle-noc#1636): **a real wake that is not
+#: mined.** The NOC posts it in a real platform message when it drives a verification wake of its
+#: own (a roll, a move, a check on demand). Unlike `SCHEME` it short-circuits nothing: the wake runs
+#: as any other, model included, and posts no mechanical ack. The only difference a verified one
+#: makes is that the exchange is not handed to the memory provider (`_wake.WakeAgent._observe`).
+MARKED_SCHEME = "BCNOC2"
+_MARKED_RE = re.compile(rf"\b{MARKED_SCHEME} (?P<nonce>{_NONCE}) (?P<hmac>[0-9a-f]{{64}})\b")
+
+
+def marked_payload(nonce: str, timeline: str, author: str) -> bytes:
+    """The bytes a `MARKED_SCHEME` marker signs: the scheme, the timeline, the author, the nonce.
+
+    ``BCNOC2 <timeline-uuid> <author-uuid> <nonce>``, both uuids in canonical lowercase. Bound to
+    **the timeline it was posted on and the account that posted it**, so a marker is good for one
+    message's author on one timeline and nothing else: a copy pasted into a message on any other
+    timeline, or into a message by anyone else on the same one, fails, and that message is mined
+    like any other (issue #950). The signature proves the NOC minted the marker for this message's
+    author here, not merely that it minted it once. The one place the signed bytes are decided, so
+    the NOC's half (`marker.py`) and this one agree on one line.
+    """
+    return f"{MARKED_SCHEME} {_canonical(timeline)} {_canonical(author)} {nonce}".encode()
+
+
+def _canonical(uuid: str) -> str:
+    return uuid.strip().lower()
+
+
+def verify_marked(body: str, secret: str, timeline: str, author: str) -> str | None:
+    """The nonce of a valid `MARKED_SCHEME` marker for this ``timeline`` and ``author``, else ``None``.
+
+    ``author`` is the uuid of the account that posted ``body``, as the platform asserts it.
+
+    **Every** marker line in ``body`` is judged, each on its own, and the first that verifies is the
+    answer: one check message may carry a line for each of several agents, and every agent but the
+    first would otherwise read another agent's line and never its own. Accepting any is no wider
+    than accepting the first, because each line is verified alone. The signature is compared in
+    constant time; an unsigned, wrongly-signed, other-timeline or other-author marker is ``None``: an
+    ordinary message in every respect. A `SCHEME` marker never matches here.
+    """
+    for match in _MARKED_RE.finditer(body):
+        payload = marked_payload(match.group("nonce"), timeline, author)
+        expected = hmac.new(secret.encode(), payload, sha256).hexdigest()
+        if hmac.compare_digest(expected, match.group("hmac")):
+            return match.group("nonce")
     return None
 
 

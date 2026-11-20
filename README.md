@@ -183,6 +183,18 @@ However large the burst and however much is seeded, the query is the newest mess
 
 **Turn-0 recall skips what this wake just filed from its seeded backlog** ([issue #746](https://github.com/basecradle/basecradle-harness/issues/746)). That backlog is mined before the turn, and the query carries it, so its drawers are the closest matches by construction. On one agent's palace they took 4 of the 10 injected slots with the very question the model was reading in its transcript. They are now dropped from the Turn-0 ranking before the pool is cut, so those slots go to other memories. The rule is narrow on purpose: only the conversation files this wake wrote from its seed, never every drawer from the current timeline (a compacted transcript no longer holds its early turns). The `memory_search` tool still returns them, and so does every later wake's recall.
 
+**A wake the NOC marks for its own verification is answered and not mined** ([issue #950](https://github.com/basecradle/basecradle-harness/issues/950)). When the fleet checks an agent after a roll, a move, or on demand, it posts a real message carrying a signed marker, `BCNOC2 <nonce> <hex-hmac-sha256>`. The HMAC-SHA256 is computed over `BCNOC2 <timeline-uuid> <author-uuid> <nonce>`, both uuids in canonical lowercase, keyed by the agent's `NOC_PROBE_SECRET`. The author is the platform account that posts the message. The wake runs as any other: the model reads the message and answers it, and the harness posts no mechanical ack. The one difference is that the exchange is never handed to the memory provider, and on an agent with one bound, one INFO line says so:
+
+```
+INFO memory op=observe result=skipped reason=marked timeline=<uuid> chars=<n>
+```
+
+- **Nothing but a verified marker counts.** The harness rebuilds the signed bytes from the timeline it is actually reading and from the message's author as the platform asserts it. So a marker is good for one author's message on one timeline and nothing else. A copy pasted into a message on any other timeline, or into anyone else's message on the same one, does not verify, and that message is mined like any other.
+- **Everything else that fails is an ordinary message too:** a forged marker, a misshapen one, and any marker on a box without `NOC_PROBE_SECRET`.
+- **Only a message's body is read for it.** The NOC posts the marker nowhere else, so a task's instructions, a webhook payload and an asset's description are never read for it: each is a field someone who has seen a marker could paste it into. A body may carry lines for several agents; each line is verified on its own.
+- **A turn that answered a marked message together with an unmarked one is mined whole.** Mining a check costs one drawer; skipping a real message would cost a memory.
+- **The token-free synthetic probe, `BCNOC1`, is unchanged:** acked without the model, never mined.
+
 ### Let a model pick what gets recalled — the LLM reranker
 
 Hybrid search (vectors + BM25) decides what your agent remembers by *similarity*. MemPalace's own LongMemEval numbers say the single biggest step left is not a better index but **an LLM reading the candidate pool and choosing** — and upstream ships that only inside a benchmark script. The harness uses MemPalace's library API, so the reranker lives here, on the one `search` call both memory surfaces already share: the hybrid search fetches a **pool** of `max(20, 2 × requested)` candidates, a model picks the best of them, and those come back in its order. Turn-0 injection and the `memory_search` tool both get it, and neither can drift from the other.
