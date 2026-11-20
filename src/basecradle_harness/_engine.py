@@ -50,6 +50,7 @@ from typing import Any
 
 from basecradle_harness import _arguments
 from basecradle_harness._assets import model_sees_images, model_sees_video
+from basecradle_harness._attempts import another_attempt_follows
 from basecradle_harness._elision import archive_marker, refusal
 from basecradle_harness._exceptions import (
     TRANSIENT_FAILURES,
@@ -784,7 +785,13 @@ class Engine:
             kv(video=_media_name(clip), model=model, reason=reason, detail=detail),
         )
 
-    def _chat(self, messages: list[Message], tools: Sequence[ToolSpec] | None) -> Message:
+    def _chat(
+        self,
+        messages: list[Message],
+        tools: Sequence[ToolSpec] | None,
+        *,
+        deferrable: bool = True,
+    ) -> Message:
         """One provider call, retrying the **transient** faults (issues #259, #284, #506, #545).
 
         Four failures are transient — the same call, re-issued unchanged, usually succeeds — and
@@ -843,6 +850,14 @@ class Engine:
         is its own ``llm`` line, ``outcome=failed`` (issue #782): at ERROR for the transient give-up,
         naming the fault and the attempts, so a dropped wake stays diagnosable from the logs alone;
         at WARNING for a fault that is not retried, whose verdict is the wake's own line.
+
+        **The transient give-up is a WARNING while the router is about to try again** (issue #957).
+        A give-up that propagates out of the turn ends the wake on an outage, which exits ``75``; on
+        an attempt another follows (`another_attempt_follows`) that is a deferral, not a failure,
+        and the call is about to be made again. ``deferrable=False`` is for a call whose give-up is
+        caught inside the engine and never reaches the wake (the reserve summary, `_reserve_summary`): its
+        wake does not exit ``75``, no attempt follows it, and it keeps the ERROR whatever attempt
+        this is.
         """
         attempts = max(1, self.response_retries + 1)
         provider, model = describe_provider(self.provider)
@@ -922,7 +937,7 @@ class Engine:
             last_exc,
             attempt=retry.label,
             seconds=time.monotonic() - began,
-            level=logging.ERROR,
+            level=logging.WARNING if deferrable and another_attempt_follows() else logging.ERROR,
             extra={"timeout": None if budget is None else _secs(budget)},
         )
         raise last_exc
@@ -1046,7 +1061,8 @@ class Engine:
         """
         messages.append(Message.system(_RESERVE_NUDGE))
         try:
-            reply = self._chat(messages, None)
+            # Its give-up is caught below, so it never defers the wake (issue #957).
+            reply = self._chat(messages, None, deferrable=False)
         except Exception as exc:  # surface as EngineError; the wake posts the canned note
             _log.warning("Reserve summary call failed after the step budget was spent: %s", exc)
             raise EngineError(

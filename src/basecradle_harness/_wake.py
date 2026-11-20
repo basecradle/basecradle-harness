@@ -100,6 +100,7 @@ from basecradle_harness import (
     _refuseless_pricing,
 )
 from basecradle_harness._assets import _describe, _is_image, image_input, model_sees_images
+from basecradle_harness._attempts import another_attempt_follows, last_attempt
 from basecradle_harness._basecradle import (
     _PROVIDER_BASE_URLS,
     DEFAULT_CONTEXT_MESSAGES,
@@ -465,12 +466,11 @@ RESUME_CEILING = 2
 #: outlasted every in-call retry and left work pending. Everything else keeps the code it had.
 EX_TEMPFAIL = 75
 
-#: Which of the router's attempts at one delivery this wake is, and how many it makes in all
-#: (basecradle-router#527). Set on every real wake, never on a probe, exported after `agent.env`.
-#: Read only to decide whether this is the **last** attempt (`last_attempt`), the one that tells
-#: the timeline about an outage: every earlier attempt may simply succeed on the next try.
-WAKE_ATTEMPT_ENV = "BASECRADLE_WAKE_ATTEMPT"
-WAKE_ATTEMPTS_ENV = "BASECRADLE_WAKE_ATTEMPTS"
+#: The verdict on a wake that gave up on an outage **while another attempt follows** (issue #957):
+#: the router's own word for the same ending (basecradle-router#527), so the two halves say one
+#: thing. Not a failure, so the fleet's *Wake Failed* count, which reads ``outcome=error``, does not
+#: take it; the last attempt, and a wake no attempt follows, still end ``outcome=error``.
+DEFERRED = "deferred"
 
 #: The most passes one wake runs (issue #596). A turn cut off at the output budget costs at most
 #: `RESUME_CEILING` passes beyond the one that cut it off before it is finished or stalls — a stall
@@ -2016,6 +2016,11 @@ class WakeAgent:
         self._wake_ids: set[str] = set()
         session: Session | None = None
         try:
+            if self._held_by_notice():
+                # Started by the harness's own outage notice, and by nothing newer (issue #957): the
+                # work it says is waiting stays waiting, untouched, for the wake a peer starts.
+                outcome = "ok"
+                return []
             session = self.harness.session(self.source)
             # The claims this wake holds stay young while it makes progress (issue #532).
             session.heartbeat = self._progress
@@ -2067,7 +2072,9 @@ class WakeAgent:
             # stopped before this point writes none; the next wake's figure is cumulative. It
             # raises nothing but a stop.
             log_key_spend(provider, timeline=self.timeline_uuid, delivery=delivery)
-            outcome = "ok"
+            # A wake that gave up on an outage a resume absorbed exits `75` all the same, so while
+            # another attempt follows it is deferred, exactly as the raised outage below is (#957).
+            outcome = DEFERRED if self.gave_up is not None and another_attempt_follows() else "ok"
             return posted + self.speech.posts
         except TRANSIENT_FAILURES as exc:
             # A temporary provider fault outlasted every in-call retry and is ending the wake with
@@ -2083,6 +2090,11 @@ class WakeAgent:
             except WakeStopped as stop:
                 outcome, stopped_by = "stopped", self._settle_stop(stop, session)
                 raise
+            # Not yet a failure while the router is about to try again (issue #957): the wake is
+            # deferred, in the router's own word. The last attempt, and a wake no attempt follows,
+            # keep `outcome=error`.
+            if another_attempt_follows():
+                outcome = DEFERRED
             raise
         except WakeStopped as stop:
             outcome, stopped_by = "stopped", self._settle_stop(stop, session)
@@ -4313,10 +4325,16 @@ class WakeAgent:
                 self.claims.recount(
                     self.timeline_uuid, uuid, kind=kind, resumes=claim.resumes, reason=claim.reason
                 )
-                _log.exception(
+                # An outage the router is about to try again is not yet a failure (issue #957), so
+                # its traceback rides a WARNING; anything else, and the last attempt, keep ERROR.
+                _log.log(
+                    logging.WARNING
+                    if is_outage(exc) and another_attempt_follows()
+                    else logging.ERROR,
                     "Resuming the interrupted turn failed (%s, not a fault of the turn, so not "
                     "counted toward the resume ceiling); the next wake will try again.",
                     type(exc).__name__,
+                    exc_info=True,
                 )
                 self._log_deferred(kind, uuid, reason="resume_failed")
                 self._note_outage(kind, uuid, exc)
@@ -5165,7 +5183,7 @@ class WakeAgent:
             if sent is None:
                 return
             posted.append(sent)
-            self.outages.note(self.timeline_uuid)
+            self.outages.note(self.timeline_uuid, notice=_uuid_of(sent))
             _log.error(
                 "%s %s",
                 head("wake reported_failure", RED),
@@ -5179,6 +5197,82 @@ class WakeAgent:
             )
         except Exception:  # noqa: BLE001 - the wake's own fault must reach the entrypoint intact
             _log.exception("Telling the timeline about the outage failed; the wake ends as it was.")
+
+    def _held_by_notice(self) -> bool:
+        """Is this wake owed to nothing but the harness's own outage notice? (issue #957)
+
+        The notice is a new message on the timeline, so its delivery wakes the agent, and before
+        this that wake tried the waiting work again, failed on the same outage, exited ``75`` and
+        began a second chain of the router's attempts, while the notice said the harness "has
+        stopped retrying for now". So a wake on a timeline whose outage was announced, and not yet
+        cleared by a successful call (`OutageState`), first asks whether anything has arrived since
+        the notice (`_newer_than`). When nothing has, it does no model work at all: no claim, no
+        mark, no transcript, nothing settled. What is waiting stays exactly as the notice says, for
+        the next wake a new message or a later event starts, and that wake attempts it as any wake
+        does.
+
+        **Every fallback attempts the work**, because the error on that side is one more chain and
+        the error on the other is a peer's item left unanswered: no marker, a marker with no notice
+        uuid (written before #957), or a listing the platform would not give. The check costs a few
+        reads, and only while an outage is announced on this timeline.
+        """
+        notice = self.outages.notice(self.timeline_uuid)
+        if notice is None:
+            return False
+        try:
+            if self._newer_than(notice):
+                return False
+        except Exception:  # noqa: BLE001 - a failed check must leave the wake to attempt the work
+            _log.warning(
+                "Could not tell whether anything arrived on timeline %s since its outage notice; "
+                "attempting the waiting work.",
+                self.timeline_uuid,
+                exc_info=True,
+            )
+            return False
+        _log.info(
+            "%s %s",
+            head("wake skipped", YELLOW),
+            kv(timeline=self.timeline_uuid, delivery=delivery_id(), reason="outage_notice"),
+        )
+        return True
+
+    def _newer_than(self, notice: str) -> bool:
+        """Has a peer's item arrived on this timeline since the outage notice `notice`? (#957)
+
+        The three streams are listed newest-first by UUIDv7 (`_messages_since`), so each walk stops
+        at the first item at or below the notice's uuid: everything before it was there when the
+        wake that gave up was running, and the notice says it is kept. The agent's own posts never
+        count, the notice among them. A task is not a stream (one scheduled earlier can activate
+        later), so an activated task counts when no wake has ever claimed it and it is not recorded
+        as handled: the wake that gave up claimed what it reached, so what is left unclaimed is new,
+        or old work that wake never reached, and attempting that costs at worst the chain this
+        guards against, never an item.
+
+        The stated residual, as for the mark (`MarkStore`): a uuid is minted before its record is
+        committed, so an item minted a moment before the notice and committed after it reads as
+        older than the notice, and waits for the next wake.
+        """
+        floor = _as_uuid(notice)
+        streams = (
+            (self.client.messages.filter(timeline=self.timeline_uuid), self._is_own),
+            (self.client.assets.filter(timeline=self.timeline_uuid), self._is_own),
+            (self.client.webhook_events.filter(timeline=self.timeline_uuid), None),
+        )
+        for listing, own in streams:
+            for item in listing:
+                position = _as_uuid(item.content.uuid)
+                if position is not None and floor is not None and position <= floor:
+                    break
+                if own is None or not own(item):
+                    return True
+        activated = self.client.tasks.filter(timeline=self.timeline_uuid, status="activated")
+        seen = self.seen.all(self.timeline_uuid, kind=_TASKS)
+        return any(
+            task.content.uuid not in seen
+            and self.claims.read(self.timeline_uuid, task.content.uuid, kind=_TASKS) is None
+            for task in activated
+        )
 
     def _model_ok(self) -> None:
         """Self-heal after a successful model call: clear the billing and outage markers (#336, #951).
@@ -5233,40 +5327,6 @@ def _turn_stopped(work: list[Message]) -> bool:
     writes — so nothing a peer or the model says can make a crashed turn read as stopped.
     """
     return bool(work) and work[-1].role == "system" and work[-1].content == STOPPED_NOTE
-
-
-def last_attempt() -> bool:
-    """Is this wake the router's **last** attempt at its delivery? (issue #951)
-
-    ``BASECRADLE_WAKE_ATTEMPT == BASECRADLE_WAKE_ATTEMPTS`` (`WAKE_ATTEMPT_ENV`), and only then does
-    a wake that gave up on an outage tell the timeline: an earlier attempt is followed by another,
-    which may simply succeed. Neither variable set — a wake run by hand, by a router that predates
-    them, or a probe — is not a last attempt, so such a wake posts nothing, exactly as before.
-
-    A value that is not a positive integer, or only one of the pair, is the router's contract
-    broken, so it is logged and read as not-last: the cost of that error is a notice not posted,
-    which the exit code still lets the router recover from, never a notice posted early. An attempt
-    past the count is read as last, since there is no attempt after it.
-    """
-    raw_attempt = (os.environ.get(WAKE_ATTEMPT_ENV) or "").strip()
-    raw_attempts = (os.environ.get(WAKE_ATTEMPTS_ENV) or "").strip()
-    if not raw_attempt and not raw_attempts:
-        return False
-    try:
-        attempt, attempts = int(raw_attempt), int(raw_attempts)
-    except ValueError:
-        attempt = attempts = 0
-    if attempt < 1 or attempts < 1:
-        _log.warning(
-            "The router's attempt variables are not a pair of positive integers "
-            "(%s=%r, %s=%r), so this wake is not treated as the last attempt.",
-            WAKE_ATTEMPT_ENV,
-            raw_attempt,
-            WAKE_ATTEMPTS_ENV,
-            raw_attempts,
-        )
-        return False
-    return attempt >= attempts
 
 
 def _turn_timed_out(exc: BaseException) -> bool:
@@ -6553,16 +6613,25 @@ def _wake_once(args: argparse.Namespace) -> tuple[WakeStopped | None, int]:
         # unleveled and unfilterable, so the harness's hardest failure — the wake that never ran
         # at all — was the one line a journald/Live-Tail severity filter could not find. The
         # print stays for a terminal run (where logging may be quieter than the operator's eyes).
-        _log.error(
-            "%s %s",
-            head("wake failed", RED),
-            kv(timeline=args.timeline, error=str(error), delivery=delivery_id()),
-        )
+        #
+        # **Except on an outage another attempt follows** (issue #957): the wake did not fail, it
+        # was deferred, and its `wake end … outcome=deferred` and the call's own `llm … outcome=
+        # failed` line (WARNING) already say what happened and why. So no `wake failed` line is
+        # written, at any level: a Failure-tier head on an attempt that has not failed is the
+        # page `@origin` ruled out, and it is never re-headed as `wake deferred`, which is the
+        # per-item line the NOC counts as one deferred item.
+        outage = is_outage(error)
+        if not (outage and another_attempt_follows()):
+            _log.error(
+                "%s %s",
+                head("wake failed", RED),
+                kv(timeline=args.timeline, error=str(error), delivery=delivery_id()),
+            )
         print(f"basecradle-harness-wake: {last_word(error)}", file=sys.stderr)
         # A temporary provider fault that outlasted every retry is the one ending a later wake may
         # fix unchanged, so it exits `EX_TEMPFAIL` and the router tries again on its patient
         # schedule (issue #951). Everything else keeps the 1 it always had.
-        return None, EX_TEMPFAIL if is_outage(error) else 1
+        return None, EX_TEMPFAIL if outage else 1
     if agent.gave_up is not None:
         # A resume absorbed an outage so the wake could answer the rest, and its item is still
         # waiting (issue #951): the wake did its work and gave up on that one, so a later wake must
