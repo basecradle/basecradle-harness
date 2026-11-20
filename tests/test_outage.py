@@ -35,6 +35,7 @@ from basecradle_harness import (
     ProviderTimeoutError,
     ToolCall,
 )
+from basecradle_harness import _attempts as attempts_module
 from basecradle_harness import _wake as wake_module
 from basecradle_harness._attempts import (
     WAKE_ATTEMPT_ENV,
@@ -63,6 +64,7 @@ from tests.test_wake import (
     BC_URL,
     E1,
     M0,
+    M1,
     M4,
     PNG_BYTES,
     REPLY,
@@ -263,6 +265,7 @@ def test_an_attempt_past_the_count_is_read_as_last(attempt):
 )
 def test_a_broken_attempt_pair_is_not_last_and_says_so(monkeypatch, caplog, number, of):
     """The router's contract broken costs a notice not posted, never one posted early."""
+    monkeypatch.setattr(attempts_module, "_reported", set())
     monkeypatch.setenv(WAKE_ATTEMPT_ENV, number)
     monkeypatch.setenv(WAKE_ATTEMPTS_ENV, of)
 
@@ -850,3 +853,66 @@ def test_a_listing_the_platform_will_not_give_attempts_the_work(platform, tmp_pa
         agent.wake()
 
     assert healthy.prompts != []
+
+
+def test_a_peers_message_that_landed_during_the_last_attempt_is_not_held(
+    platform, tmp_path, attempt
+):
+    """`M1` arrived after the last attempt read the timeline and before its notice posted, so its
+    uuid sorts below the notice's; no wake ever claimed it, so it is new."""
+    _told(platform, tmp_path, attempt)
+
+    attempt(1)
+    serve_messages(
+        platform,
+        page(
+            _notice_item(),
+            message(uuid=M1, body="hello? anyone?"),
+            message(uuid=M0, body="are you there?"),
+        ),
+    )
+    brain = RaisingProvider(_down())
+    with pytest.raises(ProviderServerError):
+        _agent(tmp_path, brain).wake()
+
+    assert brain.calls > 0
+
+
+def test_a_later_attempt_of_a_delivery_from_before_the_notice_holds(platform, tmp_path, attempt):
+    """Its item is claimed, by its own first attempt: it is what the notice says is waiting."""
+    _told(platform, tmp_path, attempt)
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages")
+
+    attempt(2)
+    serve_messages(
+        platform,
+        page(
+            _notice_item(),
+            message(uuid=M1, body="hello? anyone?"),
+            message(uuid=M0, body="are you there?"),
+        ),
+    )
+    brain = RaisingProvider(_down())
+    assert _agent(tmp_path, brain).wake() == []
+
+    assert brain.calls == 0
+
+
+def test_a_resume_that_timed_out_on_the_turn_keeps_its_error_on_any_attempt(
+    platform, tmp_path, monkeypatch, attempt, caplog
+):
+    """The turn's fault, not an outage: the wake exits 0, so no attempt follows its give-up."""
+    timed_out = ProviderTimeoutError("did not answer in time")
+    _died_mid_tool_chain(platform, tmp_path, timed_out)
+
+    attempt(1)
+    serve_messages(platform, page(message(uuid=M0, body="audit the repo")))
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, _SpeaksThenFails(timed_out, speaks=False)))
+
+    assert code == 0
+    (failed,) = [r for r in _lines(caplog, "llm ") if "outcome=failed" in r.getMessage()]
+    assert failed.levelno == logging.ERROR
+    (end,) = _lines(caplog, "wake end ")
+    assert "outcome=ok" in plain(end.getMessage())

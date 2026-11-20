@@ -5238,41 +5238,67 @@ class WakeAgent:
         return True
 
     def _newer_than(self, notice: str) -> bool:
-        """Has a peer's item arrived on this timeline since the outage notice `notice`? (#957)
+        """Has a peer's item arrived on this timeline that no wake has tried? (issue #957)
 
-        The three streams are listed newest-first by UUIDv7 (`_messages_since`), so each walk stops
-        at the first item at or below the notice's uuid: everything before it was there when the
-        wake that gave up was running, and the notice says it is kept. The agent's own posts never
-        count, the notice among them. A task is not a stream (one scheduled earlier can activate
-        later), so an activated task counts when no wake has ever claimed it and it is not recorded
-        as handled: the wake that gave up claimed what it reached, so what is left unclaimed is new,
-        or old work that wake never reached, and attempting that costs at worst the chain this
-        guards against, never an item.
+        Two tests, and an item that passes either is new:
+
+        - **Above the notice.** The three streams are listed newest-first by UUIDv7
+          (`_messages_since`), so an item whose uuid sorts above the notice's was minted after the
+          notice was posted.
+        - **Unclaimed.** The wake that gave up claimed what it read, and the notice says that is
+          kept. A peer's item below the notice with no claim was never tried by anything: one that
+          landed while the last attempt sat in its retries, after it had read the timeline. Holding
+          it would leave a peer's message unanswered behind a notice it arrived before, so it is
+          new. Each stream is read down to its mark (everything at or below the mark is settled);
+          a stream with no mark yet is read over the bootstrap's window (`context_messages`), where
+          an older item seeded and never claimed reads as new too, which attempts the work as
+          before.
+
+        The agent's own posts never count, the notice among them. A task is not a stream (one
+        scheduled earlier can activate later), so only the second test applies to it, against the
+        seen-set. Every miss falls on the side of attempting: an item the wake that gave up never
+        reached (it raised on an earlier kind) is unclaimed, reads as new, and costs at worst the
+        chain this guards against, never an item. A later attempt of another delivery that began
+        before the notice finds its own item claimed and holds: that item is what the notice says
+        is waiting.
 
         The stated residual, as for the mark (`MarkStore`): a uuid is minted before its record is
-        committed, so an item minted a moment before the notice and committed after it reads as
-        older than the notice, and waits for the next wake.
+        committed, so an item minted a moment before the notice and committed after it, and claimed
+        by nothing, still reads as new; one claimed by the wake that gave up is held, as it should
+        be.
         """
         floor = _as_uuid(notice)
         streams = (
-            (self.client.messages.filter(timeline=self.timeline_uuid), self._is_own),
-            (self.client.assets.filter(timeline=self.timeline_uuid), self._is_own),
-            (self.client.webhook_events.filter(timeline=self.timeline_uuid), None),
+            (_MESSAGES, self.client.messages.filter(timeline=self.timeline_uuid), self._is_own),
+            (_ASSETS, self.client.assets.filter(timeline=self.timeline_uuid), self._is_own),
+            (_EVENTS, self.client.webhook_events.filter(timeline=self.timeline_uuid), None),
         )
-        for listing, own in streams:
-            for item in listing:
-                position = _as_uuid(item.content.uuid)
-                if position is not None and floor is not None and position <= floor:
-                    break
-                if own is None or not own(item):
+        for kind, listing, own in streams:
+            mark = self.marks.get(self.timeline_uuid, kind=kind)
+            waiting = (
+                _recent(listing, self.context_messages)
+                if mark is None
+                else _messages_since(listing, mark)
+            )
+            for item in waiting:
+                if own is not None and own(item):
+                    continue
+                if self._untried(item, kind, floor):
                     return True
         activated = self.client.tasks.filter(timeline=self.timeline_uuid, status="activated")
         seen = self.seen.all(self.timeline_uuid, kind=_TASKS)
         return any(
-            task.content.uuid not in seen
-            and self.claims.read(self.timeline_uuid, task.content.uuid, kind=_TASKS) is None
+            task.content.uuid not in seen and self._untried(task, _TASKS, None)
             for task in activated
         )
+
+    def _untried(self, item: object, kind: str, floor: UUID | None) -> bool:
+        """Is `item` above the notice (`floor`), or claimed by no wake? (issue #957)"""
+        uuid = item.content.uuid
+        position = _as_uuid(uuid)
+        if floor is not None and (position is None or position > floor):
+            return True
+        return self.claims.read(self.timeline_uuid, uuid, kind=kind) is None
 
     def _model_ok(self) -> None:
         """Self-heal after a successful model call: clear the billing and outage markers (#336, #951).

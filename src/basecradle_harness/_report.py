@@ -433,7 +433,8 @@ class TimelineNotice:
     An account-level or vendor-level outage is noticed *per timeline* — each conversation (and each
     peer AI on it) deserves to be told once, and no more. So the debounce is a marker file per
     timeline beside the wake's other stores (`marks/`, `seen/`, `claims/`, `breaker/`) under the
-    agent's home, holding the time the outage was first announced there. Each kind of notice is one
+    agent's home, holding the time the outage was first announced there (the outage marker holds
+    the notice's uuid instead, `OutageState`, issue #957). Each kind of notice is one
     subclass naming its folder and suffix, and the orphan sweep purges each by that exact name
     (`_cleanup.enumerate_artifacts`), so a new kind is one subclass and one line there.
 

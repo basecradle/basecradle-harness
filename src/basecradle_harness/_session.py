@@ -349,6 +349,16 @@ class Session:
         if _index_of(self.history, turn) is None:
             raise ValueError("the turn to resume is not in this transcript")
         self._turn = turn
+        # The engine's give-up line reads it (issue #957): a resume's own-budget timeout is the
+        # turn's fault, so no router attempt follows it.
+        self.engine.resuming = True
+        try:
+            return self._resume(turn, brief)
+        finally:
+            self.engine.resuming = False
+
+    def _resume(self, turn: Message, brief: str | None) -> str:
+        """The body of `resume`, run while the engine knows it is resuming."""
         try:
             reply = self._continue(turn, brief)
         except ProviderContextLengthError as error:

@@ -409,6 +409,11 @@ class Engine:
         #: to leave the driving item **pending** instead of committing it — a fragment is not the
         #: turn's terminal narration, and terminal narration is the commit record.
         self.output_truncated = False
+        #: Whether the run in progress is a **resume** of an interrupted turn (`Session.resume`). A
+        #: resume that runs out of the harness's own fitted budget is the turn's fault, never an
+        #: outage (`_wake._turn_timed_out`, issue #589), so its wake does not exit ``75`` and no
+        #: attempt follows its give-up, which therefore keeps its ERROR (issue #957).
+        self.resuming = False
         #: The blind-model describer (issue #472), built lazily on first need and memoized for the
         #: life of this engine — one adapter instance per wake, never one per picture. ``False`` is
         #: *not yet asked*; ``None`` is *asked and there is none*, which is the ordinary case (no
@@ -857,7 +862,8 @@ class Engine:
         and the call is about to be made again. ``deferrable=False`` is for a call whose give-up is
         caught inside the engine and never reaches the wake (the reserve summary, `_reserve_summary`): its
         wake does not exit ``75``, no attempt follows it, and it keeps the ERROR whatever attempt
-        this is.
+        this is. So does a resume's timeout on the harness's own budget (`resuming`): the wake
+        counts it toward the turn's resume ceiling and exits ``0``, never ``75``.
         """
         attempts = max(1, self.response_retries + 1)
         provider, model = describe_provider(self.provider)
@@ -929,6 +935,10 @@ class Engine:
             last_exc, "vendor_deadline", False
         )
         budget = last_timeout(self.provider) if timed_out else None
+        # Deferred, not failed, only when the give-up will end the wake on an outage another of
+        # the router's attempts follows (issue #957): not a call the engine catches itself, and
+        # not a resume's own-budget timeout, which the wake judges the turn's fault.
+        deferred = deferrable and not (timed_out and self.resuming) and another_attempt_follows()
         # The give-up is the call's own `llm` line, `outcome=failed` (issue #782), where it was a
         # prose ERROR: a fact the board needs never lives only in prose. It keeps the ERROR, so the
         # page it always raised is neither lost nor doubled.
@@ -937,7 +947,7 @@ class Engine:
             last_exc,
             attempt=retry.label,
             seconds=time.monotonic() - began,
-            level=logging.WARNING if deferrable and another_attempt_follows() else logging.ERROR,
+            level=logging.WARNING if deferred else logging.ERROR,
             extra={"timeout": None if budget is None else _secs(budget)},
         )
         raise last_exc

@@ -31,12 +31,16 @@ _log = logging.getLogger("basecradle_harness")
 WAKE_ATTEMPT_ENV = "BASECRADLE_WAKE_ATTEMPT"
 WAKE_ATTEMPTS_ENV = "BASECRADLE_WAKE_ATTEMPTS"
 
+#: The broken pairs already reported, so a wake that asks several times says it once.
+_reported: set[tuple[str, str]] = set()
+
 
 def _attempt_pair() -> tuple[int, int] | None:
     """``(attempt, attempts)`` as the router exported them, or ``None`` when they say nothing.
 
     Neither variable set is ``None`` silently. A value that is not a positive integer, or only one
-    of the pair, is the router's contract broken, so it is logged and read as ``None`` too.
+    of the pair, is the router's contract broken, so it is logged (once per process for the same
+    values: a wake asks from the engine, the wake and the entrypoint) and read as ``None`` too.
     """
     raw_attempt = (os.environ.get(WAKE_ATTEMPT_ENV) or "").strip()
     raw_attempts = (os.environ.get(WAKE_ATTEMPTS_ENV) or "").strip()
@@ -47,6 +51,9 @@ def _attempt_pair() -> tuple[int, int] | None:
     except ValueError:
         attempt = attempts = 0
     if attempt < 1 or attempts < 1:
+        if (raw_attempt, raw_attempts) in _reported:
+            return None
+        _reported.add((raw_attempt, raw_attempts))
         _log.warning(
             "The router's attempt variables are not a pair of positive integers "
             "(%s=%r, %s=%r), so this wake is read as neither the last attempt nor one "
