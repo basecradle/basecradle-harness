@@ -391,23 +391,24 @@ def test_an_exchange_that_is_nothing_but_scaffolding_is_not_mined_at_all(platfor
     assert provider.observed == []
 
 
-# === the twin rule: an exchange the store already holds is not filed again (issue #950) =========
+# === the repeat rule: a repeat of the newest exchange on a timeline is not filed (issue #950) =====
 
 
 class TwinStore(Recorder):
-    """A store that answers `holds` from what it filed, as the seam requires of a real one."""
+    """A store that answers `repeats` from what it filed, as the seam requires of a real one."""
 
-    def __init__(self, holds=None):
+    def __init__(self, repeats=None):
         super().__init__(injected=None)
-        self._holds = holds
+        self._repeats = repeats
 
-    def holds(self, twin):
-        if self._holds is not None:
-            return self._holds(twin)
-        return any(exchange.twin == twin for exchange in self.observed)
+    def repeats(self, exchange):
+        if self._repeats is not None:
+            return self._repeats(exchange)
+        mine = [e for e in self.observed if e.scope.timeline == exchange.scope.timeline]
+        return bool(mine) and mine[-1].twin == exchange.twin
 
 
-def test_an_exchange_the_store_holds_is_not_filed_again_and_says_so(platform, tmp_path, caplog):
+def test_a_repeat_of_the_newest_exchange_is_not_filed_and_says_so(platform, tmp_path, caplog):
     provider = TwinStore()
     agent = _agent(tmp_path, provider)
 
@@ -415,9 +416,15 @@ def test_an_exchange_the_store_holds_is_not_filed_again_and_says_so(platform, tm
         agent._observe("[2026-11-20T06:00:00Z] john: ping", "Here.")
         agent._observe("[2026-11-20T07:00:00Z] john: ping", "Here.")
         agent._observe("[2026-11-20T08:00:00Z] john: ping", "Here, and John: the key moved.")
+        agent._observe("[2026-11-20T09:00:00Z] john: ping", "Here.")
 
-    assert [e.assistant for e in provider.observed] == ["Here.", "Here, and John: the key moved."]
+    assert [e.assistant for e in provider.observed] == [
+        "Here.",
+        "Here, and John: the key moved.",
+        "Here.",  # after something else was said, a repeat is filed: later is current
+    ]
     assert all(e.twin and e.twin.startswith("v1:") for e in provider.observed)
+    assert all(e.scope.timeline == TIMELINE_UUID for e in provider.observed)
     skipped = [r for r in caplog.records if "reason=twin" in r.getMessage()]
     assert [r.getMessage() for r in skipped] == [
         "memory op=observe result=skipped reason=twin chars=38"
@@ -425,25 +432,25 @@ def test_an_exchange_the_store_holds_is_not_filed_again_and_says_so(platform, tm
     assert skipped[0].levelname == "INFO"
 
 
-def test_a_holds_that_raises_files_the_exchange(platform, tmp_path, caplog):
+def test_a_repeats_that_raises_files_the_exchange(platform, tmp_path, caplog):
     """A broken answer costs one more drawer, never a memory."""
 
-    def broken(twin):
+    def broken(exchange):
         raise RuntimeError("the store would not answer")
 
-    provider = TwinStore(holds=broken)
+    provider = TwinStore(repeats=broken)
     agent = _agent(tmp_path, provider)
 
     with caplog.at_level("WARNING", logger="basecradle_harness"):
         agent._observe("[2026-11-20T06:00:00Z] john: ping", "Here.")
 
     assert len(provider.observed) == 1
-    assert any("holds() failed" in r.getMessage() for r in caplog.records)
+    assert any("repeats() failed" in r.getMessage() for r in caplog.records)
 
 
-def test_only_a_plain_yes_from_holds_skips(platform, tmp_path):
-    """A provider answering with anything but ``True`` has not said it holds the exchange."""
-    provider = TwinStore(holds=lambda twin: "yes")
+def test_only_a_plain_yes_from_repeats_skips(platform, tmp_path):
+    """A provider answering with anything but ``True`` has not said the exchange is a repeat."""
+    provider = TwinStore(repeats=lambda exchange: "yes")
     agent = _agent(tmp_path, provider)
 
     agent._observe("[2026-11-20T06:00:00Z] john: ping", "Here.")
@@ -452,7 +459,7 @@ def test_only_a_plain_yes_from_holds_skips(platform, tmp_path):
 
 
 def test_a_provider_that_keeps_no_record_files_every_exchange(platform, tmp_path):
-    """The seam's default `holds` is no, so a provider without one mines exactly as before."""
+    """The seam's default `repeats` is no, so a provider without one mines exactly as before."""
     provider = Recorder(injected=None)
     agent = _agent(tmp_path, provider)
 
@@ -472,25 +479,21 @@ def test_a_wake_files_one_of_two_identical_check_ins_and_the_one_that_differs(
     tasks = [
         _task_json(TASK_UUID, check_in, "2026-11-20T06:00:00.000Z"),
         _task_json("019e7761-2222-7333-8444-555566667778", check_in, "2026-11-20T07:00:00.000Z"),
-        _task_json("019e7761-2222-7333-8444-555566667779", "Check the vault.", LATE_TASK),
     ]
     platform.get("/tasks").mock(
         return_value=httpx.Response(200, json={"tasks": tasks, "next_cursor": None})
     )
+    # One wake answers both check-ins back to back, with nothing filed on the timeline between them.
     provider = TwinStore()
     agent = _agent(tmp_path, provider, _CannedModel(text="Nothing needs me this hour."))
 
     with caplog.at_level("INFO", logger="basecradle_harness"):
         agent.wake()
 
-    filed = [e.user for e in provider.observed if "A task scheduled by" in e.user]
-    assert len(filed) == 2
-    assert sum(check_in in user for user in filed) == 1
-    assert sum("Check the vault." in user for user in filed) == 1
+    filed = [e.user for e in provider.observed]
+    assert sum("A task scheduled by" in user for user in filed) == 1
+    assert sum("Where does John live?" in user for user in filed) == 1
     assert sum("reason=twin" in r.getMessage() for r in caplog.records) == 1
-
-
-LATE_TASK = "2026-11-20T08:00:00.000Z"
 
 
 def _task_json(uuid, instructions, at):

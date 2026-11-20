@@ -8,6 +8,7 @@ of an exchange file, and the same census of a directory.
 
 import ast
 import importlib.util
+import os
 import random
 import sys
 from pathlib import Path
@@ -16,7 +17,12 @@ import pytest
 
 from basecradle_harness import MemoryExchange, MemoryScope, _twins
 from basecradle_harness import _wake as wake_module
-from basecradle_harness._mempalace import _exchange_markdown, exchange_of
+from basecradle_harness._mempalace import (
+    _TIMELINE_FILE,
+    _exchange_markdown,
+    exchange_of,
+    timeline_of_file,
+)
 from basecradle_harness._palace_check import twin_census
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "twin_census_standalone.py"
@@ -81,9 +87,10 @@ def test_the_copy_imports_only_the_standard_library():
 
 def test_the_copy_carries_the_same_rule(script):
     assert script.TWIN_RULE == _twins.TWIN_RULE
-    assert [(p.pattern, p.flags, m) for p, m in script._STAMPS] == [
-        (p.pattern, p.flags, m) for p, m in _twins._STAMPS
+    assert [(p.pattern, p.flags, m) for p, m in script._OPENINGS] == [
+        (p.pattern, p.flags, m) for p, m in _twins._OPENINGS
     ]
+    assert script._TIMELINE_FILE.pattern == _TIMELINE_FILE.pattern
 
 
 def test_the_copy_keys_and_reads_every_exchange_as_the_package_does(script):
@@ -98,9 +105,17 @@ def test_the_copy_keys_and_reads_every_exchange_as_the_package_does(script):
 def test_the_copy_counts_a_directory_as_the_palace_check_does(script, tmp_path, capsys):
     convos = tmp_path / "mempalace" / "conversations"
     convos.mkdir(parents=True)
-    for n, (user, assistant) in enumerate(_corpus()):
+    timelines = ["019e7750-66ee-7f53-829f-13a8a710b6da", "019e7750-66ee-7f53-829f-13a8a710b6db"]
+    # Each exchange twice, back to back, so some are repeats of the newest on their timeline; a
+    # third of them in files that name no timeline, which are always kept.
+    doubled = [pair for pair in _corpus() for _ in range(2)]
+    for n, (user, assistant) in enumerate(doubled):
         exchange = MemoryExchange(user=user, assistant=assistant, scope=MemoryScope(agent="nova"))
-        (convos / f"{n:032x}.md").write_text(_exchange_markdown(exchange), encoding="utf-8")
+        name = f"{timelines[n // 2 % 2]}.{n:032x}.md" if n // 2 % 3 else f"{n:032x}.md"
+        path = convos / name
+        path.write_text(_exchange_markdown(exchange), encoding="utf-8")
+        os.utime(path, (1_000 + n, 1_000 + n))
+        assert script.timeline_of_file(name) == timeline_of_file(name)
 
     found = twin_census(tmp_path / "mempalace")
     assert script.main(["twin_census_standalone.py", str(convos)]) == 0

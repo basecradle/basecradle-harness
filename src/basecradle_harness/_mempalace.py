@@ -281,10 +281,11 @@ EXCHANGE_PIECE_CHARS = 800
 # drawer keeps it on its continuation, so a peer's words never read as the agent's.
 _QUOTE = "> "
 
-#: The drawer metadata field the observe files an exchange's twin key under (`_twins`, issue #950),
-#: and the one `MemPalaceMemoryProvider.holds` looks it up by. Prefixed, because the namespace of
-#: unprefixed fields is upstream's.
+#: The drawer metadata fields the observe files an exchange's key and its timeline under (`_twins`,
+#: issue #950), and the ones `MemPalaceMemoryProvider.repeats` looks them up by. Prefixed, because
+#: the namespace of unprefixed fields is upstream's.
 TWIN_FIELD = "harness_twin"
+TIMELINE_FIELD = "harness_timeline"
 
 _MISSING = (
     "MemPalace is not installed. Install the optional extra to use the MemPalace memory "
@@ -371,24 +372,67 @@ class MemPalaceMemoryProvider(MemoryProvider):
         path = convo_dir.expanduser().resolve() / _conversation_name(exchange.scope.timeline)
         if exchange.seeded:
             self._seeded_files.add(path.name)
-        self._file(path, _exchange_markdown(exchange), twin=exchange.twin)
+        self._file(
+            path,
+            _exchange_markdown(exchange),
+            twin=exchange.twin,
+            timeline=_timeline_uuid(exchange.scope.timeline),
+        )
 
-    def holds(self, twin: str) -> bool:
-        """Whether a drawer in this palace was filed under twin key ``twin`` (issue #950).
+    def repeats(self, exchange: MemoryExchange) -> bool:
+        """Whether ``exchange`` repeats the newest exchange this palace filed on its timeline (#950).
 
-        Answered from the palace itself: a metadata lookup on `TWIN_FIELD`, which `_file` stamps on
-        every drawer of an exchange the engine keyed. No search, no embedding and no model call.
-        A drawer filed before the rule carries no key and never matches, so the first twin after
-        it is filed once; a drawer that is deleted takes its key with it, so its twin is filed again
-        the next time it happens. ``False`` before the palace exists. Raises what MemPalace raises,
-        which the engine logs and answers by filing.
+        Answered from the palace itself, by two metadata lookups and no search, embedding or model
+        call: the drawers filed under this exchange's key on this timeline (`TWIN_FIELD`,
+        `TIMELINE_FIELD`, which `_file` stamps on every drawer of an exchange the engine keyed), and
+        whether any drawer on this timeline was filed after the newest of them. ``source_mtime``
+        orders the filings: `_file` stamps the file's own on every drawer of it, and a home move
+        that keeps mtimes keeps the order. A drawer filed before the rule carries neither field, so
+        it never matches and never counts as later; a drawer that is deleted takes its key with it,
+        so its repeat is filed again.
+
+        A **seeded** repeat (issue #746) is the message the model is reading in its transcript this
+        wake, and the drawer it repeats would be the closest match for this wake's Turn-0 recall,
+        so that drawer's file joins the ones `context` keeps out, exactly as the file a seeded
+        exchange is filed in would have.
+
+        ``False`` before the palace exists, and for an exchange with no key or no timeline uuid.
+        Raises what MemPalace raises, which the engine logs and answers by filing.
         """
-        if not self.palace_path.exists():
+        timeline = _timeline_uuid(exchange.scope.timeline)
+        if exchange.twin is None or timeline is None or not self.palace_path.exists():
             return False
-        found = self.read_collection().get(where={TWIN_FIELD: twin}, limit=1, include=[])
-        return bool(found.get("ids"))
+        collection = self.read_collection()
+        found = collection.get(
+            where={"$and": [{TWIN_FIELD: exchange.twin}, {TIMELINE_FIELD: timeline}]},
+            include=["metadatas"],
+        )
+        filed = [
+            meta
+            for meta in found.get("metadatas") or []
+            if isinstance((meta or {}).get("source_mtime"), int | float)
+        ]
+        if not filed:
+            return False
+        newest = max(meta["source_mtime"] for meta in filed)
+        later = collection.get(
+            where={"$and": [{TIMELINE_FIELD: timeline}, {"source_mtime": {"$gt": newest}}]},
+            limit=1,
+            include=[],
+        )
+        if later.get("ids"):
+            return False
+        if exchange.seeded:
+            self._seeded_files.update(
+                name
+                for meta in filed
+                if meta["source_mtime"] == newest and (name := _source_name(meta)) is not None
+            )
+        return True
 
-    def _file(self, path: Path, text: str, *, twin: str | None = None) -> None:
+    def _file(
+        self, path: Path, text: str, *, twin: str | None = None, timeline: str | None = None
+    ) -> None:
         """Write ``text`` to ``path`` and file it as drawers, all of it or none of it.
 
         Each drawer goes through ``file_conversation_exchange``, MemPalace's canonical write path
@@ -411,8 +455,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
           ``file_conversation_exchange`` stamps the same value itself, and its value wins
           (``setdefault``). The harness stamps it too, so a drawer it files is current whatever
           upstream's write path does;
-        - `TWIN_FIELD` — the exchange's twin key, when the engine computed one, on every drawer of
-          it, which is what `holds` looks up (issue #950).
+        - `TWIN_FIELD` and `TIMELINE_FIELD` — the exchange's key, when the engine computed one, and
+          the timeline uuid its file is named for, on every drawer of it: what `repeats` looks up
+          (issue #950).
 
         Under MemPalace's own per-file lock (``mine_lock``), the one a concurrent ``mempalace
         mine`` takes for this file before it re-checks whether it is filed. If anything raises
@@ -448,6 +493,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
                     stamp["convo_chunker_version"] = version
                 if twin is not None:
                     stamp[TWIN_FIELD] = twin
+                if timeline is not None:
+                    stamp[TIMELINE_FIELD] = timeline
                 room = convo_miner.detect_convo_room(text)
                 for piece in pieces:
                     drawer = convo_miner.file_conversation_exchange(
@@ -1160,6 +1207,12 @@ def exchange_of(text: str) -> tuple[str, str]:
     return user, "\n".join(lines[split:])
 
 
+def timeline_of_file(name: str) -> str | None:
+    """The timeline uuid a conversation file's name carries (`_TIMELINE_FILE`), or ``None``."""
+    match = _TIMELINE_FILE.match(name)
+    return match["timeline"] if match else None
+
+
 def _pieces(text: str, size: int = EXCHANGE_PIECE_CHARS) -> list[str]:
     """``text`` as the fewest drawers of at most ``size`` characters, cut only between lines.
 
@@ -1407,8 +1460,7 @@ def _filed(raw: object) -> str | None:
 def _timeline_of(hit: dict) -> str | None:
     """The timeline a drawer's conversation file was named for (`_TIMELINE_FILE`), or ``None``."""
     name = _source_name(hit)
-    match = _TIMELINE_FILE.match(name) if name else None
-    return match["timeline"] if match else None
+    return timeline_of_file(name) if name else None
 
 
 def _source_name(hit: dict) -> str | None:
@@ -1429,5 +1481,11 @@ def _conversation_name(timeline: str | None) -> str:
     name always either carries a real timeline or carries none.
     """
     stem = uuid.uuid4().hex
+    candidate = _timeline_uuid(timeline)
+    return f"{candidate}.{stem}.md" if candidate else f"{stem}.md"
+
+
+def _timeline_uuid(timeline: str | None) -> str | None:
+    """``timeline`` as the observe records it (lowercase), when it is a uuid; else ``None``."""
     candidate = (timeline or "").strip().lower()
-    return f"{candidate}.{stem}.md" if _UUID.match(candidate) else f"{stem}.md"
+    return candidate if _UUID.match(candidate) else None

@@ -1,8 +1,10 @@
-"""The twin rule: an exchange filed once, word for word, is not filed again (issue #950).
+"""The repeat rule's key and census (issue #950).
 
-Pinned against the real dialogue renderers, so a reworded template fails here rather than silently
-filing every repetition of a routine exchange (the rule masks a stamp only where a renderer puts
-it). The fiction: Nova Digital (`nova`, AI) is the agent; John Doe (`john`) a peer.
+The key is pinned against the real dialogue renderers, so a reworded template fails here rather
+than silently filing every repetition of a routine exchange; and against the ways a looser key
+would lose what was said (the rule masks only the opening stamp of the peer's half). The census is
+pinned to "the newest exchange on its timeline". The fiction: Nova Digital (`nova`, AI) is the
+agent; John Doe (`john`) a peer.
 """
 
 import pytest
@@ -69,7 +71,7 @@ def _key(item, kind, reply="Nothing needs me this hour."):
 # === what the harness stamped is set aside =======================================================
 
 
-def test_a_scheduled_check_in_repeated_is_a_twin_whatever_its_stamps():
+def test_a_scheduled_check_in_repeated_has_one_key_whatever_its_stamps():
     """The measured case: the same check-in, a new task each hour, the same routine reply."""
     first = _task("Hourly check-in: read your timelines and act on anything new.")
     again = _task(
@@ -90,23 +92,33 @@ def test_a_scheduled_check_in_repeated_is_a_twin_whatever_its_stamps():
         (_asset("skyline.png"), _asset("skyline.png", at=LATE), wake_module._ASSETS),
     ],
 )
-def test_every_renderers_stamps_are_set_aside(first, again, kind):
+def test_every_renderers_opening_stamp_is_set_aside(first, again, kind):
     assert _key(first, kind) == _key(again, kind)
 
 
-def test_a_batch_with_only_its_stamps_changed_is_a_twin():
-    first = wake_module._render_batch([_message("ping"), _message("still there?")])
-    again = wake_module._render_batch(
-        [_message("ping", at=LATE), _message("still there?", at=LATE)]
-    )
+def test_a_stamp_written_by_the_sdk_as_a_datetime_is_set_aside_too():
+    from datetime import UTC, datetime
 
-    assert twin_key(first, "Yes.") == twin_key(again, "Yes.")
+    first = _message("ping", at=datetime(2026, 11, 20, 6, tzinfo=UTC))
+    again = _message("ping", at=datetime(2026, 11, 20, 7, tzinfo=UTC))
+
+    assert _key(first, wake_module._MESSAGES) == _key(again, wake_module._MESSAGES)
+
+
+def test_a_batch_sets_aside_only_its_opening_stamp():
+    """A batch's later stamps are not at the opening, so a repeated batch is filed: the safe way."""
+    first = wake_module._render_batch([_message("ping"), _message("still there?")])
+    same_later = wake_module._render_batch([_message("ping", at=LATE), _message("still there?")])
+    moved_later = wake_module._render_batch([_message("ping"), _message("still there?", at=LATE)])
+
+    assert twin_key(first, "Yes.") == twin_key(same_later, "Yes.")
+    assert twin_key(first, "Yes.") != twin_key(moved_later, "Yes.")
 
 
 # === what was said is never set aside ============================================================
 
 
-def test_a_check_in_whose_reply_says_something_new_is_not_a_twin():
+def test_a_check_in_whose_reply_says_something_new_is_not_a_repeat():
     """The worry the issue names: a scheduled wake can be the one where the agent learned something."""
     check_in = _task("Hourly check-in: read your timelines and act on anything new.")
 
@@ -115,25 +127,47 @@ def test_a_check_in_whose_reply_says_something_new_is_not_a_twin():
     )
 
 
-def test_near_is_not_a_twin():
+def test_near_is_not_a_repeat():
     """Why the rule is exact: a near-twin can be the opposite fact."""
     assert twin_key("Is the deploy ready?", "The deploy is ready.") != twin_key(
         "Is the deploy ready?", "The deploy is not ready."
     )
 
 
-def test_a_uuid_or_time_a_peer_wrote_is_what_was_said():
-    """A stamp is masked only where a renderer puts it, never wherever its shape appears."""
-    first = _message(f"Use timeline {TIMELINE_A} from 2026-11-21T17:00:00Z.")
-    again = _message(f"Use timeline {TIMELINE_B} from 2026-11-21T17:00:00Z.", at=LATE)
-    later = _message(f"Use timeline {TIMELINE_A} from 2026-11-22T17:00:00Z.", at=LATE)
+def test_a_dated_line_in_a_reply_is_what_was_said():
+    """The self-review's counterexample: a line opening with a bracketed time, written by the model."""
+    check_in = _task("Hourly check-in.")
+
+    assert _key(
+        check_in, wake_module._TASKS, reply="Reminder set:\n[2026-11-21T09:00:00Z] call John"
+    ) != _key(check_in, wake_module._TASKS, reply="Reminder set:\n[2026-12-01T09:00:00Z] call John")
+
+
+def test_a_dated_line_inside_a_peers_message_is_what_was_said():
+    first = _message("Last backups:\n[2026-11-19T06:00:00Z] ok")
+    again = _message("Last backups:\n[2026-11-20T06:00:00Z] ok", at=LATE)
 
     assert _key(first, wake_module._MESSAGES, "Noted.") != _key(
         again, wake_module._MESSAGES, "Noted."
     )
-    assert _key(first, wake_module._MESSAGES, "Noted.") != _key(
-        later, wake_module._MESSAGES, "Noted."
-    )
+
+
+def test_a_uuid_or_time_a_peer_wrote_is_what_was_said():
+    first = _message(f"Use timeline {TIMELINE_A} from 2026-11-21T17:00:00Z.")
+    other_uuid = _message(f"Use timeline {TIMELINE_B} from 2026-11-21T17:00:00Z.", at=LATE)
+    other_time = _message(f"Use timeline {TIMELINE_A} from 2026-11-22T17:00:00Z.", at=LATE)
+
+    for again in (other_uuid, other_time):
+        assert _key(first, wake_module._MESSAGES, "Noted.") != _key(
+            again, wake_module._MESSAGES, "Noted."
+        )
+
+
+def test_a_task_header_written_into_a_reply_is_what_was_said():
+    header = wake_module._task_dialogue(_task("x"))
+    other = wake_module._task_dialogue(_task("x", uuid=TASK_B))
+
+    assert twin_key("ping", header) != twin_key("ping", other)
 
 
 def test_who_spoke_is_kept():
@@ -150,14 +184,19 @@ def test_a_different_endpoint_is_a_different_delivery():
     assert _key(first, wake_module._EVENTS) != _key(other, wake_module._EVENTS)
 
 
-def test_case_and_punctuation_are_words_and_whitespace_runs_are_one_space():
+def test_only_the_ends_of_each_half_are_trimmed():
+    """Indentation is meaning (code); case and punctuation are words ("$5" and "€5")."""
     assert twin_key("It costs $5.", "") != twin_key("It costs €5.", "")
     assert twin_key("Ping", "") != twin_key("ping", "")
-    assert twin_key("ping  me\n later", "ok") == twin_key("ping me later ", "ok")
+    assert twin_key("x", "if a:\n    g()") != twin_key("x", "if a:\ng()")
+    assert twin_key("x", "a  b") != twin_key("x", "a b")
+    assert twin_key("  ping\n", "ok\n\n") == twin_key("ping", "ok")
 
 
-def test_the_halves_never_merge():
+def test_no_text_can_move_the_boundary_between_the_halves():
     assert twin_key("a b", "") != twin_key("a", "b")
+    assert twin_key("a\x00b", "c") != twin_key("a", "b\x00c")
+    assert twin_key("1:a", "") != twin_key("", "a")
 
 
 def test_the_key_names_its_rule():
@@ -168,17 +207,33 @@ def test_the_key_names_its_rule():
 # === the census replays a recorded history =======================================================
 
 
-def test_the_census_keeps_the_first_of_each_twin_set_and_skips_the_rest():
-    history = [
-        ("[2026-11-20T06:00:00Z] john: ping", "Here."),
-        ("[2026-11-20T07:00:00Z] john: ping", "Here."),
-        ("[2026-11-20T08:00:00Z] john: ping", "Here, John."),
-        ("[2026-11-20T09:00:00Z] john: ping", "Here."),
-    ]
+def _ping(hour, reply="Here.", timeline=TIMELINE_A):
+    return (timeline, f"[2026-11-20T{hour:02d}:00:00Z] john: ping", reply)
+
+
+def test_a_repeat_of_the_newest_exchange_on_its_timeline_is_skipped():
+    found = census([_ping(6), _ping(7), _ping(8)])
+
+    assert (found.total, found.kept, found.skipped, found.collapsed) == (3, 1, 2, 1)
+
+
+def test_a_repeat_after_something_else_was_said_is_kept():
+    """Later is current: ok, down, ok keeps all three, so memory's newest record is ok."""
+    history = [_ping(6, "Status ok."), _ping(7, "Status down."), _ping(8, "Status ok.")]
+
+    assert census(history).skipped == 0
+
+
+def test_the_same_words_on_another_timeline_are_kept():
+    history = [_ping(6), _ping(7, timeline=TIMELINE_B), _ping(8), _ping(9, timeline=TIMELINE_B)]
 
     found = census(history)
 
-    assert (found.total, found.kept, found.skipped, found.collapsed) == (4, 2, 2, 1)
+    assert (found.kept, found.skipped, found.collapsed) == (2, 2, 2)
+
+
+def test_an_exchange_with_no_timeline_is_always_kept():
+    assert census([_ping(6, timeline=None), _ping(7, timeline=None)]).skipped == 0
 
 
 @pytest.mark.parametrize(

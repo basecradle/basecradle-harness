@@ -183,16 +183,17 @@ However large the burst and however much is seeded, the query is the newest mess
 
 **Turn-0 recall skips what this wake just filed from its seeded backlog** ([issue #746](https://github.com/basecradle/basecradle-harness/issues/746)). That backlog is mined before the turn, and the query carries it, so its drawers are the closest matches by construction. On one agent's palace they took 4 of the 10 injected slots with the very question the model was reading in its transcript. They are now dropped from the Turn-0 ranking before the pool is cut, so those slots go to other memories. The rule is narrow on purpose: only the conversation files this wake wrote from its seed, never every drawer from the current timeline (a compacted transcript no longer holds its early turns). The `memory_search` tool still returns them, and so does every later wake's recall.
 
-**An exchange the palace already holds, word for word, is not filed again** ([issue #950](https://github.com/basecradle/basecradle-harness/issues/950)). Routine exchanges are not memories: on one agent's store, routine check-ins were 7.5% of all drawers, near-identical to each other, 42 of them unreachable by search because their own twins outranked them, and every one of them competing with a distinctive memory for a place in recall. The agent keeps its transcript; memory is for what was learned. So before an exchange is filed, the harness computes its **twin key** and asks the store whether it already holds one filed under it. If it does, the exchange is not filed, and one INFO line says so:
+**An exchange that repeats the newest one filed on its timeline is not filed again** ([issue #950](https://github.com/basecradle/basecradle-harness/issues/950)). Routine exchanges are not memories: on one agent's store, routine check-ins were 7.5% of all drawers, near-identical to each other, 42 of them unreachable by search because their own twins outranked them, and every one of them competing with a distinctive memory for a place in recall. The agent keeps its transcript; memory is for what was learned. So before an exchange is filed, the harness computes its key and asks the store whether the newest exchange it filed on the same timeline carries that key. If it does, the exchange is not filed, and one INFO line says so:
 
 ```
-INFO memory op=observe result=skipped reason=twin chars=213
+INFO memory op=observe result=skipped reason=twin chars=<n>
 ```
 
-- **The rule keys on what was said, never on how the wake started.** A scheduled check-in can be the wake on which the agent learned something, so there is no list of routine kinds. An hourly check-in whose reply is the routine one is a twin of the last; the same check-in whose reply says something new is not, and is filed.
-- **Exact, never near.** Two exchanges are twins only when their words are the same once the harness's own stamps are set aside: the `[created_at]` stamp opening each item, a task activation's uuid and send time, and a webhook delivery's event uuid, each only where the harness writes it. Whitespace runs count as one space; case, punctuation and everything a peer or the model wrote count as written, a uuid or a time inside a message included. A near-twin rule cannot be made safe: "the deploy is ready" and "the deploy is not ready" are near-twins by any measure of similarity. A routine reply the model phrases a new way is filed once per phrasing.
-- **The record is the store's.** The key is filed on every drawer of the exchange (`harness_twin` in MemPalace's metadata), and the answer is a metadata lookup in the palace: no search, no embedding, no model call, no list kept beside the palace. A drawer that is removed takes its key with it, so its twin is filed again the next time it happens. Nothing already filed is touched: a drawer from before 0.201.0 carries no key, so the first twin after the upgrade is filed once.
-- **A custom provider opts in** by answering `holds(twin)` from its own store and keeping `exchange.twin` with what it files. A provider that does not files every exchange, as before.
+- **The rule keys on what was said, never on how the wake started.** A scheduled check-in can be the wake on which the agent learned something, so there is no list of routine kinds. An hourly check-in whose reply is the routine one repeats the last; the same check-in whose reply says something new does not, and is filed.
+- **Exact, never near.** Two exchanges match only when their words are the same, with one thing set aside: the stamp the harness writes at the opening of the peer's half (the item's `[created_at]`, and for a task activation its uuid and send time, for a webhook delivery its event uuid). The reply is never masked, and neither is anything a peer wrote, so a time or a uuid anyone *said* counts as said. Leading and trailing whitespace is dropped; indentation, case and punctuation count. A near-twin rule cannot be made safe: "the deploy is ready" and "the deploy is not ready" are near-twins by any measure of similarity. A routine reply the model phrases a new way is filed.
+- **The newest on its timeline, never any.** Memory is read as "later is current", so a status that went `ok`, then `down`, then `ok` keeps all three exchanges: skipping the third would leave `down` as the newest record. A repeat of the newest record changes neither what memory holds nor which record is newest. The same words on another timeline are another event, and are filed.
+- **The record is the store's.** The key and the timeline are filed on every drawer of the exchange (`harness_twin` and `harness_timeline` in MemPalace's metadata), and the answer is two metadata lookups in the palace: no search, no embedding, no model call, no list kept beside the palace. A drawer that is removed takes its key with it, so its repeat is filed again. Nothing already filed is touched: a drawer from before 0.201.0 carries no key, so the first repeat after the upgrade is filed once.
+- **A custom provider opts in** by answering `repeats(exchange)` from its own store and keeping `exchange.twin` and the timeline with what it files. A provider that does not files every exchange, as before.
 
 ### Let a model pick what gets recalled — the LLM reranker
 
@@ -435,7 +436,7 @@ When the dry-run forecast says files will be **mined as new**, each one gets a l
 
 #### What the twin rule would have done — `--twin-census`
 
-`--twin-census` replays the palace's conversation files, oldest first, through the [twin rule](#swap-the-memory-backend--the-memory-provider) the observe applies, and prints how many exchanges it would have kept, how many it would have skipped, and how many distinct exchanges the skipped ones repeat. Each file is one exchange the observe filed, so the directory is the agent's recorded history of what was mined. It is **token-free and read-only**, opens no database (it runs on a copy of the `conversations/` directory alone), prints counts only, and runs alone:
+`--twin-census` replays the palace's conversation files, oldest first, through the [repeat rule](#swap-the-memory-backend--the-memory-provider) the observe applies, and prints how many exchanges it would have kept, how many it would have skipped, and how many distinct exchanges the skipped ones repeat. Each file is one exchange the observe filed, with its timeline in its name, so the directory is the agent's recorded history of what was mined. It is **token-free and read-only**, opens no database (it runs on a copy of the `conversations/` directory alone), prints no drawer text, and runs alone:
 
 ```
 basecradle-harness-palace-check --twin-census /home/<user>/harness
@@ -457,8 +458,8 @@ class MyMemory(MemoryProvider):
     def context(self, scope):  # at Turn 0 — scope.agent is the identity, scope.query the turn
         return "Relevant memories:\n- John lives in Dallas."  # or None to inject nothing
 
-    def holds(self, twin):  # optional: True when the store already filed exchange.twin == twin
-        return False  # the default: every exchange is filed
+    def repeats(self, exchange):  # optional: True when the newest exchange filed on
+        return False  # exchange.scope.timeline carries exchange.twin; the default files every one
 
     def tools(self):  # optional: model-facing ops, on top of the automatic hooks
         return []

@@ -91,11 +91,12 @@ from the cut, whether a wider ask reaches it and at which, whether a copy or nea
 place, whether sentinels or the widening cap kept it out, and whether an index has lost it. See
 `basecradle_harness._palace_pool`.
 
-**What the twin rule would have done: ``--twin-census``** (issue #950). Token-free and read-only,
-and it opens no database: it reads the palace's conversation files alone (each is one exchange the
-observe filed, so the directory read in filing order is the agent's recorded history of what was
-mined), replays them through the rule the observe now applies (`_twins`), and prints how many it
-would have kept and how many skipped. Counts only. See `twin_census`.
+**What the repeat rule would have done: ``--twin-census``** (issue #950). Token-free and
+read-only, and it opens no database: it reads the palace's conversation files alone (each is one
+exchange the observe filed, its timeline in its name, so the directory read in filing order is the
+agent's recorded history of what was mined), replays them through the rule the observe now applies
+(`_twins`), and prints how many it would have kept and how many skipped. No drawer text. See
+`twin_census`.
 
 **A miss is diagnosed, never printed.** A probe that does not come back gets a ``why:`` line made of
 ids, counts and ranks: how many drawers carry its exact text or its query, what took the top slots,
@@ -136,6 +137,7 @@ from basecradle_harness._mempalace import (
     content_hashes,
     exchange_of,
     filed_by_observe,
+    timeline_of_file,
 )
 from basecradle_harness._observability import last_word, log_handler
 from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL, reranker_from_env
@@ -1350,14 +1352,15 @@ def _positive(value: str) -> int:
 
 
 def twin_census(palace: Path) -> TwinCensus:
-    """What the twin rule would have done to this palace's recorded exchanges (issue #950).
+    """What the repeat rule would have done to this palace's recorded exchanges (issue #950).
 
     Every file in the conversations directory, oldest first by modification time (the observe
     writes a file once, and a home move that keeps mtimes keeps the order), name breaking a tie,
-    read back into its two halves (`_mempalace.exchange_of`) and replayed through the rule
-    (`_twins.census`). Reads no database and imports no MemPalace, so it runs on a copy of the
-    directory alone. A file that cannot be read is an error, not a skip: a census that quietly
-    dropped files would report a number for a history it did not read.
+    read back into its timeline (from its name, `_mempalace.timeline_of_file`) and its two halves
+    (`_mempalace.exchange_of`), and replayed through the rule (`_twins.census`). Reads no database
+    and imports no MemPalace, so it runs on a copy of the directory alone. A file that cannot be
+    read is an error, not a skip: a census that quietly dropped files would report a number for a
+    history it did not read.
     """
     convos = palace / _CONVERSATIONS_WING
     files = (
@@ -1369,7 +1372,11 @@ def twin_census(palace: Path) -> TwinCensus:
         else []
     )
     return replay_twins(
-        exchange_of(path.read_text(encoding="utf-8", errors="replace")) for path in files
+        (
+            timeline_of_file(path.name),
+            *exchange_of(path.read_text(encoding="utf-8", errors="replace")),
+        )
+        for path in files
     )
 
 
@@ -1525,9 +1532,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "token-free, read-only, and runs alone: replay the palace's conversation files, oldest "
-            "first, through the rule the observe applies to a twin (an exchange word for word "
-            "one already filed, the harness's own stamps aside), and print how many it would "
-            "have kept and skipped. Opens no database. Counts only."
+            "first, through the rule the observe applies to a repeat (an exchange word for word "
+            "the newest one filed on its timeline, the harness's opening stamp aside), and print "
+            "how many it would have kept and skipped. Opens no database. No drawer text."
         ),
     )
     parser.add_argument(

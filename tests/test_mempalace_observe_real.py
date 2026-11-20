@@ -241,23 +241,22 @@ def test_a_fact_at_the_end_of_a_long_message_is_still_recalled(tmp_path, query, 
     assert any(needle in hit["text"] for hit in hits)
 
 
-# === the twin rule on a real palace (issue #950) ==================================================
+# === the repeat rule on a real palace (issue #950) ================================================
+
+OTHER_TIMELINE = "019a3b2c-4d5e-7f60-8a1b-2c3d4e5f6a7c"
 
 
-def _engine_observe(provider, user, assistant):
+def _engine_observe(provider, user, assistant, *, timeline=TIMELINE, seeded=False):
     """The engine's own choke point (`WakeAgent._observe`), on a stand-in wake holding `provider`."""
     from types import SimpleNamespace
 
     from basecradle_harness._wake import WakeAgent
 
     wake = SimpleNamespace(
-        memory_provider=provider,
-        _degraded=False,
-        me_uuid=SCOPE.agent,
-        timeline_uuid=TIMELINE,
+        memory_provider=provider, _degraded=False, me_uuid=SCOPE.agent, timeline_uuid=timeline
     )
     with contextlib.redirect_stdout(io.StringIO()):
-        WakeAgent._observe(wake, user, assistant)
+        WakeAgent._observe(wake, user, assistant, seeded=seeded)
 
 
 CHECK_IN = (
@@ -267,39 +266,72 @@ CHECK_IN = (
 )
 
 
-def _check_in(hour: int, task: str) -> str:
-    return CHECK_IN.format(at=f"2026-11-20T{hour:02d}:00:00.000Z", task=task)
+def _check_in(hour: int) -> str:
+    return CHECK_IN.format(
+        at=f"2026-11-20T{hour:02d}:00:00.000Z", task=f"019e7761-2222-7333-8444-5555666677{hour:02d}"
+    )
+
+
+def _replies(palace: Path) -> list[str]:
+    real = sorted(_rows(palace)[0], key=lambda row: row[1]["source_mtime"])
+    return [text.splitlines()[-1] for text, _ in real]
 
 
 def test_two_identical_check_ins_leave_one_memory_and_a_new_word_leaves_another(tmp_path):
     """The DoD's case on a real palace, through the engine's own observe."""
-    from basecradle_harness._mempalace import TWIN_FIELD
-    from basecradle_harness._twins import twin_key
+    from basecradle_harness._mempalace import TIMELINE_FIELD, TWIN_FIELD
 
     palace = tmp_path / "palace"
     provider = MemPalaceMemoryProvider(palace, agent="nova")
-    assert provider.holds(twin_key("anything", "")) is False  # no palace yet
 
-    _engine_observe(provider, _check_in(6, "019e7761-2222-7333-8444-555566667777"), "All quiet.")
-    _engine_observe(provider, _check_in(7, "019e7761-2222-7333-8444-555566667778"), "All quiet.")
-    assert len(_rows(palace)[0]) == 1
+    _engine_observe(provider, _check_in(6), "All quiet.")
+    _engine_observe(provider, _check_in(7), "All quiet.")
+    assert _replies(palace) == ["All quiet."]
     assert len(list((palace / "conversations").iterdir())) == 1
 
-    _engine_observe(
-        provider,
-        _check_in(8, "019e7761-2222-7333-8444-555566667779"),
-        "John moved the deploy key to the vault.",
-    )
+    _engine_observe(provider, _check_in(8), "John moved the deploy key to the vault.")
     real = _rows(palace)[0]
     assert len(real) == 2
     assert len({meta[TWIN_FIELD] for _, meta in real}) == 2
+    assert {meta[TIMELINE_FIELD] for _, meta in real} == {TIMELINE}
     # And the store still serves: a search after the interleaved reads and writes finds the fact.
     hits = provider.search("where is the deploy key", n_results=2)
     assert any("vault" in (hit.get("text") or "") for hit in hits)
 
 
-def test_every_drawer_of_a_split_exchange_carries_its_key(tmp_path):
-    from basecradle_harness._mempalace import TWIN_FIELD
+def test_a_repeat_after_something_else_was_said_is_filed(tmp_path):
+    """Later is current: ok, down, ok leaves three records, so the newest one says ok."""
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+
+    for hour, reply in (
+        (6, "Status ok."),
+        (7, "Status down."),
+        (8, "Status ok."),
+        (9, "Status ok."),
+    ):
+        _engine_observe(provider, _check_in(hour), reply)
+
+    assert _replies(palace) == ["Status ok.", "Status down.", "Status ok."]
+
+
+def test_the_same_words_on_another_timeline_are_filed(tmp_path):
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+
+    _engine_observe(provider, "[2026-11-20T06:00:00.000Z] john: Deploy approved.", "Noted.")
+    _engine_observe(
+        provider,
+        "[2026-11-20T07:00:00.000Z] john: Deploy approved.",
+        "Noted.",
+        timeline=OTHER_TIMELINE,
+    )
+
+    assert len(_rows(palace)[0]) == 2
+
+
+def test_every_drawer_of_a_split_exchange_carries_its_key_and_timeline(tmp_path):
+    from basecradle_harness._mempalace import TIMELINE_FIELD, TWIN_FIELD
     from basecradle_harness._twins import twin_key
 
     palace = tmp_path / "palace"
@@ -307,13 +339,16 @@ def test_every_drawer_of_a_split_exchange_carries_its_key(tmp_path):
     user = "[2026-11-20T06:00:00.000Z] john: " + "a long message line. " * 120
 
     _engine_observe(provider, user, "Read it.")
+    _engine_observe(provider, user.replace("06:00", "07:00"), "Read it.")
 
     real = _rows(palace)[0]
     assert len(real) > 1
     assert {meta[TWIN_FIELD] for _, meta in real} == {twin_key(user, "Read it.")}
+    assert {meta[TIMELINE_FIELD] for _, meta in real} == {TIMELINE}
+    assert len(list((palace / "conversations").iterdir())) == 1
 
 
-def test_a_twin_whose_memory_was_removed_is_filed_again(tmp_path):
+def test_a_repeat_whose_memory_was_removed_is_filed_again(tmp_path):
     """The record is the store: a drawer deleted (a scrub, a wiped palace) takes its key with it."""
     palace = tmp_path / "palace"
     provider = MemPalaceMemoryProvider(palace, agent="nova")
@@ -326,7 +361,7 @@ def test_a_twin_whose_memory_was_removed_is_filed_again(tmp_path):
     assert len(_rows(palace)[0]) == 1
 
 
-def test_a_drawer_filed_before_the_rule_is_never_a_twin(tmp_path):
+def test_a_drawer_filed_before_the_rule_is_never_repeated(tmp_path):
     """Nothing already filed is touched or counted: a pre-rule drawer carries no key."""
     palace = tmp_path / "palace"
     provider = MemPalaceMemoryProvider(palace, agent="nova")
@@ -336,6 +371,22 @@ def test_a_drawer_filed_before_the_rule_is_never_a_twin(tmp_path):
     _engine_observe(provider, "[2026-11-20T08:00:00.000Z] john: ping", "Here.")
 
     assert len(_rows(palace)[0]) == 2
+
+
+def test_a_seeded_repeat_keeps_the_drawer_it_repeats_out_of_this_wakes_recall(tmp_path):
+    """Issue #746 still holds when the seeded message is not filed: its standing record is excluded."""
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    _engine_observe(provider, "[2026-11-20T06:00:00.000Z] john: The codename is TEAL-OTTER-9.", "")
+    (filed,) = list((palace / "conversations").iterdir())
+    provider.begin_wake()
+
+    _engine_observe(
+        provider, "[2026-11-20T07:00:00.000Z] john: The codename is TEAL-OTTER-9.", "", seeded=True
+    )
+
+    assert len(_rows(palace)[0]) == 1
+    assert provider._seeded_files == {filed.name}
 
 
 def test_the_census_reads_a_real_palaces_files_as_the_observe_keyed_them(tmp_path):

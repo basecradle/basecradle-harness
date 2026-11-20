@@ -831,7 +831,7 @@ What the request the model is about to read is made of, in characters, summing e
 
 ### `memory`
 
-One line per memory-system operation other than a retrieval's report, which is `memory recall` (`_wake`, `_mempalace`). The wake writes its own `op=recall` and `op=observe` guard lines here when the provider's hook fails, and an INFO `op=observe result=skipped reason=twin` line for an exchange it did not file because the store already holds its twin (issue #950).
+One line per memory-system operation other than a retrieval's report, which is `memory recall` (`_wake`, `_mempalace`). The wake writes its own `op=recall` and `op=observe` guard lines here when the provider's hook fails, and an INFO `op=observe result=skipped reason=twin` line for an exchange it did not file because it repeats the newest exchange the store filed on its timeline (issue #950).
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
@@ -839,7 +839,7 @@ One line per memory-system operation other than a retrieval's report, which is `
 | `result` | How it ended, where it did not simply succeed: `failed`, `skipped`, `unfile_failed`. | The caller. | The operation succeeded. |
 | `provider` | Common: the memory software. | The caller. | The wake's own lines, which do not know it; `op=palace-binding`. |
 | `surface` | As on `llm`. | `_mempalace`. | Not a search. |
-| `reason` | Why, as a slug: `twin` (an exchange the store already holds word for word, the harness's own stamps aside, so not filed again); the MemPalace adapter's own slugs. | `_mempalace`; the wake, for `twin`. | Nothing to explain. |
+| `reason` | Why, as a slug: `twin` (an exchange that repeats, word for word, the newest one the store filed on its timeline, so not filed again); the MemPalace adapter's own slugs. | `_mempalace`; the wake, for `twin`. | Nothing to explain. |
 | `keys` | The field names of an error envelope upstream returned. | `_mempalace`. | Not that failure. |
 | `type` | The type of an answer that was not a mapping. | `_mempalace`. | Not that failure. |
 | `palace` | The palace path bound. | `_mempalace`. | Not a binding. |

@@ -8,6 +8,7 @@ dry-run mine that prints MemPalace's per-file lines.
 
 import contextlib
 import hashlib
+import os
 import sys
 import types
 from importlib import metadata
@@ -1149,11 +1150,18 @@ def test_relocation_batches_never_split_a_file():
 
 
 def test_the_twin_census_counts_kept_and_skipped_and_opens_no_database(home, fake, capsys):
-    """The `home` fixture's four files are one exchange, four times: one kept, three twins."""
+    """Three repeats on one timeline collapse to one; files that name no timeline are all kept."""
+    convos = home / "mempalace" / "conversations"
+    timeline = "019e7750-66ee-7f53-829f-13a8a710b6da"
+    for n in range(3):
+        path = convos / f"{timeline}.{n:032x}.md"
+        path.write_text(f"> [2026-11-20T0{n}:00:00Z] john: ping\nHere.\n", encoding="utf-8")
+        os.utime(path, (1_000 + n, 1_000 + n))
+
     code, lines = _run(capsys, home, "--twin-census")
 
     assert code == 0
-    assert lines[-1] == "twin census: 4 exchanges, 1 kept, 3 skipped as twins of 1"
+    assert lines[-1] == "twin census: 7 exchanges, 5 kept, 2 skipped as twins of 1"
     assert fake.opened == [] and fake.searches == [] and fake.mines == []
 
 
