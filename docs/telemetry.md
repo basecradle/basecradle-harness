@@ -831,7 +831,7 @@ What the request the model is about to read is made of, in characters, summing e
 
 ### `memory`
 
-One line per memory-system operation other than a retrieval's report, which is `memory recall` (`_wake`, `_mempalace`). The wake writes its own `op=recall` and `op=observe` guard lines here when the provider's hook fails.
+One line per memory-system operation other than a retrieval's report, which is `memory recall` (`_wake`, `_mempalace`). The wake writes its own `op=recall` and `op=observe` guard lines here when the provider's hook fails, and an INFO `op=observe result=skipped reason=marked` line for a marked real wake it did not hand to memory (issue #950).
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
@@ -839,11 +839,12 @@ One line per memory-system operation other than a retrieval's report, which is `
 | `result` | How it ended, where it did not simply succeed: `failed`, `skipped`, `unfile_failed`. | The caller. | The operation succeeded. |
 | `provider` | Common: the memory software. | The caller. | The wake's own guard line, which does not know it; `op=palace-binding`. |
 | `surface` | As on `llm`. | `_mempalace`. | Not a search. |
-| `reason` | Why, as a slug. | `_mempalace`. | Nothing to explain. |
+| `reason` | Why, as a slug: `marked` (a wake the NOC marked with a verified `BCNOC2`, not handed to memory); the MemPalace adapter's own slugs. | `_mempalace`; the wake, for `marked`. | Nothing to explain. |
 | `keys` | The field names of an error envelope upstream returned. | `_mempalace`. | Not that failure. |
 | `type` | The type of an answer that was not a mapping. | `_mempalace`. | Not that failure. |
 | `palace` | The palace path bound. | `_mempalace`. | Not a binding. |
 | `config` | The MemPalace config file path. | `_mempalace`. | Not a binding. |
+| `timeline` | Common. | The wake, on `reason=marked`. | Any other line. |
 | `chars` | Common. | The wake. | Not the wake's guard line. |
 
 ### `memory recall`

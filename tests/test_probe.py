@@ -65,3 +65,57 @@ def test_a_bare_unsigned_sentinel_is_rejected():
 
 def test_ack_line_echoes_the_nonce_unsigned():
     assert ack_line(NONCE) == f"BCNOC1-ACK {NONCE}"
+
+
+# --- BCNOC2: the marked real wake (issue #950) ---------------------------------------------------
+
+from basecradle_harness._probe import marked_payload, verify_marked  # noqa: E402
+
+TIMELINE = "019e7750-66ee-7f53-829f-13a8a710b6da"
+OTHER_TIMELINE = "019e7750-66ee-7f53-829f-13a8a710b6db"
+# The pinned vector for BCNOC2: HMAC-SHA256 over "BCNOC2 <timeline> <nonce>" under SECRET. The NOC's
+# mint must produce exactly this; do not regenerate without the NOC side agreeing on #950.
+MARKED_HMAC = "26a9203bd55f36a47731f03315514e40930eced3ec72f14377922a41c1a3400c"
+MARKED = f"BCNOC2 {NONCE} {MARKED_HMAC}"
+
+
+def marked(nonce, timeline=TIMELINE, secret=SECRET):
+    sig = hmac.new(secret.encode(), marked_payload(nonce, timeline), sha256).hexdigest()
+    return f"BCNOC2 {nonce} {sig}"
+
+
+def test_the_marked_pinned_vector_verifies_on_its_timeline():
+    assert marked_payload(NONCE, TIMELINE) == f"BCNOC2 {TIMELINE} {NONCE}".encode()
+    assert verify_marked(f"NOC check.\n{MARKED}", SECRET, TIMELINE) == NONCE
+
+
+def test_a_marked_copy_on_another_timeline_does_not_verify():
+    """A real marker pasted elsewhere is an ordinary message: nobody can make an agent forget one."""
+    assert verify_marked(MARKED, SECRET, TIMELINE) == NONCE
+    assert verify_marked(MARKED, SECRET, OTHER_TIMELINE) is None
+
+
+def test_a_marker_signed_without_its_timeline_never_verifies():
+    """The signed bytes name the timeline; a line signed over "BCNOC2 <nonce>" alone is forged."""
+    unbound = hmac.new(SECRET.encode(), f"BCNOC2 {NONCE}".encode(), sha256).hexdigest()
+    for timeline in (TIMELINE, OTHER_TIMELINE):
+        assert verify_marked(f"BCNOC2 {NONCE} {unbound}", SECRET, timeline) is None
+
+
+def test_the_timeline_is_read_as_the_harness_records_it():
+    assert verify_marked(MARKED, SECRET, f" {TIMELINE.upper()} ") == NONCE
+
+
+def test_a_wrongly_signed_or_misshapen_marked_line_does_not_verify():
+    assert verify_marked(marked(NONCE, secret="another-secret"), SECRET, TIMELINE) is None
+    assert verify_marked(f"BCNOC2 {NONCE} {'0' * 64}", SECRET, TIMELINE) is None
+    assert verify_marked(f"BCNOC2 {NONCE}", SECRET, TIMELINE) is None
+    assert verify_marked("", SECRET, TIMELINE) is None
+
+
+def test_the_two_kinds_never_stand_in_for_each_other():
+    """A BCNOC2 is never acked as a probe, and a BCNOC1 never marks a real wake."""
+    assert verify_probe(MARKED, SECRET) is None
+    assert verify_marked(MARKER, SECRET, TIMELINE) is None
+    forged_as_probe = MARKED.replace("BCNOC2", "BCNOC1")
+    assert verify_probe(forged_as_probe, SECRET) is None

@@ -225,7 +225,7 @@ from basecradle_harness._observability import (
 )
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._plugins import ResolvedTools
-from basecradle_harness._probe import ack_line, verify_probe
+from basecradle_harness._probe import ack_line, verify_marked, verify_probe
 from basecradle_harness._provider import Provider
 from basecradle_harness._report import (
     BILLING,
@@ -2382,7 +2382,7 @@ class WakeAgent:
             _incoming_asset_text,
             kind=_ASSETS,
             skip=self._is_own,
-            probe=lambda asset: self._probe_nonce(_asset_marker_carrier(asset)),
+            probe=lambda asset: self._probe_nonce(_carrier(asset, _ASSETS)),
         )
 
     def _perceive_asset(self, asset: object) -> tuple[str, list[ImageContent]]:
@@ -2722,7 +2722,7 @@ class WakeAgent:
             _incoming_event_text,
             _incoming_event_text,
             kind=_EVENTS,
-            probe=lambda event: self._probe_nonce(event.content.payload),
+            probe=lambda event: self._probe_nonce(_carrier(event, _EVENTS)),
         )
 
     # --- activated tasks -----------------------------------------------------
@@ -2787,7 +2787,7 @@ class WakeAgent:
             # is the safe failure direction for a monitor — a crash before recording re-acks
             # (harmless) rather than leaving the task claimed-but-unacked, which would
             # manufacture a false FAIL. See task-seam.md §4.
-            probe=lambda task: self._probe_nonce(task.content.instructions),
+            probe=lambda task: self._probe_nonce(_carrier(task, _TASKS)),
         )
 
     # --- the shared act-on loop ----------------------------------------------
@@ -2966,7 +2966,7 @@ class WakeAgent:
             # arriving in items the agent chose not to answer: a peer's birthday mentioned in a
             # message the agent had no reason to reply to must still be recallable, from any
             # timeline, later. The exchange is real whether or not anyone else heard it.
-            self._observe(_dialogue_of(item, kind), narration)
+            self._observe(_dialogue_of(item, kind), narration, marked=self._marked(item, kind))
             if truncated_turn:
                 # The turn is unfinished, so it is **not committed** (issue #490): the claim stays
                 # in-flight, the record stops here, and the next wake finishes the turn. It *is*
@@ -3298,7 +3298,9 @@ class WakeAgent:
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake
             _log.warning("Memory provider begin_wake() failed; continuing.", exc_info=True)
 
-    def _observe(self, user: str, assistant: str, *, seeded: bool = False) -> None:
+    def _observe(
+        self, user: str, assistant: str, *, seeded: bool = False, marked: bool = False
+    ) -> None:
         """Hand a completed exchange to the memory provider's `observe` hook, guarded.
 
         **The one place the harness mines, and therefore the one place the boundary is kept**
@@ -3322,6 +3324,12 @@ class WakeAgent:
           quoting its own injected recall back in a reply, which is genuine LLM output on a path
           that is genuinely mined.
 
+        - **A marked real wake is not handed to memory at all** (``marked``, issue #950): the NOC's
+          own verification wake, recognised by a verified `BCNOC2` marker bound to this timeline
+          (`_marked`). The caller decides it from the items the turn answered, never from text, and
+          one INFO line says so, ``memory op=observe result=skipped reason=marked``. A batch with
+          any unmarked message in it is mined whole.
+
         Fires after each real exchange (never on a probe ack or a self-skip — those never
         reach here), and before the turn for a first wake's seeded backlog, which says so
         (``seeded``, issue #746). A no provider, or one whose hook is a no-op (the default SQLite
@@ -3330,6 +3338,18 @@ class WakeAgent:
         posted.
         """
         if self.memory_provider is None:
+            return
+        if marked:
+            _log.info(
+                "memory %s",
+                kv(
+                    op="observe",
+                    result="skipped",
+                    reason="marked",
+                    timeline=self.timeline_uuid,
+                    chars=len(user) + len(assistant),
+                ),
+            )
             return
         user = strip_injected(user)
         assistant = "" if self._degraded else strip_injected(assistant)
@@ -3389,7 +3409,12 @@ class WakeAgent:
         if self.memory_provider is None:
             return
         for message in self._seeded_peers(seeded)[-DEFAULT_CONTEXT_MESSAGES:]:
-            self._observe(_dialogue_of(message, _MESSAGES), "", seeded=True)
+            self._observe(
+                _dialogue_of(message, _MESSAGES),
+                "",
+                seeded=True,
+                marked=self._marked(message, _MESSAGES),
+            )
 
     def _seeded_peers(self, seeded: list[object]) -> list[object]:
         """The peer messages in a first wake's seeded backlog, oldest first.
@@ -3401,7 +3426,7 @@ class WakeAgent:
         return [
             message
             for message in seeded
-            if not self._is_own(message) and self._probe_nonce(message.content.body or "") is None
+            if not self._is_own(message) and self._probe_nonce(_carrier(message, _MESSAGES)) is None
         ]
 
     def _manifest_entries(self) -> list[tuple[str, str | None]]:
@@ -3474,6 +3499,34 @@ class WakeAgent:
         if not self.probe_secret:
             return None
         return verify_probe(carrier, self.probe_secret.reveal())
+
+    def _marked(self, item: object, kind: str) -> bool:
+        """Whether `item` carries a verified `BCNOC2` marker for this timeline (issue #950).
+
+        A **marked real wake**: the NOC's own verification wake (a roll, a move, a check on demand,
+        basecradle-noc#1636), which runs as any other wake, model included, and is not handed to
+        memory (`_observe`). Off unless `NOC_PROBE_SECRET` was provisioned, exactly as the probe is:
+        with no secret nothing verifies, and a marked item is an ordinary one. The marker is read
+        from the same field as the probe's (`_carrier`) and bound to this timeline
+        (`_probe.marked_payload`), so a copy of a real marker pasted into a message anywhere else is
+        an ordinary message, mined like any other: nobody can make an agent forget a real
+        conversation by calling it a probe.
+        """
+        if not self.probe_secret:
+            return False
+        secret = self.probe_secret.reveal()
+        return verify_marked(_carrier(item, kind), secret, self.timeline_uuid) is not None
+
+    def _turn_marked(self, turn: Message, item: object, kind: str) -> bool:
+        """Whether a recovered turn (a resume, a stall) was a marked real wake and nothing else.
+
+        Only a turn that carried this one item: a recovered message turn may have answered a whole
+        batch, whose mates are known here only by uuid, so their markers cannot be read and the turn
+        is mined, as an unmarked one is. Mining a marked wake costs one drawer; not mining a real
+        message would cost a memory.
+        """
+        uuid = item.content.uuid
+        return set(turn.items or [uuid]) <= {uuid} and self._marked(item, kind)
 
     # --- the first wake: infer a high-water mark from the timeline ------------
 
@@ -3724,7 +3777,11 @@ class WakeAgent:
         # silence-default the most valuable exchange to remember can be exactly the one that
         # produced no reply — a peer states a fact in passing, the agent rightly says nothing, and
         # the fact must still be recallable from another timeline a month later.
-        self._observe(_render_batch(batch), narration)
+        self._observe(
+            _render_batch(batch),
+            narration,
+            marked=all(self._marked(message, _MESSAGES) for message in batch),
+        )
         if truncated_turn:
             # The turn is unfinished (issue #490). Flip this batch's `_OURS` entries to `_PENDING`
             # — exactly as the billing wall does — so `_settle` commits none of them, the mark holds
@@ -3788,7 +3845,7 @@ class WakeAgent:
             if self._is_own(item):
                 ledger.append((uuid, _FINAL))
                 continue
-            nonce = self._probe_nonce(item.content.body)
+            nonce = self._probe_nonce(_carrier(item, _MESSAGES))
             if nonce is not None:
                 if uuid in self._acked_probes:  # acked by an earlier pass of this wake (#596)
                     ledger.append((uuid, _FINAL))
@@ -4160,7 +4217,11 @@ class WakeAgent:
             # wake's turn may have carried a *batch* (`_render_batch`), and mining the one item
             # that owned the claim would forget the peers it was answered alongside. That
             # rendering is already dialogue — every other kind's is not (`_dialogue_of`).
-            self._observe(rendered if kind == _MESSAGES else _dialogue_of(item, kind), narration)
+            self._observe(
+                rendered if kind == _MESSAGES else _dialogue_of(item, kind),
+                narration,
+                marked=self._turn_marked(turn, item, kind),
+            )
             if truncated_turn:
                 # The continuation was itself cut off (issue #490). The turn is still unfinished, so
                 # it does not commit — the claim this wake just reclaimed stays in-flight, naming
@@ -4400,7 +4461,11 @@ class WakeAgent:
             return _PENDING
         if mine:
             rendered = turn.content or text(item)
-            self._observe(rendered if kind == _MESSAGES else _dialogue_of(item, kind), "")
+            self._observe(
+                rendered if kind == _MESSAGES else _dialogue_of(item, kind),
+                "",
+                marked=self._turn_marked(turn, item, kind),
+            )
         for mate in turn.items:
             if mate != uuid:
                 self._stall_mate(mate, kind)
@@ -5412,6 +5477,23 @@ def _asset_marker_carrier(asset: object) -> str:
     through to perception, never mistaken for a probe.
     """
     return getattr(asset.content, "description", None) or ""
+
+
+def _carrier(item: object, kind: str) -> str:
+    """The field of an item a NOC marker rides in: one mapping, read by both marker kinds.
+
+    A message's body, a task's instructions, a webhook delivery's payload, an asset's description
+    (`_asset_marker_carrier`). The synthetic probe (`BCNOC1`, `_probe_nonce`) and the marked real
+    wake (`BCNOC2`, `WakeAgent._marked`) read the same field of the same item, so the two can never
+    disagree about where a marker is.
+    """
+    if kind == _ASSETS:
+        return _asset_marker_carrier(item)
+    if kind == _EVENTS:
+        return item.content.payload or ""
+    if kind == _TASKS:
+        return item.content.instructions or ""
+    return item.content.body or ""
 
 
 def wake_harness(
