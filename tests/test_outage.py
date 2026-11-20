@@ -44,6 +44,7 @@ from basecradle_harness._report import (
     is_outage,
     outage_body,
 )
+from basecradle_harness._stop import WakeStopped
 from basecradle_harness._wake import (
     EX_TEMPFAIL,
     WAKE_ATTEMPT_ENV,
@@ -52,6 +53,7 @@ from basecradle_harness._wake import (
     MarkStore,
     last_attempt,
 )
+from tests.conftest import plain
 from tests.test_wake import (
     BC_URL,
     M0,
@@ -448,29 +450,47 @@ def _died_mid_tool_chain(platform, home, error):
         _agent(home, _SpeaksThenFails(error)).wake()
 
 
-@pytest.mark.parametrize(
-    "error",
-    [ProviderServerError(DOWN, status_code=503), ProviderTimeoutError("did not answer in time")],
-    ids=["outage", "timeout_below_the_ceiling"],
-)
 def test_a_resume_that_fails_on_an_outage_exits_75_and_tells_the_last_attempt(
-    platform, tmp_path, monkeypatch, attempt, error
+    platform, tmp_path, monkeypatch, attempt
 ):
     """The resume's failure is absorbed so the wake can answer the rest, but its item still waits
     on a wake nothing else will start, so this wake gave up on it."""
-    _died_mid_tool_chain(platform, tmp_path, error)
+    _died_mid_tool_chain(platform, tmp_path, _down())
 
     attempt(4)
     serve_messages(platform, page(message(uuid=M0, body="audit the repo")))
-    agent = _agent(tmp_path, _SpeaksThenFails(error, speaks=False))
+    brain = _SpeaksThenFails(_down(), speaks=False)
+    agent = _agent(tmp_path, brain)
 
     assert _wake_once(monkeypatch, agent) == EX_TEMPFAIL
+    assert brain.calls >= 1  # it did resume
     assert len(_notices(platform)) == 1
     claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
     assert claim is not None and claim.phase == "in-flight"  # kept, for the next wake
 
 
-def test_a_resume_that_fails_on_a_platform_fault_keeps_exit_0(
+def test_a_resume_that_timed_out_on_the_turn_is_not_an_outage(
+    platform, tmp_path, monkeypatch, attempt
+):
+    """Issue #589: a resume out of the harness's own budget is the turn's fault and counts toward
+    the ceiling. A patient router retry would spend that ceiling on a slow vendor within minutes,
+    so it keeps the exit and the silence it had."""
+    timed_out = ProviderTimeoutError("did not answer in time")
+    _died_mid_tool_chain(platform, tmp_path, timed_out)
+
+    attempt(4)
+    serve_messages(platform, page(message(uuid=M0, body="audit the repo")))
+    brain = _SpeaksThenFails(timed_out, speaks=False)
+    agent = _agent(tmp_path, brain)
+
+    assert _wake_once(monkeypatch, agent) == 0
+    assert brain.calls >= 1
+    assert _notices(platform) == []
+    claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
+    assert claim is not None and (claim.phase, claim.resumes) == ("in-flight", 1)
+
+
+def test_a_resume_that_fails_on_a_fault_that_is_not_an_outage_keeps_exit_0(
     platform, tmp_path, monkeypatch, attempt
 ):
     """The same ``except`` absorbs faults that are not an outage, and they keep the code they had."""
@@ -478,10 +498,77 @@ def test_a_resume_that_fails_on_a_platform_fault_keeps_exit_0(
 
     attempt(4)
     serve_messages(platform, page(message(uuid=M0, body="audit the repo")))
-    agent = _agent(tmp_path, _SpeaksThenFails(RuntimeError("a harness fault"), speaks=False))
+    brain = _SpeaksThenFails(ProviderAuthError("invalid api key", status_code=401), speaks=False)
+    agent = _agent(tmp_path, brain)
 
     assert _wake_once(monkeypatch, agent) == 0
+    assert brain.calls >= 1  # it did resume, and failed there
     assert _notices(platform) == []
+    claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
+    assert claim is not None and claim.phase == "in-flight"
+
+
+def test_the_latest_failure_of_an_item_decides(platform, tmp_path):
+    """An item a later pass failed some other way is no longer waiting on the outage."""
+    serve_messages(platform, page())
+    agent = _agent(tmp_path, CountingProvider())
+
+    agent._note_outage("messages", M0, _down())
+    assert agent._outage_left() is not None
+    agent._note_outage("messages", M0, ProviderAuthError("invalid api key", status_code=401))
+
+    assert agent._outage_left() is None
+
+
+def test_an_item_a_later_pass_finished_is_not_given_up_on(platform, tmp_path):
+    serve_messages(platform, page())
+    agent = _agent(tmp_path, CountingProvider())
+    agent._note_outage("messages", M0, _down())
+    assert agent.claims.claim(TIMELINE_UUID, M0, kind="messages")
+    assert agent._outage_left() is not None  # in flight: still waiting
+
+    agent.claims.commit(TIMELINE_UUID, M0, kind="messages")
+
+    assert agent._outage_left() is None
+
+
+# --- success is a call, and a stop is a stop -----------------------------------------------------
+
+
+def test_the_first_successful_call_resets_the_debounce_even_if_the_turn_then_fails(
+    platform, tmp_path, attempt
+):
+    """A turn whose first call answers and whose next one fails is a new outage, and is told."""
+    OutageState(tmp_path).note(TIMELINE_UUID)  # an earlier outage, already announced
+    attempt(4)
+    serve_messages(platform, page(message(uuid=M0, body="audit the repo")))
+
+    with pytest.raises(ProviderServerError):
+        _agent(tmp_path, _SpeaksThenFails(_down())).wake()
+
+    assert _posts(platform)[0] == "On it."  # the call that answered
+    assert len(_notices(platform)) == 1  # the new outage was told
+    assert OutageState(tmp_path).noted(TIMELINE_UUID)
+
+
+def test_a_stop_while_the_notice_posts_is_settled_as_a_stop(platform, tmp_path, attempt, caplog):
+    """The stop lands inside the outage handler, where the stop handler below cannot catch it."""
+    attempt(4)
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    agent = _agent(tmp_path, RaisingProvider(_down()))
+
+    def stopped(*_args, **_kwargs):
+        raise WakeStopped()
+
+    agent._post = stopped
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"), pytest.raises(WakeStopped):
+        agent.wake()
+
+    claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
+    assert claim is not None and claim.phase == "abandoned"  # settled, never resumed as a crash
+    (end,) = [r.getMessage() for r in caplog.records if "wake end" in r.getMessage()]
+    assert "outcome=stopped" in plain(end) and "signal=TERM" in plain(end)
 
 
 # --- what the notice leaves behind ---------------------------------------------------------------

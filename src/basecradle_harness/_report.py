@@ -264,7 +264,7 @@ def outage_body(*, provider: str | None, exc: ProviderError) -> str:
 
     Posted once per outage per timeline, and only by the router's last attempt, so by the time it is
     read every retry the fleet makes has failed. Three things, in the order a reader needs them:
-    **that the agent could not answer** and why (the vendor's own words, relayed as every report
+    **that the agent could not finish answering** (it may have posted partway through the turn) and why (the vendor's own words, relayed as every report
     relays them: `verbatim`, credential-shaped spans redacted, cut at `STALL_DETAIL_CAP` because a
     vendor that is down answers with an HTML error page as often as with a sentence), **that nothing
     is lost**, and **what starts the next wake**. That last clause is the one that makes the promise
@@ -278,7 +278,7 @@ def outage_body(*, provider: str | None, exc: ProviderError) -> str:
     detail = bounded(verbatim(exc).strip(), STALL_DETAIL_CAP) or type(exc).__name__
     return (
         "Automatic notice from this agent's harness — its model did not write this. "
-        f"The agent could not answer here: its calls to {name} kept failing ({detail}), and the "
+        f"The agent could not finish answering here: its calls to {name} kept failing ({detail}), and the "
         "harness has stopped retrying for now. This kind of failure is usually temporary. Nothing "
         "is lost: what is waiting here is kept and will be picked up on the next wake, and a new "
         "message on this timeline starts one."

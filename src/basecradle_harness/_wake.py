@@ -2020,7 +2020,7 @@ class WakeAgent:
         try:
             session = self.harness.session(self.source)
             # The claims this wake holds stay young while it makes progress (issue #532).
-            session.heartbeat = self.claims.beat
+            session.heartbeat = self._progress
             self._brief = None  # compose the brief once this wake, lazily, before the model
             self._brief_composed = False
             self._brief_sections = {}
@@ -2077,16 +2077,18 @@ class WakeAgent:
             # its work pending (issue #951). Recorded so the entrypoint exits `EX_TEMPFAIL`, and on
             # the router's last attempt the timeline is told once. Then it goes on out, exactly as
             # before: `wake failed`, the claim in flight, the next wake re-driving or resuming it.
-            self._gave_up(exc, posted)
+            #
+            # The notice is a platform post, so a stop can land inside it, and a raise inside this
+            # handler is never caught by the `except WakeStopped` below: the stop is settled here,
+            # or the next wake would resume a stopped turn as a crash (#798).
+            try:
+                self._gave_up(exc, posted)
+            except WakeStopped as stop:
+                outcome, stopped_by = "stopped", self._settle_stop(stop, session)
+                raise
             raise
         except WakeStopped as stop:
-            # SIGTERM (issue #798): the wake was stopped, and a stop is a stop. Whatever it still
-            # holds in flight is settled here, so no later wake resumes or re-drives it — the
-            # session has already ended the running turn on `STOPPED_NOTE`. Then the stop goes on
-            # out, so the entrypoint dies by the signal.
-            outcome, stopped_by = "stopped", stop.signal_name
-            self._stop_held(stop)
-            self._note_stop(session)
+            outcome, stopped_by = "stopped", self._settle_stop(stop, session)
             raise
         finally:
             # This wake is over; its claims are no longer its to keep alive (issue #532). A session
@@ -4425,7 +4427,9 @@ class WakeAgent:
                     RESUME_CEILING,
                 )
                 self._log_deferred(kind, uuid, reason="resume_failed")
-                self._note_outage(kind, uuid, exc)
+                # A fault of the turn, never an outage (#589), so it earns no patient retry: the
+                # router re-waking it within minutes would spend the ceiling on a slow vendor.
+                self._outage_items.pop((kind, uuid), None)
                 disposition = _PENDING
             else:
                 # The last resume the ceiling allows, and it timed out too (issue #589). Replaying it
@@ -5186,15 +5190,42 @@ class WakeAgent:
             return "the scheduled task"
         return "your message"
 
+    def _settle_stop(self, stop: WakeStopped, session: Session | None) -> str:
+        """SIGTERM (issue #798): settle what this wake holds, and return the signal's name.
+
+        The wake was stopped, and a stop is a stop. Whatever it still holds in flight is settled
+        here, so no later wake resumes or re-drives it — the session has already ended the running
+        turn on `STOPPED_NOTE`. The caller then lets the stop go on out, so the entrypoint dies by
+        the signal.
+        """
+        self._stop_held(stop)
+        self._note_stop(session)
+        return stop.signal_name
+
+    def _progress(self) -> None:
+        """The session's progress hook: beat the claims, and reset the outage debounce (#532, #951).
+
+        The engine calls it after every successful model call (and every tool result), so the
+        outage marker clears at **the first successful call**, as the ruling asks — not only when a
+        whole turn returns, which a turn whose fourth call fails never does. One `exists()` check a
+        step on a healthy wake. Never raises: the session logs a failing hook and carries on.
+        """
+        self.claims.beat()
+        self.outages.recovered(self.timeline_uuid)
+
     def _note_outage(self, kind: str, uuid: str, exc: BaseException) -> None:
-        """Remember an item a resume left pending on a temporary provider fault (issue #951).
+        """Record how a resume left an item pending — on an outage, or not (issue #951).
 
         Only a temporary fault is an outage (`is_outage`); a platform refusal or a harness fault the
-        same ``except`` absorbs is not, and keeps the exit code it had. Whether the wake gave up on
-        it is decided as the wake ends (`_outage_left`), once every pass has had its chance.
+        same ``except`` absorbs is not, and keeps the exit code it had. The **latest** failure of
+        the item is what counts, so a later pass that fails it some other way forgets the outage.
+        Whether the wake gave up on it is decided as the wake ends (`_outage_left`), once every
+        pass has had its chance.
         """
         if isinstance(exc, ProviderError) and is_outage(exc):
             self._outage_items[(kind, uuid)] = exc
+        else:
+            self._outage_items.pop((kind, uuid), None)
 
     def _outage_left(self) -> ProviderError | None:
         """The outage a resume left an item waiting on, if that item is still unsettled (issue #951).
