@@ -86,12 +86,17 @@ class MemoryExchange:
             provider may keep what it files from it out of **this wake's** Turn-0 `context`
             (issue #746) — and must still return it from a deliberate search. A provider that
             ignores the flag behaves exactly as before it existed.
+        twin: The exchange's twin key (`_twins.twin_key`), computed by the engine for every
+            exchange it hands over. A provider that answers `MemoryProvider.holds` records it with
+            what it files, so the next exchange carrying the same key is recognized (issue #950).
+            ``None`` from a caller that computed none; a provider then records nothing.
     """
 
     user: str
     assistant: str
     scope: MemoryScope
     seeded: bool = False
+    twin: str | None = None
 
 
 class MemoryProvider(ABC):
@@ -118,6 +123,25 @@ class MemoryProvider(ABC):
 
     def observe(self, exchange: MemoryExchange) -> None:
         """Capture a completed exchange. Default: no-op (explicit-memory only)."""
+
+    def holds(self, twin: str) -> bool:
+        """Whether this store already holds an exchange filed under twin key ``twin``. Default: no.
+
+        The engine asks before it hands an exchange to `observe`, and an exchange the store holds a
+        twin of is not filed again (`_twins`, issue #950): routine exchanges are not memories. A
+        mining provider owes the answer, and owes it **from the store itself**: it files
+        `MemoryExchange.twin` with what it files and answers by looking the key up there, never in a
+        list kept beside the store. That is what makes an exchange removed from the store (a scrub,
+        a wiped palace) file again the next time it happens, and what keeps the inflow rule from
+        touching anything already filed: drawers from before the rule carry no key, so the first
+        twin after it is filed once.
+
+        The default answers ``False`` (a provider that keeps no record cannot say), so a provider
+        that does not implement it files every exchange exactly as before the rule. A hook that
+        raises is treated the same way, with a WARNING: the cost of a broken answer is one more
+        drawer, never a lost memory.
+        """
+        return False
 
     def context(self, scope: MemoryScope) -> str | None:
         """Prompt-ready memory to inject at Turn 0, or ``None``. Default: no-op.

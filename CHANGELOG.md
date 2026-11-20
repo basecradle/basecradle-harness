@@ -7,6 +7,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.201.0] - 2026-11-20
+
+### Changed: An exchange the store already holds, word for word, is not filed again (issue #950)
+
+`@origin` ruled on 2026-11-20 (basecradle#633) that routine, template-shaped exchanges are not memories and are not mined. On the store the problem was measured on, routine check-ins were 427 drawers, 7.5% of all, near-identical to each other: 42 could not be reached by search because about 385 twins outranked them, and every one of them competed with a distinctive memory for a place in recall.
+
+- **The rule keys on what was said, never on how the wake started** (`_twins`). There is no list of routine kinds, because a scheduled wake can be the one on which the agent learned something: an exchange is a twin when its words are those of an exchange already filed, once the harness's own stamps are set aside (the `[created_at]` stamp opening each item, a task activation's uuid and send time, a webhook delivery's event uuid, each masked only where the renderer writes it). Whitespace runs count as one space and nothing else is normalized.
+- **Exact, never near.** A near-twin rule cannot be made safe mechanically: "the deploy is ready" and "the deploy is not ready" are near-twins by any token or embedding measure. A routine reply the model phrases a new way is filed once per phrasing; one it repeats is not.
+- **The key is the engine's; the record is the store's.** `WakeAgent._observe`, the one place the harness mines, computes the key for every provider and asks `MemoryProvider.holds(twin)` (new; the default answers no, so a provider without it files every exchange as before). An exchange it holds is skipped with one INFO line, `memory op=observe result=skipped reason=twin chars=<n>`; a `holds` that raises is a WARNING and the exchange is filed. The key rides the exchange (`MemoryExchange.twin`, new) so the provider files it.
+- **MemPalace answers from the palace.** `_file` stamps the key as `harness_twin` on every drawer of the exchange, and `holds` is a metadata lookup: no search, no embedding, no model call, no side list. A removed drawer takes its key with it, so its twin is filed again; a drawer from before this version has no key, so nothing already filed is touched or counted.
+- **`basecradle-harness-palace-check --twin-census`** (new, token-free, read-only, opens no database): replays a palace's conversation files, oldest first, through the rule and prints how many exchanges it would have kept, how many skipped, and how many distinct exchanges the skipped ones repeat. Counts only.
+- **Telemetry contract:** the `memory` head's `reason` gains `twin`, filled by the wake.
+- **Fleet effect:** on a MemPalace agent, a repeated routine exchange leaves one memory instead of one per repetition. A SQLite agent (no observe) is unchanged.
+
 ## [0.200.0] - 2026-11-20
 
 ### Added: `basecradle-harness-brain-check`, one wake-shaped request to the configured brain (issue #947)

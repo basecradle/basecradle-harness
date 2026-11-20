@@ -263,6 +263,7 @@ from basecradle_harness._stop import die as die_by_signal
 from basecradle_harness._stop import install as install_stop_handler
 from basecradle_harness._timeouts import output_cap
 from basecradle_harness._tools import Tool
+from basecradle_harness._twins import twin_key
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
 
@@ -3321,6 +3322,13 @@ class WakeAgent:
           and deliberately narrow: it catches the one residue closure cannot reach — a model
           quoting its own injected recall back in a reply, which is genuine LLM output on a path
           that is genuinely mined.
+        - **An exchange the store already holds a twin of is not filed again** (issue #950):
+          routine exchanges are not memories. The key is computed here, after the two steps above,
+          so it is a key of what would be filed (`_twins.twin_key`); the provider answers from its
+          own store (`MemoryProvider.holds`) and records the key with what it files. A skip is one
+          INFO line, ``memory op=observe result=skipped reason=twin``. A ``holds`` that raises is
+          a WARNING and the exchange is filed: a broken answer costs one more drawer, never a
+          memory.
 
         Fires after each real exchange (never on a probe ack or a self-skip — those never
         reach here), and before the turn for a first wake's seeded backlog, which says so
@@ -3337,6 +3345,18 @@ class WakeAgent:
             # Nothing but scaffolding, or a degraded turn on an item with no text of its own.
             # Mining an empty exchange writes a drawer that can only ever dilute retrieval.
             return
+        twin = twin_key(user, assistant)
+        try:
+            held = self.memory_provider.holds(twin) is True
+        except Exception:  # noqa: BLE001 - a memory hook must never break the wake
+            _log.warning("Memory provider holds() failed; filing the exchange.", exc_info=True)
+            held = False
+        if held:
+            _log.info(
+                "memory %s",
+                kv(op="observe", result="skipped", reason="twin", chars=len(user) + len(assistant)),
+            )
+            return
         try:
             self.memory_provider.observe(
                 MemoryExchange(
@@ -3344,6 +3364,7 @@ class WakeAgent:
                     assistant=assistant,
                     scope=MemoryScope(agent=self.me_uuid, timeline=self.timeline_uuid),
                     seeded=seeded,
+                    twin=twin,
                 )
             )
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake; swallow it

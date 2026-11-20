@@ -91,6 +91,12 @@ from the cut, whether a wider ask reaches it and at which, whether a copy or nea
 place, whether sentinels or the widening cap kept it out, and whether an index has lost it. See
 `basecradle_harness._palace_pool`.
 
+**What the twin rule would have done: ``--twin-census``** (issue #950). Token-free and read-only,
+and it opens no database: it reads the palace's conversation files alone (each is one exchange the
+observe filed, so the directory read in filing order is the agent's recorded history of what was
+mined), replays them through the rule the observe now applies (`_twins`), and prints how many it
+would have kept and how many skipped. Counts only. See `twin_census`.
+
 **A miss is diagnosed, never printed.** A probe that does not come back gets a ``why:`` line made of
 ids, counts and ranks: how many drawers carry its exact text or its query, what took the top slots,
 where it ranks in a deeper fetch and in the vector index alone, and whether the index finds it by
@@ -128,10 +134,13 @@ from basecradle_harness._mempalace import (
     candidate_pool,
     chunker_version,
     content_hashes,
+    exchange_of,
     filed_by_observe,
 )
 from basecradle_harness._observability import last_word, log_handler
 from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL, reranker_from_env
+from basecradle_harness._twins import TwinCensus
+from basecradle_harness._twins import census as replay_twins
 from basecradle_harness._version import __version__
 
 PROG = "basecradle-harness-palace-check"
@@ -1340,6 +1349,30 @@ def _positive(value: str) -> int:
     return number
 
 
+def twin_census(palace: Path) -> TwinCensus:
+    """What the twin rule would have done to this palace's recorded exchanges (issue #950).
+
+    Every file in the conversations directory, oldest first by modification time (the observe
+    writes a file once, and a home move that keeps mtimes keeps the order), name breaking a tie,
+    read back into its two halves (`_mempalace.exchange_of`) and replayed through the rule
+    (`_twins.census`). Reads no database and imports no MemPalace, so it runs on a copy of the
+    directory alone. A file that cannot be read is an error, not a skip: a census that quietly
+    dropped files would report a number for a history it did not read.
+    """
+    convos = palace / _CONVERSATIONS_WING
+    files = (
+        sorted(
+            (path for path in convos.iterdir() if path.is_file()),
+            key=lambda path: (path.stat().st_mtime, path.name),
+        )
+        if convos.is_dir()
+        else []
+    )
+    return replay_twins(
+        exchange_of(path.read_text(encoding="utf-8", errors="replace")) for path in files
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """The ``basecradle-harness-palace-check`` entrypoint."""
     parser = argparse.ArgumentParser(
@@ -1488,6 +1521,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--twin-census",
+        action="store_true",
+        help=(
+            "token-free, read-only, and runs alone: replay the palace's conversation files, oldest "
+            "first, through the rule the observe applies to a twin (an exchange word for word "
+            "one already filed, the harness's own stamps aside), and print how many it would "
+            "have kept and skipped. Opens no database. Counts only."
+        ),
+    )
+    parser.add_argument(
         "--token-ceiling",
         type=_positive,
         metavar="T",
@@ -1498,6 +1541,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    if args.twin_census and (
+        args.end_to_end
+        or args.pool_diagnosis
+        or args.sample is not None
+        or args.practice_observe
+        or args.register_off_wing
+        or args.stamp_chunker_version
+        or args.relocate_source_file
+        or args.dry_run
+    ):
+        parser.error("--twin-census runs alone")
     if args.end_to_end:
         if args.sample is None or args.token_ceiling is None:
             parser.error("--end-to-end needs --sample and --token-ceiling")
@@ -1589,6 +1643,17 @@ def main(argv: list[str] | None = None) -> int:
             f"FAIL: no palace at {palace}" if paths else "FAIL: no palace under that HARNESS_HOME"
         )
         return 1
+    if args.twin_census:
+        try:
+            found = twin_census(palace)
+        except OSError as error:
+            print(f"FAIL: could not read the conversation files: {last_word(error)}")
+            return 1
+        print(
+            f"twin census: {found.total} exchanges, {found.kept} kept, "
+            f"{found.skipped} skipped as twins of {found.collapsed}"
+        )
+        return 0
 
     # A sample runs hundreds of searches; one `memory recall` line each would bury the report.
     level = logging.WARNING if args.sample else logging.INFO

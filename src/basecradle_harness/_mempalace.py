@@ -281,6 +281,11 @@ EXCHANGE_PIECE_CHARS = 800
 # drawer keeps it on its continuation, so a peer's words never read as the agent's.
 _QUOTE = "> "
 
+#: The drawer metadata field the observe files an exchange's twin key under (`_twins`, issue #950),
+#: and the one `MemPalaceMemoryProvider.holds` looks it up by. Prefixed, because the namespace of
+#: unprefixed fields is upstream's.
+TWIN_FIELD = "harness_twin"
+
 _MISSING = (
     "MemPalace is not installed. Install the optional extra to use the MemPalace memory "
     "provider:  pip install basecradle-harness[mempalace]"
@@ -366,9 +371,24 @@ class MemPalaceMemoryProvider(MemoryProvider):
         path = convo_dir.expanduser().resolve() / _conversation_name(exchange.scope.timeline)
         if exchange.seeded:
             self._seeded_files.add(path.name)
-        self._file(path, _exchange_markdown(exchange))
+        self._file(path, _exchange_markdown(exchange), twin=exchange.twin)
 
-    def _file(self, path: Path, text: str) -> None:
+    def holds(self, twin: str) -> bool:
+        """Whether a drawer in this palace was filed under twin key ``twin`` (issue #950).
+
+        Answered from the palace itself: a metadata lookup on `TWIN_FIELD`, which `_file` stamps on
+        every drawer of an exchange the engine keyed. No search, no embedding and no model call.
+        A drawer filed before the rule carries no key and never matches, so the first twin after
+        it is filed once; a drawer that is deleted takes its key with it, so its twin is filed again
+        the next time it happens. ``False`` before the palace exists. Raises what MemPalace raises,
+        which the engine logs and answers by filing.
+        """
+        if not self.palace_path.exists():
+            return False
+        found = self.read_collection().get(where={TWIN_FIELD: twin}, limit=1, include=[])
+        return bool(found.get("ids"))
+
+    def _file(self, path: Path, text: str, *, twin: str | None = None) -> None:
         """Write ``text`` to ``path`` and file it as drawers, all of it or none of it.
 
         Each drawer goes through ``file_conversation_exchange``, MemPalace's canonical write path
@@ -390,7 +410,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
           without it as filed by an older chunker, so it is no longer filed (issue #751). 3.11's
           ``file_conversation_exchange`` stamps the same value itself, and its value wins
           (``setdefault``). The harness stamps it too, so a drawer it files is current whatever
-          upstream's write path does.
+          upstream's write path does;
+        - `TWIN_FIELD` — the exchange's twin key, when the engine computed one, on every drawer of
+          it, which is what `holds` looks up (issue #950).
 
         Under MemPalace's own per-file lock (``mine_lock``), the one a concurrent ``mempalace
         mine`` takes for this file before it re-checks whether it is filed. If anything raises
@@ -424,6 +446,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 version = chunker_version()
                 if version is not None:
                     stamp["convo_chunker_version"] = version
+                if twin is not None:
+                    stamp[TWIN_FIELD] = twin
                 room = convo_miner.detect_convo_room(text)
                 for piece in pieces:
                     drawer = convo_miner.file_conversation_exchange(
@@ -1116,6 +1140,24 @@ def _exchange_markdown(exchange: MemoryExchange) -> str:
     """
     quoted = "\n".join(f"{_QUOTE}{line}" for line in exchange.user.splitlines() or [""])
     return f"{quoted}\n{exchange.assistant}\n"
+
+
+def exchange_of(text: str) -> tuple[str, str]:
+    """An exchange file's text read back as ``(user, assistant)``: the inverse of `_exchange_markdown`.
+
+    The leading quoted lines are the user half, unquoted; the rest, less the one trailing newline
+    the writer adds, is the reply. A reply whose first line itself begins with the quote mark is
+    read into the user half: the file does not record where one ended and the other began. Used by
+    the palace check's twin census (issue #950), never by the observe.
+    """
+    lines = text.splitlines()
+    split = 0
+    while split < len(lines) and lines[split].startswith(_QUOTE.rstrip()):
+        split += 1
+    user = "\n".join(
+        line[len(_QUOTE) :] if line.startswith(_QUOTE) else "" for line in lines[:split]
+    )
+    return user, "\n".join(lines[split:])
 
 
 def _pieces(text: str, size: int = EXCHANGE_PIECE_CHARS) -> list[str]:

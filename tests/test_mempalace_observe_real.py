@@ -239,3 +239,112 @@ def test_a_fact_at_the_end_of_a_long_message_is_still_recalled(tmp_path, query, 
     hits = provider.search(f"[2026-10-31T12:00:00Z] john: {query}", 10)
 
     assert any(needle in hit["text"] for hit in hits)
+
+
+# === the twin rule on a real palace (issue #950) ==================================================
+
+
+def _engine_observe(provider, user, assistant):
+    """The engine's own choke point (`WakeAgent._observe`), on a stand-in wake holding `provider`."""
+    from types import SimpleNamespace
+
+    from basecradle_harness._wake import WakeAgent
+
+    wake = SimpleNamespace(
+        memory_provider=provider,
+        _degraded=False,
+        me_uuid=SCOPE.agent,
+        timeline_uuid=TIMELINE,
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        WakeAgent._observe(wake, user, assistant)
+
+
+CHECK_IN = (
+    "[{at}] A task scheduled by @nova has activated and is now in front of every viewer of this "
+    "timeline (task {task}, scheduled for {at}).\n"
+    "Hourly check-in: read your timelines and act on anything new."
+)
+
+
+def _check_in(hour: int, task: str) -> str:
+    return CHECK_IN.format(at=f"2026-11-20T{hour:02d}:00:00.000Z", task=task)
+
+
+def test_two_identical_check_ins_leave_one_memory_and_a_new_word_leaves_another(tmp_path):
+    """The DoD's case on a real palace, through the engine's own observe."""
+    from basecradle_harness._mempalace import TWIN_FIELD
+    from basecradle_harness._twins import twin_key
+
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    assert provider.holds(twin_key("anything", "")) is False  # no palace yet
+
+    _engine_observe(provider, _check_in(6, "019e7761-2222-7333-8444-555566667777"), "All quiet.")
+    _engine_observe(provider, _check_in(7, "019e7761-2222-7333-8444-555566667778"), "All quiet.")
+    assert len(_rows(palace)[0]) == 1
+    assert len(list((palace / "conversations").iterdir())) == 1
+
+    _engine_observe(
+        provider,
+        _check_in(8, "019e7761-2222-7333-8444-555566667779"),
+        "John moved the deploy key to the vault.",
+    )
+    real = _rows(palace)[0]
+    assert len(real) == 2
+    assert len({meta[TWIN_FIELD] for _, meta in real}) == 2
+    # And the store still serves: a search after the interleaved reads and writes finds the fact.
+    hits = provider.search("where is the deploy key", n_results=2)
+    assert any("vault" in (hit.get("text") or "") for hit in hits)
+
+
+def test_every_drawer_of_a_split_exchange_carries_its_key(tmp_path):
+    from basecradle_harness._mempalace import TWIN_FIELD
+    from basecradle_harness._twins import twin_key
+
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    user = "[2026-11-20T06:00:00.000Z] john: " + "a long message line. " * 120
+
+    _engine_observe(provider, user, "Read it.")
+
+    real = _rows(palace)[0]
+    assert len(real) > 1
+    assert {meta[TWIN_FIELD] for _, meta in real} == {twin_key(user, "Read it.")}
+
+
+def test_a_twin_whose_memory_was_removed_is_filed_again(tmp_path):
+    """The record is the store: a drawer deleted (a scrub, a wiped palace) takes its key with it."""
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    _engine_observe(provider, "[2026-11-20T06:00:00.000Z] john: ping", "Here.")
+    collection = mp.get_collection(str(palace))
+    collection.delete(ids=collection.get()["ids"])
+
+    _engine_observe(provider, "[2026-11-20T07:00:00.000Z] john: ping", "Here.")
+
+    assert len(_rows(palace)[0]) == 1
+
+
+def test_a_drawer_filed_before_the_rule_is_never_a_twin(tmp_path):
+    """Nothing already filed is touched or counted: a pre-rule drawer carries no key."""
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    _observe(provider, "[2026-11-20T06:00:00.000Z] john: ping", "Here.")  # no key, as before
+
+    _engine_observe(provider, "[2026-11-20T07:00:00.000Z] john: ping", "Here.")
+    _engine_observe(provider, "[2026-11-20T08:00:00.000Z] john: ping", "Here.")
+
+    assert len(_rows(palace)[0]) == 2
+
+
+def test_the_census_reads_a_real_palaces_files_as_the_observe_keyed_them(tmp_path):
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    for hour in (6, 7, 8):
+        _observe(provider, f"[2026-11-20T{hour:02d}:00:00.000Z] john: ping", "Here.")
+    _observe(provider, "[2026-11-20T09:00:00.000Z] john: ping", "Here, John.")
+
+    found = _palace_check.twin_census(palace)
+
+    assert (found.total, found.kept, found.skipped, found.collapsed) == (4, 2, 2, 1)

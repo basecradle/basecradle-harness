@@ -1143,3 +1143,21 @@ def test_relocation_batches_never_split_a_file():
 
     assert [name for batch in batches for name in batch] == list(files)
     assert batches == [["0.md", "1.md"], ["2.md", "3.md"], ["4.md"], ["big.md"]]
+
+
+# === --twin-census (issue #950) ===================================================================
+
+
+def test_the_twin_census_counts_kept_and_skipped_and_opens_no_database(home, fake, capsys):
+    """The `home` fixture's four files are one exchange, four times: one kept, three twins."""
+    code, lines = _run(capsys, home, "--twin-census")
+
+    assert code == 0
+    assert lines[-1] == "twin census: 4 exchanges, 1 kept, 3 skipped as twins of 1"
+    assert fake.opened == [] and fake.searches == [] and fake.mines == []
+
+
+def test_the_twin_census_runs_alone(home, fake, capsys):
+    with pytest.raises(SystemExit):
+        _palace_check.main([str(home), "--twin-census", "--sample", "3"])
+    assert "--twin-census runs alone" in capsys.readouterr().err
