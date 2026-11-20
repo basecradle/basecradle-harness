@@ -25,7 +25,7 @@ decided the harness must speak in this one narrow, model-unavailable case (the C
 Channel section records it). It is not the breaker-alert mistake the invariant warns against: there
 the model was available and *chose* not to mention the outage; here there is no model to ask.
 
-Two report shapes, one per handled class:
+Three report shapes, one per handled class:
 
 - **Permanent** (`ProviderPayloadTooLargeError` — a payload too large to ever accept — and a context
   overflow that could not self-heal): the same *content* fails forever, and only the human changing it
@@ -36,6 +36,15 @@ Two report shapes, one per handled class:
   funds it. The report says so in plain language, the notice is **debounced** (one per outage per
   timeline — `BillingState`), and the pending work is left pending so it resumes on the first
   successful call after funding.
+- **Outage** (`is_outage`, issue #951, @origin 2026-11-20: *"when a wake gives up for a temporary
+  reason, the timeline is told once, plainly; and success resets it"*): a temporary fault — a rate
+  limit, a vendor that is down, a dropped connection, a timeout — outlasted every in-call retry.
+  The wake exits ``EX_TEMPFAIL`` and the router tries it again later, and only the **router's last
+  attempt** posts (`outage_body`), because until then the next attempt may simply succeed. It is
+  written in the harness's own words, as the stall note is, debounced once per outage per timeline
+  (`OutageState`), and cleared by the first successful call. Before it, a temporary failure that
+  outlasted every retry ended silently: the work stayed pending and nothing told the person who
+  wrote that anything was wrong (2026-11-02).
 
 And one note that is not a vendor verdict at all (issue #589, founder-approved 2026-09-29: *"a bad
 ask should cost one wasted wake and a visible stall, never a crash loop"*):
@@ -61,6 +70,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from basecradle_harness._exceptions import (
+    TRANSIENT_FAILURES,
     ProviderBillingError,
     ProviderContextLengthError,
     ProviderError,
@@ -71,10 +81,12 @@ from basecradle_harness._observability import RED, YELLOW, Rendered, bounded, he
 
 _log = logging.getLogger("basecradle_harness")
 
-#: The two reported classes (the transient class is retried, never reported). They ride the
-#: `reported_failure` log line's ``kind=`` field, which the NOC alarms on (basecradle-noc#317).
+#: The reported classes. They ride the `reported_failure` log line's ``kind=`` field, and the NOC
+#: alarms on ``kind=billing`` alone (basecradle-noc#317). ``outage`` is the transient class once it
+#: has outlasted the router's last attempt (issue #951); before that it is retried, never reported.
 PERMANENT = "permanent"
 BILLING = "billing"
+OUTAGE = "outage"
 
 #: The reason slug on the log line — a stable, greppable name for *which* fault, one per handled
 #: exception type. Coarser than the verbatim vendor error (which rides the timeline post), but stable
@@ -131,6 +143,16 @@ def classify(exc: BaseException) -> ReportClass | None:
         # decision 4's "a blown context tells the human", not a substitute for the self-heal.
         return ReportClass(PERMANENT, _CONTEXT_LENGTH)
     return None
+
+
+def is_outage(exc: BaseException) -> bool:
+    """Is this a temporary provider fault that a wake gives up on as an **outage**? (issue #951)
+
+    The engine retries exactly this class inside a call (`_exceptions.TRANSIENT_FAILURES`), so one
+    that reaches the wake has outlasted every retry. It is the one ending a later wake may fix
+    unchanged, which is what ``EX_TEMPFAIL`` tells the router.
+    """
+    return isinstance(exc, TRANSIENT_FAILURES)
 
 
 def verbatim(exc: BaseException) -> str:
@@ -234,6 +256,32 @@ def stall_body(*, item: str, resumes: int, tool_calls: int, detail: str) -> str:
         "harness has stopped retrying so it does not loop, and nothing more will happen on it by "
         "itself. What would help: send it again, ideally split into smaller steps. If this keeps "
         f"happening, {cause}"
+    )
+
+
+def outage_body(*, provider: str | None, exc: ProviderError) -> str:
+    """The outage notice (issue #951) — the harness speaking for itself, never as the agent.
+
+    Posted once per outage per timeline, and only by the router's last attempt, so by the time it is
+    read every retry the fleet makes has failed. Three things, in the order a reader needs them:
+    **that the agent could not finish answering** (it may have posted partway through the turn) and why (the vendor's own words, relayed as every report
+    relays them: `verbatim`, credential-shaped spans redacted, cut at `STALL_DETAIL_CAP` because a
+    vendor that is down answers with an HTML error page as often as with a sentence), **that nothing
+    is lost**, and **what starts the next wake**. That last clause is the one that makes the promise
+    true: nothing wakes the agent again until something happens on the timeline, the same fact the
+    billing notice's request for a post answers (issue #596).
+
+    It names no item. One wake can give up on a batch, a task, a delivery and an asset alike, and
+    the claim that matters — what is waiting here is kept — is true of each.
+    """
+    name = provider_label(provider)
+    detail = bounded(verbatim(exc).strip(), STALL_DETAIL_CAP) or type(exc).__name__
+    return (
+        "Automatic notice from this agent's harness — its model did not write this. "
+        f"The agent could not finish answering here: its calls to {name} kept failing ({detail}), and the "
+        "harness has stopped retrying for now. This kind of failure is usually temporary. Nothing "
+        "is lost: what is waiting here is kept and will be picked up on the next wake, and a new "
+        "message on this timeline starts one."
     )
 
 
@@ -379,29 +427,78 @@ def billing_repeat_line(
     return Rendered(probe_prefix(source) + line)
 
 
-class BillingState:
-    """Per-timeline out-of-funds debounce + self-heal state (issue #336).
+class TimelineNotice:
+    """One debounced notice per outage per timeline, and its self-heal (issues #336, #951).
 
-    Billing is an *account-level* outage, but a notice is posted *per timeline* — each conversation
-    (and each peer AI on it) deserves to be told once. So the debounce is per-timeline: a marker file
-    beside the wake's other stores (`marks/`, `seen/`, `claims/`, `breaker/`) under the agent's home,
-    holding the time the outage was first noticed on that timeline.
+    An account-level or vendor-level outage is noticed *per timeline* — each conversation (and each
+    peer AI on it) deserves to be told once, and no more. So the debounce is a marker file per
+    timeline beside the wake's other stores (`marks/`, `seen/`, `claims/`, `breaker/`) under the
+    agent's home, holding the time the outage was first announced there. Each kind of notice is one
+    subclass naming its folder and suffix, and the orphan sweep purges each by that exact name
+    (`_cleanup.enumerate_artifacts`), so a new kind is one subclass and one line there.
 
-    - `note_and_check` records the outage and returns whether *this* wake should post the notice —
-      ``True`` on the first billing failure of an outage (the marker was absent), ``False`` on every
-      one after (already notified → stay quiet). Idempotent per outage.
-    - `recovered` is the **self-heal**: called after any successful model call, it clears the marker
-      (if present) and returns whether it cleared one, so a wake can log the recovery. The next
-      outage re-notifies from a clean slate.
+    - `noted` — has this outage already been announced on `timeline`?
+    - `note` — record that it has.
+    - `recovered` is the **self-heal**: called after any successful model call, it clears the
+      marker (if present) and returns whether it cleared one. The next outage notices again from a
+      clean slate.
 
     It mirrors `WakeBreaker`'s storage shape (one small file per timeline, an injectable clock for
-    deterministic tests) and, like it, never breaks a wake: a filesystem hiccup degrades to "not
-    blocked" rather than raising.
+    deterministic tests) and, like it, never breaks a wake: a filesystem hiccup degrades to "not yet
+    announced" rather than raising — better a possible second notice than a silent outage.
     """
+
+    #: The folder under the root, and the marker's suffix — each subclass's own.
+    FOLDER = ""
+    SUFFIX = ""
 
     def __init__(self, root: str | Path, *, now=None) -> None:
         self.root = Path(root)
         self._now = now or time.time
+
+    def noted(self, timeline: str) -> bool:
+        """Whether this outage has already been announced on `timeline`."""
+        return self._path(timeline).exists()
+
+    def note(self, timeline: str) -> None:
+        """Record that this outage has been announced on `timeline`. A write failure is logged."""
+        path = self._path(timeline)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(repr(self._now()))
+        except OSError as error:
+            _log.warning("Could not persist the %s marker for %s: %s", self.FOLDER, timeline, error)
+
+    def recovered(self, timeline: str) -> bool:
+        """Clear any marker on `timeline`; return whether one was cleared (self-heal).
+
+        Called after a successful model call: a call got through, so the outage is over and the
+        next one should be announced. Returns ``True`` only when a marker was actually present, so a
+        healthy wake pays nothing but one `exists()` check per kind.
+        """
+        path = self._path(timeline)
+        if not path.exists():
+            return False
+        try:
+            path.unlink()
+        except OSError as error:
+            _log.warning("Could not clear the %s marker for %s: %s", self.FOLDER, timeline, error)
+            return False
+        return True
+
+    def _path(self, timeline: str) -> Path:
+        return self.root / self.FOLDER / f"{quote(timeline, safe='')}{self.SUFFIX}"
+
+
+class BillingState(TimelineNotice):
+    """The out-of-funds debounce (issue #336): ``billing/<timeline>.blocked``.
+
+    Its marker is written *before* the notice is posted (`note_and_check`), and its presence is
+    also the wake's record that the account is blocked (`blocked`), which is the shape it shipped in.
+    """
+
+    FOLDER = "billing"
+    SUFFIX = ".blocked"
 
     def note_and_check(self, timeline: str) -> bool:
         """Record a billing outage on `timeline`; return whether this wake should post the notice.
@@ -410,36 +507,23 @@ class BillingState:
         outage is already announced and this wake stays quiet ("fail fast and quiet"). A write failure
         degrades to ``True`` (better a possible second notice than a silent outage).
         """
-        path = self._path(timeline)
-        if path.exists():
+        if self.noted(timeline):
             return False
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(repr(self._now()))
-        except OSError as error:
-            _log.warning("Could not persist the billing-blocked marker for %s: %s", timeline, error)
+        self.note(timeline)
         return True
 
     def blocked(self, timeline: str) -> bool:
         """Whether `timeline` currently holds a billing-blocked marker."""
-        return self._path(timeline).exists()
+        return self.noted(timeline)
 
-    def recovered(self, timeline: str) -> bool:
-        """Clear any billing-blocked marker on `timeline`; return whether one was cleared (self-heal).
 
-        Called after a successful model call: a call got through, so the account is funded again and
-        the next outage should re-notify. Returns ``True`` (and the caller logs the recovery) only
-        when a marker was actually present, so a healthy wake pays nothing but one `exists()` check.
-        """
-        path = self._path(timeline)
-        if not path.exists():
-            return False
-        try:
-            path.unlink()
-        except OSError as error:
-            _log.warning("Could not clear the billing-blocked marker for %s: %s", timeline, error)
-            return False
-        return True
+class OutageState(TimelineNotice):
+    """The outage debounce (issue #951): ``outage/<timeline>.notified``.
 
-    def _path(self, timeline: str) -> Path:
-        return self.root / "billing" / f"{quote(timeline, safe='')}.blocked"
+    Its marker is written only **after** the notice posted: a post the platform refused announced
+    nothing, so the next last attempt must try again. That is the one way it differs from the
+    billing marker, which is written first.
+    """
+
+    FOLDER = "outage"
+    SUFFIX = ".notified"

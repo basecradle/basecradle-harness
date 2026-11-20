@@ -202,7 +202,7 @@ The harness's members (`_observability._VERDICT_VALUES` for the `outcome=` pairs
 | Operator's Choice | `wake stopped` | `stopped` |
 | Failure | `wake failed`, `wake reported_failure`, `post failed`, `cleanup failed`, `cleanup blocked`, `palace scrub failed`, `palace scrub` (an apply that removed what the harness mined) | `error`, `failed` |
 
-The Operator's Choice tier's members across the fleet today: `outcome=stopped` (the router's `stage=wake` line, and the harness's `wake end`), `event=wake_stopped` (the router), and the harness's `wake stopped`. The router's members of the other tiers are its own `logfmt.PALETTE`, pinned by its `tests/test_logfmt.py`. `tests/test_telemetry_contract.py` holds the harness to this section: the SGR of every tier, and the `outcome=` vocabulary in both directions.
+The Operator's Choice tier's members across the fleet today: `outcome=stopped` (the router's `stage=wake` line, and the harness's `wake end`), `event=wake_stopped` (the router), and the harness's `wake stopped`. The router's members of the other tiers are its own `logfmt.PALETTE`, pinned by its `tests/test_logfmt.py`; its Warning tier includes `outcome=deferred`, a wake that exited `75` and is scheduled to be tried again (basecradle-router#527, the router's half of harness issue #951). The harness writes no `outcome=deferred`: a wake that gives up on an outage still ends `wake end … outcome=error`. `tests/test_telemetry_contract.py` holds the harness to this section: the SGR of every tier, and the `outcome=` vocabulary in both directions.
 
 ## Model Calls
 
@@ -585,14 +585,16 @@ An item a stopped wake held in flight, settled so no later wake resumes or re-dr
 
 ### `wake reported_failure`
 
-A permanent or billing model failure reported to the timeline (`_wake._report_provider_failure`, `_report.billing_onset_line`). NOC-alarmed.
+A permanent, billing or outage model failure reported to the timeline (`_wake._report_provider_failure`, `_report.billing_onset_line`, `_wake.WakeAgent._gave_up`). NOC-alarmed on `kind=billing` only (*LLM Vendor Payment Failed*, basecradle-noc#317).
+
+`kind=outage` (issue #951) is written once per outage per timeline, by the router's last attempt at a delivery (`BASECRADLE_WAKE_ATTEMPT` equal to `BASECRADLE_WAKE_ATTEMPTS`), and only when its notice posted: a temporary fault outlasted every in-call retry and the wake is giving up with its work pending. The same wake still writes `wake failed` when the fault propagated, and exits `75`.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
-| `kind` | `permanent` or `billing`. | The wake. | Never. |
-| `reason` | The failure's slug (`payload_too_large`, `out_of_funds`). | The wake. | Never. |
+| `kind` | `permanent`, `billing` or `outage`. | The wake. | Never. |
+| `reason` | The failure's slug: `payload_too_large`, `context_length` or `out_of_funds`, and for an outage the brain's [fault slug](#fault-slugs) (`rate_limited`, `server_error`, `transport`, `timeout`, `invalid_response`, `truncated`). | The wake. | Never. |
 | `provider` | Common. | The wake. | A probe line. |
-| `item` | Common. | The wake. | A billing onset. |
+| `item` | Common. | The wake. | A billing onset, or an outage (its notice names no item). |
 | `timeline` | Common. | The wake. | A probe line. |
 | `delivery` | Common. | The environment. | As Common. |
 | `source` | Common. | `_log_grammar`. | Real traffic. |
@@ -627,6 +629,8 @@ The debounced repeat for every later wake an out-of-funds account blocks (`_repo
 | `reason` | `timeline_deleted`. | The entrypoint. | Never. |
 
 ### `wake failed`
+
+A wake that ended on a fault. The entrypoint exits `75` (`EX_TEMPFAIL`) when that fault is a temporary provider fault that outlasted every in-call retry (an outage, issue #951), and `1` for every other.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|

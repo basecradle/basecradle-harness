@@ -446,8 +446,8 @@ Rails change; we don't consume `timeline.deleted`.
   `BaseCradleError`) keeps and retries next run. *A platform outage must never read as
   "everything deleted" and trigger a mass purge — default to keep on anything but a 404.*
 - **The invariant — memory deliberately persists across timeline deletion and is never swept.**
-  The sweep operates *only* on the six artifact dirs (`sessions/`, `marks/`, `seen/`, `claims/`,
-  `breaker/`, `billing/` — the last added by issue #336) and **never touches** `memory.db`
+  The sweep operates *only* on the seven artifact dirs (`sessions/`, `marks/`, `seen/`, `claims/`,
+  `breaker/`, `billing/` — added by issue #336 — and `outage/`, by issue #951) and **never touches** `memory.db`
   (+ `-wal`/`-shm`) or the MemPalace palace dir. If a peer told the agent its birthday on a
   since-deleted timeline, the agent must still remember it. (By construction: memory is never
   enumerated, so a purge can't reach it.)

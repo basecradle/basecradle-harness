@@ -23,12 +23,12 @@ the artifacts. A platform outage must never be read as "everything deleted" and
 trigger a mass purge: we default to **keep** on anything that is not a 404.
 
 **Memory is deliberately out of scope and is never touched.** The sweep operates
-only on the six artifact dirs below; it never enumerates, and so never deletes,
+only on the seven artifact dirs below; it never enumerates, and so never deletes,
 ``memory.db`` (+ ``-wal``/``-shm``) or the MemPalace palace dir. If a peer told
 the agent its birthday on a since-deleted timeline, the agent must still remember
 it. See the CLAUDE.md "Security invariants" section.
 
-The six artifact kinds, all under ``$HARNESS_HOME``, keyed by timeline UUID with
+The seven artifact kinds, all under ``$HARNESS_HOME``, keyed by timeline UUID with
 the same ``quote(..., safe='')`` filename convention the stores already use:
 
 ================  ==========================================================
@@ -40,6 +40,7 @@ Seen-set (tasks)  ``seen/<kind>/<uuid>.txt``
 Claims            ``claims/<kind>/<uuid>/*.claim``  (per-uuid directory)
 Wake-breaker      ``breaker/<uuid>.wakes``, ``breaker/<uuid>.tripped``
 Billing-blocked   ``billing/<uuid>.blocked``  (out-of-funds debounce, issue #336)
+Outage-notified   ``outage/<uuid>.notified``  (outage-notice debounce, issue #951)
 ================  ==========================================================
 
 **Settled claims are pruned on timelines that still exist** (issue #526). A claim is
@@ -204,7 +205,7 @@ class SweepSummary:
 def enumerate_artifacts(home: Path) -> dict[str, list[Path]]:
     """Map each referenced timeline UUID to the on-disk paths that belong to it.
 
-    Scans the six artifact dirs under ``home``, parsing each timeline UUID out of a
+    Scans the seven artifact dirs under ``home``, parsing each timeline UUID out of a
     filename/dirname and URL-decoding it (``unquote``), the exact inverse of the
     ``quote(..., safe='')`` the stores write with — so encode/decode round-trips. The
     returned paths are what a purge deletes, so this is the single source of truth for
@@ -278,6 +279,13 @@ def enumerate_artifacts(home: Path) -> dict[str, list[Path]]:
     billing = home / "billing"
     if billing.is_dir():
         for path in billing.glob("*.blocked"):
+            add(unquote(path.stem), path)
+
+    # Outage-notice markers — `outage/<uuid>.notified` (issue #951), the same shape and the same
+    # reason: a deleted timeline leaves nothing behind.
+    outage = home / "outage"
+    if outage.is_dir():
+        for path in outage.glob("*.notified"):
             add(unquote(path.stem), path)
 
     return artifacts
