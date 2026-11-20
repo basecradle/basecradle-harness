@@ -101,6 +101,8 @@ not a message. Everything you leave out is forgotten."""
 #: quotes it is real LLM output on a path that is legitimately mined — the one class of scaffolding
 #: the closed boundary still cannot exclude structurally. Everything else the harness composes is
 #: kept out at its source, which is why nothing else is listed here (see the module docstring).
+#: These are the MemPalace adapter's framing, so a second provider that injects a differently
+#: framed block is not covered by them; see `MemoryProvider.context`.
 INJECTED_RECALL_LITERALS = (
     _LEGACY_INJECTED_HEADING,
     _LEGACY_RECALL_HEADING,
