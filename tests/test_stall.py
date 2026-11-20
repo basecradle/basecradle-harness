@@ -745,3 +745,57 @@ def test_a_stall_posted_from_a_pre_fix_claim_never_posts_its_credential(platform
     body = json.loads(note.content)["message"]["body"]
     assert SENTINEL_KEY not in body
     assert "proxy.example.com/v1/chat[redacted]" in body
+
+
+# --- a stalled marked wake (issue #950) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(("alone", "marked_newest"), [(True, False), (False, False), (False, True)])
+def test_a_stalled_turn_is_marked_only_when_it_carried_that_one_item(
+    platform, tmp_path, alone, marked_newest
+):
+    """End to end on the stall path: a dead marked turn alone is not mined; with a mate it is."""
+    from basecradle_harness import MemoryProvider
+    from tests.test_wake import PRIOR, PROBE_SECRET, marked_marker
+
+    class Mined(MemoryProvider):
+        def __init__(self):
+            self.observed = []
+
+        def observe(self, exchange):
+            self.observed.append(exchange)
+
+    marked_body, plain = f"NOC check. {marked_marker()}", "My birthday is March 3."
+    if alone:
+        listed = [message(uuid=M0, body=marked_body)]
+    elif marked_newest:
+        listed = [message(uuid=M1, body=marked_body), message(uuid=M0, body=plain)]
+    else:
+        listed = [message(uuid=M1, body=plain), message(uuid=M0, body=marked_body)]
+
+    def wake(brain, memory=None):
+        agent, _ = build_wake(
+            tmp_path,
+            brain,
+            tools=[MessagesTool()],
+            memory_provider=memory,
+            probe_secret=PROBE_SECRET,
+        )
+        agent.harness.engine._sleep = lambda _seconds: None
+        return agent
+
+    MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)  # no bootstrap: every listed message is one batch
+    serve_messages(platform, page(*listed))
+    with pytest.raises(ProviderTimeoutError):
+        wake(_WorksThenStalls()).wake()
+    for _ in range(RESUME_CEILING):
+        serve_messages(platform, page(*listed))
+        with pytest.raises(_Killed):
+            wake(_DiesMidResume()).wake()
+
+    serve_messages(platform, page(*listed))
+    memory = Mined()
+    wake(_WorksThenStalls(speaks=False), memory).wake()
+
+    assert len(_stall_posts(platform)) == 1  # the stall path ran
+    assert len(memory.observed) == (0 if alone else 1)

@@ -19,8 +19,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - a single item (`_marked`);
   - every message of a batch, so a batch with any unmarked message is mined whole;
   - a seeded backlog message on its own;
-  - a resumed or stalled turn only when it carried that one item (`_turn_marked`), because its batch-mates are known there only by uuid.
-- **Unverified is ordinary.** A forged marker, a misshapen one, one signed for another timeline, and any marker on a box with no (or a blank) `NOC_PROBE_SECRET` is an ordinary item, mined like any other.
+  - a resumed or stalled turn only when it records that it carried that one item (`_turn_marked`), because its batch-mates are known there only by uuid.
+- **Unverified is ordinary.** A forged marker, a misshapen one, one signed for another timeline or another author, a marker outside a message body, and any marker on a box with no (or a blank) `NOC_PROBE_SECRET` is an ordinary item, mined like any other.
 - **Only a message's body is read for `BCNOC2`.** The NOC posts it nowhere else, so a task's instructions, a webhook payload and an asset's description are never read for it: each is a field someone who has seen a marker could paste it into on the same timeline. Every marker line in a body is checked, each on its own, so one check message can carry lines for several agents.
 - **The marker's carrier field is one mapping** (`_wake._carrier`: a message's body, a task's instructions, a webhook payload, an asset's description), now read by the synthetic probe for all four and by the marked wake for a message.
 - **`BCNOC1` is unchanged.**

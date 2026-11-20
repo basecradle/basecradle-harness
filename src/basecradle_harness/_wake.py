@@ -3325,8 +3325,8 @@ class WakeAgent:
           that is genuinely mined.
 
         - **A marked real wake is not handed to memory at all** (``marked``, issue #950): the NOC's
-          own verification wake, recognised by a verified `BCNOC2` marker bound to this timeline
-          (`_marked`). The caller decides it from the items the turn answered, never from text, and
+          own verification wake, recognised by a verified `BCNOC2` marker bound to this timeline and
+          to the message's author (`_marked`). The caller decides it from the items the turn answered, never from text, and
           one INFO line says so, ``memory op=observe result=skipped reason=marked``. A batch with
           any unmarked message in it is mined whole.
 
@@ -3517,20 +3517,22 @@ class WakeAgent:
         """
         if kind != _MESSAGES or not self.probe_secret:
             return False
+        author = getattr(getattr(item, "user", None), "uuid", None)
+        if not author:
+            return False  # no author to bind to, so nothing can verify: an ordinary message
         secret = self.probe_secret.reveal()
-        carrier = _carrier(item, kind)
-        return verify_marked(carrier, secret, self.timeline_uuid, item.user.uuid) is not None
+        return verify_marked(_carrier(item, kind), secret, self.timeline_uuid, author) is not None
 
     def _turn_marked(self, turn: Message, item: object, kind: str) -> bool:
         """Whether a recovered turn (a resume, a stall) was a marked real wake and nothing else.
 
-        Only a turn that carried this one item: a recovered message turn may have answered a whole
-        batch, whose mates are known here only by uuid, so their markers cannot be read and the turn
-        is mined, as an unmarked one is. Mining a marked wake costs one drawer; not mining a real
-        message would cost a memory.
+        Only a turn that records it carried this one item: a recovered message turn may have
+        answered a whole batch, whose mates are known here only by uuid, so their markers cannot be
+        read and the turn is mined, as an unmarked one is. A turn persisted before turns recorded
+        their items says nothing about its mates, so it is mined too. Mining a marked wake costs one
+        drawer; not mining a real message would cost a memory.
         """
-        uuid = item.content.uuid
-        return set(turn.items or [uuid]) <= {uuid} and self._marked(item, kind)
+        return list(turn.items or []) == [item.content.uuid] and self._marked(item, kind)
 
     # --- the first wake: infer a high-water mark from the timeline ------------
 

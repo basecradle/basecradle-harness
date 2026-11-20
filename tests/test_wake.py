@@ -7167,7 +7167,11 @@ def test_a_recovered_turn_counts_as_marked_only_when_it_carried_that_one_item(pl
     batch = Message.user(content="x")
     batch.items = [M1, M0]
     legacy = Message.user(content="x")  # a turn persisted before turns recorded their items
+    no_author = SimpleNamespace(
+        user=SimpleNamespace(uuid=None), content=SimpleNamespace(uuid=M0, body=marked_marker())
+    )
 
     assert agent._turn_marked(alone, item, wake_module._MESSAGES) is True
-    assert agent._turn_marked(legacy, item, wake_module._MESSAGES) is True
+    assert agent._turn_marked(legacy, item, wake_module._MESSAGES) is False  # its mates unknown
     assert agent._turn_marked(batch, item, wake_module._MESSAGES) is False
+    assert agent._marked(no_author, wake_module._MESSAGES) is False
