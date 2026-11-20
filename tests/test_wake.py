@@ -2819,26 +2819,26 @@ def agent_mark(tmp_path, kind):
 
 def _serve_message_carrier(platform, tmp_path):
     serve_messages(platform, page(message(uuid=M0, body=f"NOC probe.\n{VECTOR}")))
-    return lambda: agent_mark(tmp_path, "messages") == M0
+    return "messages", M0, lambda: agent_mark(tmp_path, "messages") == M0
 
 
 def _serve_task_carrier(platform, tmp_path):
     serve_messages(platform, page())
     serve_tasks(platform, task_page(task(uuid=T0, instructions=f"NOC probe.\n{VECTOR}")))
-    return lambda: T0 in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
+    return "tasks", T0, lambda: T0 in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
 
 
 def _serve_event_carrier(platform, tmp_path):
     serve_messages(platform, page())
     serve_events(platform, event_page(event(uuid=E0, payload=f"webhook probe\n{VECTOR}")))
-    return lambda: agent_mark(tmp_path, "webhook_events") == E0
+    return "webhook_events", E0, lambda: agent_mark(tmp_path, "webhook_events") == E0
 
 
 def _serve_asset_carrier(platform, tmp_path):
     MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
     serve_messages(platform, page())
     serve_assets(platform, asset_page(asset(uuid=A1, filename="probe.png", description=VECTOR)))
-    return lambda: agent_mark(tmp_path, "assets") == A1
+    return "assets", A1, lambda: agent_mark(tmp_path, "assets") == A1
 
 
 @pytest.mark.parametrize(
@@ -2848,7 +2848,7 @@ def _serve_asset_carrier(platform, tmp_path):
 )
 def test_a_valid_bcnoc1_in_a_platform_item_is_ordinary_content(platform, tmp_path, serve):
     """Claimed, answered by the model, mined, and settled — and no `BCNOC1-ACK` is posted."""
-    settled = serve(platform, tmp_path)
+    kind, uuid, recorded = serve(platform, tmp_path)
     memory = _Mined()
     agent, provider = build_wake(tmp_path, probe_secret=VECTOR_SECRET, memory_provider=memory)
 
@@ -2858,7 +2858,8 @@ def test_a_valid_bcnoc1_in_a_platform_item_is_ordinary_content(platform, tmp_pat
     assert len(_posts(platform)) == 1  # the agent's own reply, through its tool
     assert not any(body.startswith("BCNOC1-ACK") for body in _posts(platform))
     assert [VECTOR in exchange.user for exchange in memory.observed] == [True]  # mined
-    assert settled()  # claimed and committed like any other item
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, uuid, kind=kind).phase == "done"  # claimed
+    assert recorded()  # and recorded, so the next wake does not read it again
 
 
 def test_a_bcnoc1_is_ordinary_with_or_without_a_secret(platform, tmp_path):

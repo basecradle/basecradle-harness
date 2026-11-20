@@ -192,7 +192,7 @@ Constitution baselines: **basecradle#362** (one deployer for the fleet's machine
    /home/jt/venv/bin/basecradle-harness-wake --version   # reports the new version
    ```
 
-   plus a token-free synthetic-probe wake still acking sub-second (the duration check from the box
+   plus a token-free synthetic-probe wake still acking sub-second (the router's own `probe-ack` on its synthetic route; the harness acks no `BCNOC1`, issue #955) (the duration check from the box
    docs). `--version` is the cheap, model-free, credential-free probe added for exactly this — it
    is also what the NOC's standing release-drift detection runs on a cadence to fail loud when
    @jt's running version drifts from PyPI latest. **This proves the right bytes are installed and

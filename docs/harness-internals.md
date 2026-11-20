@@ -116,7 +116,7 @@ the generated tool manifest, and the persistent Turn 0 land in Group 3, below.
 Turn 0 stops being a one-time onboarding seed (Group 1's `_orientation` field-scrape, which
 ages into the distant past of a long transcript) and becomes a brief **re-asserted on every
 wake**. A `WakeAgent` injects it at the head of each wake's work — **lazily, just before the
-model is first engaged**, so an idle or probe-only wake neither bloats the transcript nor
+model is first engaged**, so an idle or self-only wake neither bloats the transcript nor
 fetches the live dashboard. Composed, in order, of four parts (`_brief.py`):
 
 1. **`initialize.md`** (`prompts/`, authored framework default) — lean, high-signal,
@@ -254,7 +254,7 @@ or a drop-in MCP server (Group 5).
   is loaded or the model is ever engaged.
 - **Trip → self-decline, token-free.** Over the cap within the window the wake **self-declines**
   — **no provider call**, acts on nothing (the whole point is to stop the burn, the same
-  token-free discipline as the NOC probe short-circuit) — writes the trip marker, logs at
+  token-free discipline the NOC probe short-circuit had until issue #955) — writes the trip marker, logs at
   `WARNING`, and posts **one** loud alert to the timeline. The alert fires only on the trip
   *transition* (the durable marker is the one-time guard, so it never per-tripped-wake loops;
   the actor self-filter keeps the agent from waking on its own alert). Every later wake for a

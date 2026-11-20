@@ -1910,9 +1910,9 @@ class WakeAgent:
         asset_trigger: str | None = None,
     ) -> list[object]:
         """Reconcile this timeline once — unseen messages, posted assets, inbound webhook
-        deliveries, *and* newly-activated tasks — and return every message the harness itself
-        posted (its notices for a model that cannot be reached; the agent's own speech, through its
-        tools, is in `self.speech`).
+        deliveries, *and* newly-activated tasks — and return every message that reached the
+        timeline: the agent's own, through its tools, plus the harness's notices for a model that
+        cannot be reached.
 
         A wake surfaces every kind of unseen actionable item on the timeline, not just
         new messages, because each kind arrives by a different route: a message and an
@@ -3439,8 +3439,9 @@ class WakeAgent:
         the provider-failure report (issue #336) with its outage notice (issue #951), and the stall
         note (issue #589), each posted because the model is the thing that failed. (The NOC probe
         ack was one until issue #955; the probe travels only on the router's synthetic route now.)
-        **The agent's speech goes through the `messages` tool**, and nowhere else. `idempotency_key` makes a post safe to repeat across a wake that died after it; only
-        the stall note needs one today.
+        **The agent's speech goes through the `messages` tool**, and nowhere else.
+        `idempotency_key` makes a post safe to repeat across a wake that died after it; only the
+        stall note needs one today.
 
         Refusals still degrade rather than raise: a locked timeline raises `TimelineLockedError`
         from the SDK and, unguarded, would kill the whole wake (`exit 1`) — the live failure this
@@ -3725,7 +3726,7 @@ class WakeAgent:
             self._absorb_after_hold(batch)
         self._pace_and_settle(batch)
         try:
-            narration = self._generate_settled(session, batch, posted, backlog)
+            narration = self._generate_settled(session, batch, backlog)
         except _REPORTED_FAILURES as exc:
             # A permanent or out-of-funds provider failure on the batch: report it once, model-free
             # (issue #336). Permanent → `_settle` commits the batch and advances the mark (the report
@@ -4842,7 +4843,6 @@ class WakeAgent:
         self,
         session: Session,
         batch: list[object],
-        posted: list[object],
         backlog: Sequence[object] = (),
     ) -> str:
         """Loop 2 — run the turn against the batch, rebuilding if a message lands mid-generation.
@@ -5004,7 +5004,8 @@ class WakeAgent:
         """Report a permanent / billing provider failure to the timeline — **model-free** (issue #336).
 
         The model is the thing that just failed, so the harness posts the notice itself, mechanically,
-        through the SDK under the agent's identity (`_post`, which costs no vendor credit). The vendor error rides inside **verbatim** (decision 3). This is the sanctioned
+        through the SDK under the agent's identity (`_post`, which costs no vendor credit). The
+        vendor error rides inside **verbatim** (decision 3). This is the sanctioned
         Unspoken-Channel exception: the model cannot be reached to speak, which is the one case that
         invariant could not cover (see `_report`).
 
