@@ -126,6 +126,7 @@ from basecradle_harness._basecradle import (
     base_url_override,
     operator_output_cap,
     resolved_model_params,
+    system_turns_from_env,
 )
 from basecradle_harness._breaker import (
     WakeBreaker,
@@ -5792,6 +5793,10 @@ def resolved_config() -> dict[str, object]:
       ``None`` when unset or blank (issue #651). The *override*, never the resolved default: one
       comparison rule then serves every agent on every provider — an endpoint a deployer did not
       declare reads ``null`` — and a regional host a deployer did declare can be read back.
+    - ``ai_system_turns`` — where the brain's model takes a system turn, as the brain reads
+      ``AI_SYSTEM_TURNS`` (issue #945): ``"anywhere"`` (unset or blank, the wire every model takes)
+      or ``"before_user"`` (every system turn no user turn follows sent as a labelled user turn). A
+      value a wake would refuse fails this report the same way.
     - ``cost_basis`` / ``cost_rates_source`` / ``cost_model_priced`` — where the brain's ``cost=``
       comes from (issues #655, #657): ``"computed"`` from the harness's transcription of the
       vendor's published rates (OpenAI aimed at its own host, Google, Anthropic), with the page and the date it
@@ -6080,6 +6085,7 @@ def resolved_config() -> dict[str, object]:
         "platform_sdk_version": _platform_sdk_version(),
         "ai_model": os.environ.get("AI_MODEL") or None,
         "ai_base_url": base_url_override(),
+        "ai_system_turns": system_turns_from_env(sdk),
         "ai_location": _configured(LOCATION_VAR),
         "ai_project": _configured(PROJECT_VAR),
         "ai_credentials_file": reported_credentials_file(os.environ.get(CREDENTIALS_FILE_VAR)),
