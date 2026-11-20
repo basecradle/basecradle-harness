@@ -93,7 +93,10 @@ def twin_key(user: str, assistant: str) -> str:
     user = _opening_masked(user.strip())
     assistant = assistant.strip()
     payload = f"{len(user)}:{user}{len(assistant)}:{assistant}"
-    return f"v{TWIN_RULE}:{hashlib.sha256(payload.encode()).hexdigest()}"
+    # `surrogatepass`: a lone surrogate (a ``\ud800`` escape in a peer's JSON) is text too, and
+    # must key, never raise.
+    digest = hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"v{TWIN_RULE}:{digest}"
 
 
 def _opening_masked(user: str) -> str:

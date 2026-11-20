@@ -382,14 +382,25 @@ class MemPalaceMemoryProvider(MemoryProvider):
     def repeats(self, exchange: MemoryExchange) -> bool:
         """Whether ``exchange`` repeats the newest exchange this palace filed on its timeline (#950).
 
-        Answered from the palace itself, by two metadata lookups and no search, embedding or model
-        call: the drawers filed under this exchange's key on this timeline (`TWIN_FIELD`,
-        `TIMELINE_FIELD`, which `_file` stamps on every drawer of an exchange the engine keyed), and
-        whether any drawer on this timeline was filed after the newest of them. ``source_mtime``
-        orders the filings: `_file` stamps the file's own on every drawer of it, and a home move
-        that keeps mtimes keeps the order. A drawer filed before the rule carries neither field, so
-        it never matches and never counts as later; a drawer that is deleted takes its key with it,
-        so its repeat is filed again.
+        Answered from the palace itself, by two metadata reads and no search, embedding or model
+        call. First, the drawers filed under this exchange's key on this timeline (`TWIN_FIELD`,
+        `TIMELINE_FIELD`, which `_file` stamps on every drawer of an exchange the engine keyed);
+        none, and it is no repeat. Then every conversation drawer filed at or after the newest of
+        them (``source_mtime``, which `_file` stamps from the file on every drawer of it): any one of
+        them on this timeline that does not carry this key means something else was filed since,
+        and it is no repeat. Two things make that second read safe in the direction that matters:
+
+        - **A drawer's timeline is read from its file's name too**, not only from `TIMELINE_FIELD`.
+          A drawer filed after the rule by something that does not stamp it (a harness rolled back
+          past this version, an upstream write path) still names its timeline in its file
+          (`_TIMELINE_FILE`), and is still seen as filed since.
+        - **At or after, never only after.** A filing whose mtime equals the newest twin's (a coarse
+          clock, a clock stepped back) counts as filed since, so the exchange is filed.
+
+        A drawer filed before the rule carries no key, so it never matches as a twin; a drawer that
+        is deleted takes its key with it, so its repeat is filed again. The second read is the size
+        of what was filed since the newest twin, which is small for the routine case it exists for
+        and grows only while a twin stands on a quiet timeline.
 
         A **seeded** repeat (issue #746) is the message the model is reading in its transcript this
         wake, and the drawer it repeats would be the closest match for this wake's Turn-0 recall,
@@ -397,7 +408,10 @@ class MemPalaceMemoryProvider(MemoryProvider):
         exchange is filed in would have.
 
         ``False`` before the palace exists, and for an exchange with no key or no timeline uuid.
-        Raises what MemPalace raises, which the engine logs and answers by filing.
+        Not atomic with the filing that follows: two wakes on one timeline at once (the router
+        serializes them; a library caller might not) can each read the other's filing late, which
+        files a repeat or skips one, never an exchange whose words differ. Raises what MemPalace
+        raises, which the engine logs and answers by filing.
         """
         timeline = _timeline_uuid(exchange.scope.timeline)
         if exchange.twin is None or timeline is None or not self.palace_path.exists():
@@ -415,13 +429,17 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not filed:
             return False
         newest = max(meta["source_mtime"] for meta in filed)
-        later = collection.get(
-            where={"$and": [{TIMELINE_FIELD: timeline}, {"source_mtime": {"$gt": newest}}]},
-            limit=1,
-            include=[],
+        since = collection.get(
+            where={"$and": [{"wing": _CONVERSATIONS_WING}, {"source_mtime": {"$gte": newest}}]},
+            include=["metadatas"],
         )
-        if later.get("ids"):
-            return False
+        for meta in since.get("metadatas") or []:
+            meta = meta or {}
+            if meta.get("room") == _REGISTRY_ROOM or meta.get(TWIN_FIELD) == exchange.twin:
+                continue
+            name = _source_name(meta)
+            if (meta.get(TIMELINE_FIELD) or (timeline_of_file(name) if name else None)) == timeline:
+                return False
         if exchange.seeded:
             self._seeded_files.update(
                 name
@@ -1192,18 +1210,21 @@ def _exchange_markdown(exchange: MemoryExchange) -> str:
 def exchange_of(text: str) -> tuple[str, str]:
     """An exchange file's text read back as ``(user, assistant)``: the inverse of `_exchange_markdown`.
 
-    The leading quoted lines are the user half, unquoted; the rest, less the one trailing newline
-    the writer adds, is the reply. A reply whose first line itself begins with the quote mark is
-    read into the user half: the file does not record where one ended and the other began. Used by
-    the palace check's twin census (issue #950), never by the observe.
+    The leading quoted lines (``> ``, or a bare ``>`` an editor left of an empty one) are the user
+    half, unquoted; the rest, less the one trailing newline the writer adds, is the reply. Split on
+    ``\n`` alone, as the writer joined. A reply whose first line itself begins with ``> `` is read
+    into the user half: the file does not record where one ended and the other began. Used by the
+    palace check's twin census (issue #950), never by the observe.
     """
-    lines = text.splitlines()
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()  # the one newline `_exchange_markdown` ends the file with
     split = 0
-    while split < len(lines) and lines[split].startswith(_QUOTE.rstrip()):
+    while split < len(lines) and (
+        lines[split].startswith(_QUOTE) or lines[split] == _QUOTE.rstrip()
+    ):
         split += 1
-    user = "\n".join(
-        line[len(_QUOTE) :] if line.startswith(_QUOTE) else "" for line in lines[:split]
-    )
+    user = "\n".join(line[len(_QUOTE) :] for line in lines[:split])
     return user, "\n".join(lines[split:])
 
 

@@ -199,6 +199,13 @@ def test_no_text_can_move_the_boundary_between_the_halves():
     assert twin_key("1:a", "") != twin_key("", "a")
 
 
+def test_a_lone_surrogate_keys_and_never_raises():
+    """A ``\\ud800`` escape in a peer's JSON decodes to text that strict UTF-8 cannot encode."""
+    import json
+
+    assert twin_key(json.loads('"hi \\ud800"'), "ok") != twin_key("hi", "ok")
+
+
 def test_the_key_names_its_rule():
     """A changed rule can only ever file an exchange once more, never suppress one it keeps."""
     assert twin_key("ping", "").startswith(f"v{TWIN_RULE}:")
@@ -242,6 +249,9 @@ def test_an_exchange_with_no_timeline_is_always_kept():
         ("[2026-11-20T06:00:00Z] john: ping", "Here."),
         ("[2026-11-20T06:00:00Z] john: two\nlines\n\nand a gap", "A reply\n> with a quote inside"),
         ("[2026-11-20T06:00:00Z] john: seeded, never answered", ""),
+        ("[2026-11-20T06:00:00Z] john: ping", ">x\nr"),
+        ("[2026-11-20T06:00:00Z] john: ping\n", "\n\nr\n"),
+        ("", "a reply to nothing"),
     ],
 )
 def test_an_exchange_file_reads_back_to_the_key_it_was_filed_under(user, assistant):

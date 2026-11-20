@@ -3350,9 +3350,9 @@ class WakeAgent:
             assistant=assistant,
             scope=MemoryScope(agent=self.me_uuid, timeline=self.timeline_uuid),
             seeded=seeded,
-            twin=twin_key(user, assistant),
         )
         try:
+            exchange = replace(exchange, twin=twin_key(user, assistant))
             repeat = self.memory_provider.repeats(exchange) is True
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake
             _log.warning("Memory provider repeats() failed; filing the exchange.", exc_info=True)

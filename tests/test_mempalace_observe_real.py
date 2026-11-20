@@ -315,6 +315,41 @@ def test_a_repeat_after_something_else_was_said_is_filed(tmp_path):
     assert _replies(palace) == ["Status ok.", "Status down.", "Status ok."]
 
 
+def test_an_unkeyed_filing_since_the_newest_twin_still_counts(tmp_path):
+    """A rollback past 0.201.0 files without the fields; its file's name still says its timeline."""
+    from basecradle_harness._mempalace import _exchange_markdown
+
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    _engine_observe(provider, _check_in(6), "Status ok.")
+    down = MemoryExchange(user=_check_in(7), assistant="Status down.", scope=SCOPE)
+    path = (palace / "conversations").resolve() / f"{TIMELINE}.{'d' * 32}.md"
+    with contextlib.redirect_stdout(io.StringIO()):
+        provider._file(path, _exchange_markdown(down))  # as 0.200.0 filed it: no key, no timeline
+
+    _engine_observe(provider, _check_in(8), "Status ok.")
+
+    assert _replies(palace) == ["Status ok.", "Status down.", "Status ok."]
+
+
+def test_a_filing_at_the_same_mtime_as_the_newest_twin_still_counts(tmp_path):
+    """A coarse or stepped-back clock: an equal mtime is filed since, never before."""
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    _engine_observe(provider, _check_in(6), "Status ok.")
+    _engine_observe(provider, _check_in(7), "Status down.")
+    collection = mp.get_collection(str(palace))
+    page = collection.get(include=["metadatas"])
+    first = min(meta["source_mtime"] for meta in page["metadatas"])
+    collection.update(
+        ids=page["ids"], metadatas=[{**meta, "source_mtime": first} for meta in page["metadatas"]]
+    )
+
+    _engine_observe(provider, _check_in(8), "Status ok.")
+
+    assert len(_rows(palace)[0]) == 3
+
+
 def test_the_same_words_on_another_timeline_are_filed(tmp_path):
     palace = tmp_path / "palace"
     provider = MemPalaceMemoryProvider(palace, agent="nova")

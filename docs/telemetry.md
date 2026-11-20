@@ -844,7 +844,7 @@ One line per memory-system operation other than a retrieval's report, which is `
 | `type` | The type of an answer that was not a mapping. | `_mempalace`. | Not that failure. |
 | `palace` | The palace path bound. | `_mempalace`. | Not a binding. |
 | `config` | The MemPalace config file path. | `_mempalace`. | Not a binding. |
-| `chars` | Common: the exchange's characters, filed or skipped. | The wake. | Not the wake's observe line. |
+| `chars` | Common: on `op=observe`, the exchange's characters, filed or skipped. | The wake. | A line the MemPalace adapter writes. |
 
 ### `memory recall`
 

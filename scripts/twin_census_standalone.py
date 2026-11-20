@@ -61,7 +61,8 @@ def twin_key(user, assistant):
     user = _opening_masked(user.strip())
     assistant = assistant.strip()
     payload = f"{len(user)}:{user}{len(assistant)}:{assistant}"
-    return f"v{TWIN_RULE}:{hashlib.sha256(payload.encode()).hexdigest()}"
+    digest = hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"v{TWIN_RULE}:{digest}"
 
 
 def timeline_of_file(name):
@@ -70,13 +71,15 @@ def timeline_of_file(name):
 
 
 def exchange_of(text):
-    lines = text.splitlines()
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
     split = 0
-    while split < len(lines) and lines[split].startswith(_QUOTE.rstrip()):
+    while split < len(lines) and (
+        lines[split].startswith(_QUOTE) or lines[split] == _QUOTE.rstrip()
+    ):
         split += 1
-    user = "\n".join(
-        line[len(_QUOTE) :] if line.startswith(_QUOTE) else "" for line in lines[:split]
-    )
+    user = "\n".join(line[len(_QUOTE) :] for line in lines[:split])
     return user, "\n".join(lines[split:])
 
 
