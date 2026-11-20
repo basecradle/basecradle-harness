@@ -146,6 +146,10 @@ basecradle-harness-scrub-palace = "basecradle_harness._scrub:main"
 # home-directory move (issue #606). No platform call, no model call, read-only by default; the
 # off-by-default --practice-observe mode writes one exchange, for a practice copy only.
 basecradle-harness-palace-check = "basecradle_harness._palace_check:main"
+# Send one wake-shaped request to the configured brain and print a JSON verdict (issue #947): would
+# this brain, configured this way, accept a real wake's request? No platform call, no memory, no
+# tool run, no write; --model-params checks a candidate model_params.json before it is installed.
+basecradle-harness-brain-check = "basecradle_harness._brain_check:main"
 
 [project.urls]
 Homepage = "https://basecradle.com"

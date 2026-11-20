@@ -81,9 +81,10 @@ import logging
 import os
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -121,7 +122,7 @@ from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
 from basecradle_harness._mcp import McpImageStore, McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
-from basecradle_harness._model_params import load_model_params
+from basecradle_harness._model_params import load_model_params, read_model_params
 from basecradle_harness._observability import kv, log_handler, log_unspoken
 from basecradle_harness._openai import (
     DEFAULT_SURFACE as OPENAI_DEFAULT_SURFACE,
@@ -1440,6 +1441,7 @@ def _provider_from_config(
     inherit_endpoint: bool = True,
     catalog: ModelCatalog | None = None,
     system_turns: str = ANYWHERE,
+    params_file: str | os.PathLike[str] | None = None,
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
@@ -1520,6 +1522,11 @@ def _provider_from_config(
     #   shares its endpoint by design; one on a *different* vendor must never be pointed at the
     #   brain's (issue #655), so it reaches its own vendor's default host.
     #
+    # ``params_file`` reads the brain's tuning from a named file instead of the config home's
+    # ``model_params.json``, by the same reader (`read_model_params`): the brain check's candidate
+    # (issue #947), judged before it is written into the agent's home. Ignored with
+    # ``inherit_params=False``, which drops the tuning whatever its source.
+    #
     # ``system_turns`` is the brain's alone and is never inherited: it declares how the brain's
     # *model* is served (`_system_turns`, issue #945), and a describer runs a different model, so
     # it builds with the default and the wire every model takes.
@@ -1529,7 +1536,12 @@ def _provider_from_config(
     model = model or os.environ.get("AI_MODEL")
     if not model:
         raise ValueError("AI_MODEL is required — the model id to run (e.g. gpt-5.4-mini).")
-    loaded_params = load_model_params if inherit_params else dict
+    if not inherit_params:
+        loaded_params: Callable[[], dict[str, Any]] = dict
+    elif params_file is not None:
+        loaded_params = partial(read_model_params, params_file, required=True)
+    else:
+        loaded_params = load_model_params
     endpoint = base_url_override() if inherit_endpoint else None
 
     # ``model_params.json`` is read *after* each branch's config-shape guards (below), never here:
@@ -1969,6 +1981,29 @@ def _resolve_tools_and_provider() -> tuple[
     # being built to act" seam, while `_resolve_tools` is shared with the read-only
     # `resolved_config` introspection, which must not write.
     _publish_palace_binding(memory)
+    provider, bridge = brain_from_config(provider_name, sdk, surface, resolved)
+    return provider, resolved, memory, bridge
+
+
+def brain_from_config(
+    provider_name: str,
+    sdk: str,
+    surface: str,
+    resolved: ResolvedTools,
+    *,
+    params_file: str | os.PathLike[str] | None = None,
+) -> tuple[Provider, CodeExecutionBridge | None]:
+    """The brain a wake builds over a resolved tool set, with its code-execution bridge.
+
+    Spelled once, for the wake (`_resolve_tools_and_provider`) and the brain check
+    (`basecradle_harness._brain_check`, issue #947): the check's whole claim is that the request it
+    sends is the one a wake's brain sends, which holds only while both build the brain here. The
+    bridge is built because the provider reads its container from it; it touches nothing until a
+    hosting agent binds it to a platform context, which the check never does.
+
+    `params_file` names a ``model_params.json`` to read instead of the config home's (a candidate
+    checked before it is installed); ``None`` is the wake's own.
+    """
     bridge = _maybe_code_bridge(provider_name, surface, resolved.builtins)
     provider = _provider_from_config(
         provider_name,
@@ -1978,8 +2013,9 @@ def _resolve_tools_and_provider() -> tuple[
         code_bridge=bridge,
         default_output_tokens=_max_output_tokens_from_env(),
         system_turns=system_turns_from_env(sdk),
+        params_file=params_file,
     )
-    return provider, resolved, memory, bridge
+    return provider, bridge
 
 
 def _resolve_tools(

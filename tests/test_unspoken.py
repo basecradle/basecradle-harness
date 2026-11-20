@@ -422,7 +422,7 @@ def _model_facing_strings():
     other surface — the brief, the nudges, the guidance the engine feeds back — where the word
     would be a lie the model then reasons from.
     """
-    from basecradle_harness import _arguments, _mempalace, _session
+    from basecradle_harness import _arguments, _brain_check, _mempalace, _session
     from basecradle_harness._brief import (
         render_brain,
         render_budget,
@@ -491,6 +491,8 @@ def _model_facing_strings():
         "withheld disclosure": " ".join(_withholding(noted, unsafe, unsafe)),
         "handed-back disclosure": " ".join(_withholding(handed_back, unsafe, [])),
         "reserve nudge": _RESERVE_NUDGE,
+        "brain-check user turn": _brain_check.USER_TURN,
+        "brain-check tool result": _brain_check.STAND_IN_RESULT,
         "step note (terse)": _step_note(1, 24, now),
         "step note (escalated)": _step_note(23, 24, now),
         "builtin guidance": _server_builtin_guidance("web_search"),

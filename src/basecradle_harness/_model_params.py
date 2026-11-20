@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 from basecradle_harness._install import config_home
@@ -60,10 +61,23 @@ def load_model_params(home: str | os.PathLike[str] | None = None) -> dict[str, A
     introspection also loads it (`resolved_model_params`, issue #236) to report the tuning — there
     a malformed file surfaces at verify time as a clean non-zero exit, the same failure a wake hits.
     """
-    path = config_home(home) / MODEL_PARAMS_NAME
+    return read_model_params(config_home(home) / MODEL_PARAMS_NAME)
+
+
+def read_model_params(path: str | os.PathLike[str], *, required: bool = False) -> dict[str, Any]:
+    """`load_model_params` for a file named by its path rather than found in a config home.
+
+    The one reader both use, so a candidate file is judged by exactly the rules a wake applies to
+    the installed one. `required` is for a path someone named on purpose (the brain check's
+    ``--model-params``, issue #947): there a missing file is a `ValueError`, because checking a
+    brain with no tuning when a file was asked for would answer a question nobody asked.
+    """
+    path = Path(path)
     try:
         raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        if required:
+            raise ValueError(f"{path} does not exist.") from exc
         return {}
     except OSError as exc:
         # A directory or a permission-denied file where model_params.json should be — surface it

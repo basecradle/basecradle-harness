@@ -75,7 +75,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -3250,20 +3250,14 @@ class WakeAgent:
         would fetch the live dashboard twice and could report parts the model was never shown.
         """
         try:
-            parts = brief_parts(
-                now=_now_line(),
-                brain=self._brain(),
-                harness=render_harness(),
-                budget=render_budget(self.harness.engine.max_steps),
-                initialize=prompt_text("initialize.md"),
-                manifest=render_manifest(self._manifest_entries()),
-                defects=render_defects(self.defect_notices),
-                safety=render_safety(self.safety_notices),
-                mcp=render_mcp(self.mcp_about),
-                your_home=self._your_home(),
+            parts = wake_brief_parts(
+                self.harness,
+                manifest=self._manifest_entries(),
+                defects=self.defect_notices,
+                safety=self.safety_notices,
+                mcp_about=self.mcp_about,
                 dashboard=fetch_dashboard_md(self.client),
                 memory=self._memory_context(query),
-                system_prompt=system_prompt_text(),
             )
             # Sizes and text off the *same* composition, so the attribution line can never report
             # the parts of a brief the model was not shown — and so the live dashboard is fetched
@@ -3279,42 +3273,6 @@ class WakeAgent:
             return None
         self._brief_sections = sections
         return brief
-
-    def _brain(self) -> str | None:
-        """The brief's ``brain`` part, guarded — an adapter's own attributes never cost the brief.
-
-        A shipped adapter answers with plain values that cannot raise. A library caller's adapter
-        is their own code, though, and a property of theirs that raises must cost this one part
-        rather than the whole brief: the rule `_memory_context` keeps for the memory provider.
-        """
-        try:
-            return render_brain(self.harness.provider)
-        except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
-            _log.warning(
-                "Could not describe the model provider; omitting the brain part.", exc_info=True
-            )
-            return None
-
-    def _your_home(self) -> str | None:
-        """The brief's ``your_home`` part, guarded — a broken install costs this part, loudly.
-
-        Keyed on the tools the harness actually registered (`render_your_home`), never on the
-        resolver's manifest or the persona prompt: the registry is what the policy admitted, so a
-        tool that requires ``SHELL`` there is a shell the model can really call.
-
-        The only way this raises is a package whose own data file is missing or unreadable, which is
-        a defect rather than a transient: a shell agent would lose the law for its folders on every
-        wake until someone reinstalls. So it logs at **ERROR** — the level that pages — and costs
-        this one part, never the rest of the brief.
-        """
-        try:
-            return render_your_home(self.harness.tools)
-        except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
-            _log.error(
-                "Could not compose the Your Home section; omitting it from the brief.",
-                exc_info=True,
-            )
-            return None
 
     def _memory_context(self, query: str | None) -> str | None:
         """The memory provider's recalled context for this turn, guarded — never breaks the wake.
@@ -5477,6 +5435,81 @@ def _asset_marker_carrier(asset: object) -> str:
     through to perception, never mistaken for a probe.
     """
     return getattr(asset.content, "description", None) or ""
+
+
+def wake_brief_parts(
+    harness: Harness,
+    *,
+    manifest: Sequence[tuple[str, str | None]],
+    defects: Sequence[str] | None,
+    safety: Sequence[str] | None,
+    mcp_about: Sequence[str] | None,
+    dashboard: str | None,
+    memory: str | None,
+) -> list[tuple[str, str]]:
+    """The persistent brief's named parts for an agent built on `harness` — the one composition.
+
+    `WakeAgent._compose_brief` and the brain check (`basecradle_harness._brain_check`, issue #947)
+    both compose the brief here, so the check's request carries the brief a wake's does, part for
+    part. The two parts only a wake can fetch are arguments: the live `dashboard` (a platform read)
+    and the recalled `memory` (a memory read), which the check passes as ``None``, exactly as a wake
+    whose dashboard fetch failed and whose provider recalled nothing would. Everything else is read
+    off `harness` (the adapter the engine calls, the step budget, the registered tools) or off the
+    prompt files, the way a wake reads it.
+    """
+    return brief_parts(
+        now=_now_line(),
+        brain=_brain_part(harness.provider),
+        harness=render_harness(),
+        budget=render_budget(harness.engine.max_steps),
+        initialize=prompt_text("initialize.md"),
+        manifest=render_manifest(manifest),
+        defects=render_defects(defects),
+        safety=render_safety(safety),
+        mcp=render_mcp(mcp_about),
+        your_home=_your_home_part(harness.tools),
+        dashboard=dashboard,
+        memory=memory,
+        system_prompt=system_prompt_text(),
+    )
+
+
+def _brain_part(provider: object) -> str | None:
+    """The brief's ``brain`` part, guarded — an adapter's own attributes never cost the brief.
+
+    A shipped adapter answers with plain values that cannot raise. A library caller's adapter
+    is their own code, though, and a property of theirs that raises must cost this one part
+    rather than the whole brief: the rule `_memory_context` keeps for the memory provider.
+    """
+    try:
+        return render_brain(provider)
+    except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
+        _log.warning(
+            "Could not describe the model provider; omitting the brain part.", exc_info=True
+        )
+        return None
+
+
+def _your_home_part(tools: Iterable[object]) -> str | None:
+    """The brief's ``your_home`` part, guarded — a broken install costs this part, loudly.
+
+    Keyed on the tools the harness actually registered (`render_your_home`), never on the
+    resolver's manifest or the persona prompt: the registry is what the policy admitted, so a
+    tool that requires ``SHELL`` there is a shell the model can really call.
+
+    The only way this raises is a package whose own data file is missing or unreadable, which is
+    a defect rather than a transient: a shell agent would lose the law for its folders on every
+    wake until someone reinstalls. So it logs at **ERROR** — the level that pages — and costs
+    this one part, never the rest of the brief.
+    """
+    try:
+        return render_your_home(tools)
+    except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
+        _log.error(
+            "Could not compose the Your Home section; omitting it from the brief.",
+            exc_info=True,
+        )
+        return None
 
 
 def _now_line() -> str:
