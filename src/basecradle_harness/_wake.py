@@ -75,7 +75,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -149,6 +149,7 @@ from basecradle_harness._brief import (
     render_your_home,
 )
 from basecradle_harness._code import CodeExecutionBridge
+from basecradle_harness._context import Compactor
 from basecradle_harness._describer import (
     DESCRIBER_API_KEY_VAR,
     DESCRIBER_CREDENTIALS_FILE_VAR,
@@ -161,7 +162,7 @@ from basecradle_harness._describer import (
     describer_stack_from_env,
     describer_surface_from_env,
 )
-from basecradle_harness._engine import OUTPUT_BUDGET, compose_hooks, is_truncation_note
+from basecradle_harness._engine import OUTPUT_BUDGET, TurnHook, compose_hooks, is_truncation_note
 from basecradle_harness._exceptions import (
     EngineError,
     HarnessError,
@@ -223,7 +224,9 @@ from basecradle_harness._observability import (
     scrub,
 )
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
+from basecradle_harness._plugins import ResolvedTools
 from basecradle_harness._probe import ack_line, verify_probe
+from basecradle_harness._provider import Provider
 from basecradle_harness._report import (
     BILLING,
     PERMANENT,
@@ -259,6 +262,7 @@ from basecradle_harness._stop import WakeStopped
 from basecradle_harness._stop import die as die_by_signal
 from basecradle_harness._stop import install as install_stop_handler
 from basecradle_harness._timeouts import output_cap
+from basecradle_harness._tools import Tool
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
 
@@ -1779,13 +1783,7 @@ class WakeAgent:
         #: (issue #592) A wake is counted once, at its first model work — see `_admit`.
         self._admitted = False
         self._breaker_held = False
-        if onboard:
-            # The persistent brief rides every model call (see `_wake_brief`) and carries the
-            # personality charter (`system-prompt.md`) itself, so a static turn-0 seed would
-            # only duplicate it — and unlike the brief, a seeded charter *persists*. Clear it;
-            # the brief is the charter now. With onboarding off the operator's turn-0 charter
-            # stands as before.
-            self.harness.system_prompt = None
+        seat_charter(self.harness, onboard=onboard)
 
     @classmethod
     def from_env(cls, *, timeline: str | None = None) -> WakeAgent:
@@ -1815,31 +1813,10 @@ class WakeAgent:
                 "transcript and high-water mark persist across wakes."
             )
         provider, resolved, memory, bridge = _resolve_tools_and_provider()
-        # The deploy-selected profile (issue #256): the same `_profile_from_env` read that gated
-        # tool resolution now builds the registry, so an `unlocked` deploy admits its opted-in
-        # shell-class tool rather than the locked default filtering it straight back out.
-        _, policy = _profile_from_env()
-        harness = Harness(
+        harness = wake_harness(
             provider,
-            system_prompt=charter_from_env(),
+            resolved,
             tools=resolved.tools,
-            policy=policy,
-            # The per-turn step budget (default 24, `HARNESS_MAX_STEPS` overrides). The engine
-            # injects a live counter against it and, when spent with tools still pending, makes
-            # the reserve summary call rather than cutting off with a canned string (issue #243).
-            max_steps=_max_steps_from_env(),
-            # How many extra times a truncated/unparseable provider response is re-requested
-            # before the wake gives up (default 2, `HARNESS_RESPONSE_RETRIES` overrides). Without
-            # it, a single EOF-mid-JSON flake aborted the wake and silently dropped the peer's
-            # message — the item is marked seen before the model runs, so no later wake retried it
-            # (issue #259).
-            response_retries=_response_retries_from_env(),
-            # The active server-side built-ins (e.g. web_search), so a model that calls one as a
-            # function gets targeted guidance instead of the generic error (issue #245).
-            server_builtins=resolved.builtins,
-            # MCP tools this agent's configuration withholds (issue #553): a model that calls one
-            # by name gets its refusal — what, why, who decided — rather than "no tool named".
-            withheld_tools=resolved.withheld,
             home=home,
             # The code-execution Asset bridge (when active) harvests a run's output files +
             # source into Assets after each code-exec turn, then feeds their uuids back. None
@@ -3250,20 +3227,14 @@ class WakeAgent:
         would fetch the live dashboard twice and could report parts the model was never shown.
         """
         try:
-            parts = brief_parts(
-                now=_now_line(),
-                brain=self._brain(),
-                harness=render_harness(),
-                budget=render_budget(self.harness.engine.max_steps),
-                initialize=prompt_text("initialize.md"),
-                manifest=render_manifest(self._manifest_entries()),
-                defects=render_defects(self.defect_notices),
-                safety=render_safety(self.safety_notices),
-                mcp=render_mcp(self.mcp_about),
-                your_home=self._your_home(),
-                dashboard=fetch_dashboard_md(self.client),
-                memory=self._memory_context(query),
-                system_prompt=system_prompt_text(),
+            parts = wake_brief_parts(
+                self.harness,
+                manifest=self._manifest_entries(),
+                defects=self.defect_notices,
+                safety=self.safety_notices,
+                mcp_about=self.mcp_about,
+                dashboard=lambda: fetch_dashboard_md(self.client),
+                memory=lambda: self._memory_context(query),
             )
             # Sizes and text off the *same* composition, so the attribution line can never report
             # the parts of a brief the model was not shown — and so the live dashboard is fetched
@@ -3279,42 +3250,6 @@ class WakeAgent:
             return None
         self._brief_sections = sections
         return brief
-
-    def _brain(self) -> str | None:
-        """The brief's ``brain`` part, guarded — an adapter's own attributes never cost the brief.
-
-        A shipped adapter answers with plain values that cannot raise. A library caller's adapter
-        is their own code, though, and a property of theirs that raises must cost this one part
-        rather than the whole brief: the rule `_memory_context` keeps for the memory provider.
-        """
-        try:
-            return render_brain(self.harness.provider)
-        except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
-            _log.warning(
-                "Could not describe the model provider; omitting the brain part.", exc_info=True
-            )
-            return None
-
-    def _your_home(self) -> str | None:
-        """The brief's ``your_home`` part, guarded — a broken install costs this part, loudly.
-
-        Keyed on the tools the harness actually registered (`render_your_home`), never on the
-        resolver's manifest or the persona prompt: the registry is what the policy admitted, so a
-        tool that requires ``SHELL`` there is a shell the model can really call.
-
-        The only way this raises is a package whose own data file is missing or unreadable, which is
-        a defect rather than a transient: a shell agent would lose the law for its folders on every
-        wake until someone reinstalls. So it logs at **ERROR** — the level that pages — and costs
-        this one part, never the rest of the brief.
-        """
-        try:
-            return render_your_home(self.harness.tools)
-        except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
-            _log.error(
-                "Could not compose the Your Home section; omitting it from the brief.",
-                exc_info=True,
-            )
-            return None
 
     def _memory_context(self, query: str | None) -> str | None:
         """The memory provider's recalled context for this turn, guarded — never breaks the wake.
@@ -5477,6 +5412,147 @@ def _asset_marker_carrier(asset: object) -> str:
     through to perception, never mistaken for a probe.
     """
     return getattr(asset.content, "description", None) or ""
+
+
+def wake_harness(
+    provider: Provider,
+    resolved: ResolvedTools,
+    *,
+    tools: Iterable[Tool],
+    home: str | None,
+    turn_hook: TurnHook | None,
+    compactor: Compactor | None,
+) -> Harness:
+    """The `Harness` a wake runs on: `WakeAgent.from_env`'s, and the brain check's (issue #947).
+
+    Built here, once, so the check's request carries what a wake's does: the same charter, policy,
+    step budget, retries, built-ins and withheld tools. The four arguments are what the two differ
+    in, each deliberately: the check offers stand-in `tools`, keeps no `home`, ends its run with
+    its own `turn_hook`, and has no `compactor`, so nothing but its own turn calls the model.
+
+    The charter it seeds is the operator's turn-0 charter; `seat_charter` then clears it when
+    onboarding is on, as `WakeAgent.__init__` does for every harness it is handed.
+    """
+    # The deploy-selected profile (issue #256): the same `_profile_from_env` read that gated
+    # tool resolution now builds the registry, so an `unlocked` deploy admits its opted-in
+    # shell-class tool rather than the locked default filtering it straight back out.
+    _, policy = _profile_from_env()
+    return Harness(
+        provider,
+        system_prompt=charter_from_env(),
+        tools=tools,
+        policy=policy,
+        # The per-turn step budget (default 24, `HARNESS_MAX_STEPS` overrides). The engine
+        # injects a live counter against it and, when spent with tools still pending, makes
+        # the reserve summary call rather than cutting off with a canned string (issue #243).
+        max_steps=_max_steps_from_env(),
+        # How many extra times a truncated/unparseable provider response is re-requested
+        # before the wake gives up (default 2, `HARNESS_RESPONSE_RETRIES` overrides). Without
+        # it, a single EOF-mid-JSON flake aborted the wake and silently dropped the peer's
+        # message — the item is marked seen before the model runs, so no later wake retried it
+        # (issue #259).
+        response_retries=_response_retries_from_env(),
+        # The active server-side built-ins (e.g. web_search), so a model that calls one as a
+        # function gets targeted guidance instead of the generic error (issue #245).
+        server_builtins=resolved.builtins,
+        # MCP tools this agent's configuration withholds (issue #553): a model that calls one
+        # by name gets its refusal — what, why, who decided — rather than "no tool named".
+        withheld_tools=resolved.withheld,
+        home=home,
+        turn_hook=turn_hook,
+        compactor=compactor,
+    )
+
+
+def seat_charter(harness: Harness, *, onboard: bool) -> None:
+    """Clear `harness`'s turn-0 charter when onboarding is on — the brief carries it then.
+
+    The persistent brief rides every model call (see `_wake_brief`) and carries the personality
+    charter (`system-prompt.md`) itself, so a static turn-0 seed would only duplicate it — and
+    unlike the brief, a seeded charter *persists*. Clear it; the brief is the charter now. With
+    onboarding off the operator's turn-0 charter stands as before. One rule for every harness a
+    wake runs on and for the brain check's (issue #947), which sent the charter twice before it
+    read this.
+    """
+    if onboard:
+        harness.system_prompt = None
+
+
+def wake_brief_parts(
+    harness: Harness,
+    *,
+    manifest: Sequence[tuple[str, str | None]],
+    defects: Sequence[str] | None,
+    safety: Sequence[str] | None,
+    mcp_about: Sequence[str] | None,
+    dashboard: Callable[[], str | None],
+    memory: Callable[[], str | None],
+) -> list[tuple[str, str]]:
+    """The persistent brief's named parts for an agent built on `harness` — the one composition.
+
+    `WakeAgent._compose_brief` and the brain check (`basecradle_harness._brain_check`, issue #947)
+    both compose the brief here, so the check's request carries the brief a wake's does, part for
+    part. The two parts only a wake can fetch are arguments: the live `dashboard` (a platform read)
+    and the recalled `memory` (a memory read, perhaps a rerank call), which the check answers with
+    ``None``, exactly as a wake whose dashboard fetch failed and whose provider recalled nothing
+    would. They are callables, called in their place in the order, so the time anchor is read
+    first and a part that raises before them costs no fetch and no recall, as it always did.
+    Everything else is read off `harness` (the adapter the engine calls, the step budget, the
+    registered tools) or off the prompt files, the way a wake reads it.
+    """
+    return brief_parts(
+        now=_now_line(),
+        brain=_brain_part(harness.provider),
+        harness=render_harness(),
+        budget=render_budget(harness.engine.max_steps),
+        initialize=prompt_text("initialize.md"),
+        manifest=render_manifest(manifest),
+        defects=render_defects(defects),
+        safety=render_safety(safety),
+        mcp=render_mcp(mcp_about),
+        your_home=_your_home_part(harness.tools),
+        dashboard=dashboard(),
+        memory=memory(),
+        system_prompt=system_prompt_text(),
+    )
+
+
+def _brain_part(provider: object) -> str | None:
+    """The brief's ``brain`` part, guarded — an adapter's own attributes never cost the brief.
+
+    A shipped adapter answers with plain values that cannot raise. A library caller's adapter
+    is their own code, though, and a property of theirs that raises must cost this one part
+    rather than the whole brief: the rule `_memory_context` keeps for the memory provider.
+    """
+    try:
+        return render_brain(provider)
+    except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
+        _log.warning(
+            "Could not describe the model provider; omitting the brain part.", exc_info=True
+        )
+        return None
+
+
+def _your_home_part(tools: Iterable[object]) -> str | None:
+    """The brief's ``your_home`` part, guarded — a broken install costs this part, loudly.
+
+    Keyed on the tools the harness actually registered (`render_your_home`), never on the
+    resolver's manifest or the persona prompt: the registry is what the policy admitted, so a
+    tool that requires ``SHELL`` there is a shell the model can really call.
+
+    The only way this raises is a package whose own data file is missing or unreadable, which is
+    a defect rather than a transient: a shell agent would lose the law for its folders on every
+    wake until someone reinstalls. So it logs at **ERROR** — the level that pages — and costs
+    this one part, never the rest of the brief.
+    """
+    try:
+        return render_your_home(tools)
+    except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
+        _log.error(
+            "Could not compose the Your Home section; omitting it from the brief.",
+            exc_info=True,
+        )
+        return None
 
 
 def _now_line() -> str:

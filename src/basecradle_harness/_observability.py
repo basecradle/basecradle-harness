@@ -2088,6 +2088,59 @@ def capture_llm_call(purpose: str = HELPER) -> Iterator[LlmCall]:
         _CAPTURE.reset(token)
 
 
+#: Where `log_llm_call` also records each line it writes, while a `tally_llm_calls` block is open;
+#: ``None`` (the ordinary case) records nothing. Ambient for `_CAPTURE`'s reason: the line is
+#: written inside the adapter, layers below the caller that wants it.
+_TALLY: ContextVar[list[dict[str, Any]] | None] = ContextVar("llm_tally", default=None)
+
+
+@contextmanager
+def tally_llm_calls() -> Iterator[list[dict[str, Any]]]:
+    """Collect, as data, what every `llm` line written inside the block says.
+
+    For a caller that reports the model calls it drove rather than journaling them, the brain check
+    (issue #947). Nothing about the line changes: it is written exactly as it would be, and the
+    entry is read off the same values it renders, so the two cannot disagree. Each entry carries
+    ``purpose``, ``step`` (``n/max`` inside an engine step), ``outcome``, ``reason``, the token
+    counts the line prints, ``cost`` as a number, ``cost_gap`` and ``generation_id``, each only
+    where the line has it. A line held back by `capture_llm_call` is tallied when its caller writes
+    it, once.
+    """
+    calls: list[dict[str, Any]] = []
+    token = _TALLY.set(calls)
+    try:
+        yield calls
+    finally:
+        _TALLY.reset(token)
+
+
+def _tally(
+    *,
+    purpose: str,
+    outcome: str,
+    reason: str | None,
+    counts: Mapping[str, int],
+    cost: Any,
+    cost_gap: str | None,
+    generation_id: str | None,
+) -> None:
+    calls = _TALLY.get()
+    if calls is None:
+        return
+    money = _money(cost)
+    entry = {
+        "purpose": purpose,
+        "step": _WORK.get().step,
+        "outcome": outcome,
+        "reason": reason,
+        **counts,
+        "cost": None if money is None else float(money),
+        "cost_gap": cost_gap,
+        "generation_id": generation_id,
+    }
+    calls.append({key: value for key, value in entry.items() if value is not None})
+
+
 def log_llm_call(
     *,
     provider: str,
@@ -2210,6 +2263,20 @@ def log_llm_call(
         # block is a fact this line must not swallow. Honest absence cuts both ways.
         counts = {}
         cost = cost if _charged(cost) else None
+    # Only on billed tokens with no cost: a figure that exists is never also reported missing, and a
+    # call that reported no usage has nothing a price was missing for.
+    gap = (
+        cost_gap if counts and _money(cost) is None and outcome not in (RETRYING, FAILED) else None
+    )
+    _tally(
+        purpose=purpose,
+        outcome=outcome,
+        reason=reason,
+        counts=counts,
+        cost=cost,
+        cost_gap=gap,
+        generation_id=generation_id,
+    )
     _log.log(
         level,
         "llm %s",
@@ -2224,13 +2291,7 @@ def log_llm_call(
             **counts,
             cost=_money(cost),
             cost_basis=cost_basis(cost),
-            # Only on billed tokens with no cost: a figure that exists is never also reported
-            # missing, and a call that reported no usage has nothing a price was missing for.
-            cost_gap=(
-                cost_gap
-                if counts and _money(cost) is None and outcome not in (RETRYING, FAILED)
-                else None
-            ),
+            cost_gap=gap,
             outcome=outcome,
             category=slug(category),
             attempt=attempt,
