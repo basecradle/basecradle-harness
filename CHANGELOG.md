@@ -7,6 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.203.0] - 2026-11-20
+
+### Removed: A `BCNOC1` probe marker in a platform item is no longer acked; it is ordinary content (issue #955)
+
+**Security fix.** The capital decided Option A on the NOC's sweep (basecradle-noc#1648, for a tracked finding): the harness stops accepting a `BCNOC1` marker in a platform item, and no new format replaces it. Before this, a wake acked a valid `BCNOC1` found in a message body, a task's instructions, a webhook payload or an asset's description, from any author, before the model. The marker is signed over its tag and nonce alone, and the harness kept no record of nonces. So a copy of one valid marker, put in anyone's item, got that real item acked mechanically and never shown to the model: the silent drop the marker's signature was meant to prevent. Nothing legitimate used that path any more: since basecradle-noc#428 the NOC holds no platform account, and its probe travels only on the router's synthetic route.
+
+- **A `BCNOC1` in a platform item is ordinary content.** On every carrier it is claimed, answered by the model, mined and settled like anything else, and no `BCNOC1-ACK` is posted. It is read-paced like any peer AI message, waits behind a breaker hold like any other work, and a seeded one is mined and carried in the Turn-0 recall query. The NOC's pinned vector (secret `basecradle-noc#1648 vector secret`) is in `tests/test_wake.py`, run against each of the four carriers.
+- **Removed:**
+  - `_probe.verify_probe`, `_probe.ack_line`, `SCHEME`, `ACK_TAG` and the `BCNOC1` signature.
+  - `WakeAgent._probe_nonce`, and the `probe=` hook `_act_on` took from all four reconcilers.
+  - The once-per-wake set of acked probes, and the message path's `probe_seen` pacing exemption.
+  - The `_carrier` / `_asset_marker_carrier` mapping. The one remaining reader, `BCNOC2`, reads a message's body directly.
+- **`BCNOC2` is untouched** (`verify_marked`, issue #950), and so is `NOC_PROBE_SECRET`, which `BCNOC2` needs. With the secret unset, blank or set, a `BCNOC1` is the same ordinary text.
+- **Where each marker lives now:** `BCNOC1` only on the router's synthetic route, and it is not the harness's to verify; `BCNOC2` only in a message body.
+- **The Unspoken Channel has one sanctioned class of harness-authored post left:** the provider-failure report, with its outage notice and the stall note. The `posted` line's `kind=probe-ack` is gone from the telemetry contract, since nothing writes it.
+- **Fleet effect:** after the NOC converges this release, a copied `BCNOC1` on any agent's timeline is answered and remembered rather than silently acked. The NOC's synthetic probe is unaffected.
+
 ## [0.202.0] - 2026-11-20
 
 ### Added: A wake that gives up on an outage exits 75 and tells the timeline once (issue #951)

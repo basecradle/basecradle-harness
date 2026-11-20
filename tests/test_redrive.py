@@ -38,7 +38,7 @@ import respx
 from basecradle_harness import Harness, Message, MessagesTool, Session, ToolCall
 from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._idempotency import MESSAGE, key
-from basecradle_harness._wake import ClaimStore, MarkStore, SeenStore, WakeAgent
+from basecradle_harness._wake import ClaimStore, MarkStore, SeenStore
 from tests.test_wake import (
     A0,
     A1,
@@ -120,12 +120,8 @@ class Reconciler:
     kind: str
     prior: str  # an item already handled before the test begins
     item: str  # the item under test — unseen, and the one a dead wake will strand
-    probe: str  # a NOC synthetic probe, older than `item` (only the probe-ack test uses it)
     path: str  # the SDK read surface it is scanned from
     wire: Callable[[str], dict]  # uuid -> the item's wire payload
-    probe_wire: Callable[
-        [str], dict
-    ]  # uuid -> the same, with "PROBE" in this kind's marker carrier
     envelope: Callable[..., dict]  # (*items) -> the newest-first page
     handled: Callable[[object, str], bool]  # (home, uuid) -> has this agent recorded it?
     record: Callable[[object, str], None]  # (home, uuid) -> record it as handled
@@ -155,22 +151,14 @@ def _task_rewind(home) -> None:
     SeenStore(home)._path(TIMELINE_UUID, "tasks").write_text(f"{T0}\n")
 
 
-# A probe sits *between* `prior` and `item` in each kind's stream, so the probe-ack test can put an
-# undecided item behind a settled one. Well-formed UUIDv7s, ordered accordingly.
 A_OLD = "019e777f-0000-7aaa-8bbb-617283940516"  # older than A0: a mark to scan from
-A_PROBE = "019e7780-eeee-7fff-8aaa-051627384950"
-E_PROBE = "019e7761-eeee-7fff-8aaa-162738495061"
-T_PROBE = "019e7770-eeee-7fff-8aaa-273849506172"
 
 ASSETS = Reconciler(
     kind="assets",
     prior=A0,
     item=A1,
-    probe=A_PROBE,
     path="/assets",
     wire=lambda uuid: asset(uuid=uuid, filename="owl.png"),
-    # An asset's probe marker is read from its **description** (`_asset_marker_carrier`).
-    probe_wire=lambda uuid: asset(uuid=uuid, filename="probe.png", description="PROBE"),
     envelope=asset_page,
     handled=_asset_handled,
     record=lambda home, uuid: MarkStore(home).set(TIMELINE_UUID, uuid, kind="assets"),
@@ -182,11 +170,8 @@ EVENTS = Reconciler(
     kind="webhook_events",
     prior=E0,
     item=E1,
-    probe=E_PROBE,
     path="/webhook_events",
     wire=lambda uuid: event(uuid=uuid, payload='{"deploy":"finished"}'),
-    # A delivery's probe marker is read from its **payload**.
-    probe_wire=lambda uuid: event(uuid=uuid, payload="PROBE"),
     envelope=event_page,
     handled=_event_handled,
     record=lambda home, uuid: MarkStore(home).set(TIMELINE_UUID, uuid, kind="webhook_events"),
@@ -198,11 +183,8 @@ TASKS = Reconciler(
     kind="tasks",
     prior=T0,
     item=T1,
-    probe=T_PROBE,
     path="/tasks",
     wire=lambda uuid: task(uuid=uuid, instructions="water the plants"),
-    # A task's probe marker is read from its **instructions**.
-    probe_wire=lambda uuid: task(uuid=uuid, instructions="PROBE"),
     envelope=task_page,
     handled=_task_handled,
     record=lambda home, uuid: SeenStore(home).add(TIMELINE_UUID, uuid, kind="tasks"),
@@ -216,11 +198,7 @@ KINDS = [pytest.param(r, id=r.kind) for r in (ASSETS, EVENTS, TASKS)]
 def serve(platform, reconciler: Reconciler, *uuids):
     """Serve `uuids` (newest-first) on this kind's read surface, for every read of this wake or any
     later one — the platform does not forget an item just because a wake died holding it."""
-
-    def wire(uuid):
-        return (reconciler.probe_wire if uuid == reconciler.probe else reconciler.wire)(uuid)
-
-    body = reconciler.envelope(*(wire(uuid) for uuid in uuids))
+    body = reconciler.envelope(*(reconciler.wire(uuid) for uuid in uuids))
     platform.get(reconciler.path).mock(return_value=httpx.Response(200, json=body))
 
 
@@ -720,7 +698,7 @@ def test_an_interrupted_create_in_a_task_turn_is_re_issued_under_the_dead_wakes_
     assert json.loads(posts[0].content)["message"]["body"] == "Watered."  # replayed byte for byte
 
 
-# --- the self-filter and the probe seam still short-circuit before the claim --
+# --- the self-filter still short-circuits before the claim ---------------------
 
 
 def test_the_agents_own_asset_is_recorded_without_ever_being_claimed(platform, tmp_path):
@@ -741,43 +719,6 @@ def test_the_agents_own_asset_is_recorded_without_ever_being_claimed(platform, t
     assert brain.prompts == []  # never acted on
     assert _asset_handled(tmp_path, A1)  # but recorded, so it is not re-scanned forever
     assert agent.claims.read(TIMELINE_UUID, A1, kind="assets") is None  # and never claimed
-
-
-@pytest.mark.parametrize("kind", [pytest.param(r, id=r.kind) for r in (ASSETS, EVENTS)])
-def test_a_probe_whose_ack_failed_is_not_marked_seen_by_the_item_behind_it(
-    platform, tmp_path, kind, monkeypatch
-):
-    """The same cursor-versus-set confusion, in miniature — and it was a live false-FAIL.
-
-    A NOC probe's ack is at-least-once: a refused post leaves the item deliberately unrecorded, so
-    the next wake re-acks it. But `_act_on` recorded each item *as it went*, and for a mark-backed
-    kind the record is a **cursor** — so the very next item in the batch advanced the mark straight
-    past the un-acked probe, and nobody ever acked it: a false monitor FAIL, manufactured by the
-    code written to prevent one. (The reasoning was right for tasks, whose record really is a set,
-    and quietly wrong for the other two.)
-
-    The order is the whole test: the probe is **older** than the real item, so a per-item record
-    sails over it. The mark now stops dead at the first undecided item, so it stays where it was and
-    the probe is re-acked next wake.
-    """
-    serve_messages(platform, page())
-    serve(platform, kind, kind.item, kind.probe, kind.prior)  # newest-first: real, probe, handled
-    kind.record(tmp_path, kind.prior)  # the incremental path, so all three are in one batch
-    monkeypatch.setattr(
-        WakeAgent,
-        "_probe_nonce",
-        lambda self, carrier: "n-1234" if "PROBE" in str(carrier) else None,
-    )
-    monkeypatch.setattr(WakeAgent, "_post", lambda self, body, *, kind: None)  # the ack is refused
-
-    agent, brain = build_wake(tmp_path)
-    agent.wake()
-
-    assert len(brain.prompts) == 1  # the real item was still acted on
-    # ...but the mark did not sail past the un-acked probe sitting behind it. It stays put, and the
-    # next wake re-reads both — a timeline read, never a model call.
-    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind=kind.kind) == kind.prior
-    assert not kind.handled(tmp_path, kind.item)
 
 
 def test_a_working_wake_records_and_commits_every_kind_it_handled(platform, tmp_path):

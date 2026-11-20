@@ -149,7 +149,7 @@ The reranker is a billed model call. Every Turn-0 recall sends it the query besi
   - Against the pre-#744 query, the reranker's prompt grows by at most ~1,000 characters: 9.5K → 10.5K at 20 candidates.
   - The cap is small because MemPalace's embedding reads only the start of the query and is diluted by a long one. Upstream's `query_sanitizer` measured R@10 falling from 89.8% to 1.0% for a short question behind 2,000+ prepended characters. Newest-first keeps the message nearest the reply inside the window.
 - **The newest message is never cut**, and that is a deliberate inheritance, not an oversight: a single long message was the whole query before #744 and stays so. Bounding it would cut a peer's own words to fit a number. That would be a new decision, not this one.
-- **Only the peers memory keeps** (`_seeded_peers`, shared with `_observe_seeded`): never the agent's own posts, never a NOC probe. What recall ranks against and what the palace mined are the same messages.
+- **Only the peers memory keeps** (`_seeded_peers`, shared with `_observe_seeded`): never the agent's own posts (a `BCNOC1` is a peer's ordinary message since issue #955). What recall ranks against and what the palace mined are the same messages.
 - **Messages folded in mid-generation are not searched for.** The brief is composed once, before the first build, as it always was.
 
 ## A Brain Reading Its Own Recall — Claude Haiku 5.5 on `@fred` (issue #733)

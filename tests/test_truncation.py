@@ -67,25 +67,20 @@ from basecradle_harness._wake import (
 )
 from basecradle_harness._xai_sdk import XaiSdkProvider
 from tests.test_wake import (
-    A0,
-    A1,
     BC_URL,
     M0,
     M1,
     M2,
     PNG_BYTES,
-    PROBE_SECRET,
     REPLY,
     TIMELINE_UUID,
     _posts,
-    asset,
     asset_page,
     build_wake,
     dashboard,
     event_page,
     message,
     page,
-    probe_marker,
     serve_messages,
     task,
     task_page,
@@ -625,30 +620,6 @@ def test_an_earlier_wakes_turn_first_continued_on_a_later_pass_still_makes_progr
     assert _claim(tmp_path, M1, kind="tasks").phase == "abandoned"
 
 
-def test_a_probe_a_later_pass_re_reads_is_acked_once(platform, tmp_path):
-    """A later pass re-reads the list from the mark, which is held behind the cut-off message — so
-    a NOC probe newer than it comes round again. It was acked on the first pass; it is not acked a
-    second time (the review of #596: without this a wake could post up to four acks)."""
-    MarkStore(tmp_path).set(TIMELINE_UUID, "019e7750-0000-7000-8000-000000000000")
-    serve_messages(
-        platform,
-        page(message(uuid=M1, body=probe_marker()), message(uuid=M0, body=BODY)),
-    )
-    brain = _CutOff(
-        Message.assistant(content="The barn owl is a sp"),
-        Message.assistant(content="…ecies. That is all."),
-        reasons=("length", "stop"),
-    )
-    agent, _ = build_wake(tmp_path, brain, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert brain.calls == 2  # the cut-off turn, then its continuation on pass 2
-    assert len([p for p in _posts(platform) if "ACK" in p]) == 1
-    assert len(posted) == 1
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
-
-
 def test_an_item_the_recovery_settled_is_recorded_even_behind_a_latch(platform, tmp_path):
     """The latch holds back work that needs the model; it has no business holding back an item the
     recovery just settled without one. Here a task's turn finished before its wake was killed (the
@@ -707,34 +678,6 @@ def test_the_backstop_names_what_it_leaves_waiting(platform, tmp_path, caplog, m
     deferred = [r.getMessage() for r in caplog.records if "wake deferred" in r.getMessage()]
     assert any(f"item={M0}" in d and "reason=truncated" in d for d in deferred)
     assert any(f"item={M1}" in d and "reason=held_back" in d for d in deferred)
-
-
-def test_an_asset_probe_a_later_pass_re_reads_is_acked_once(platform, tmp_path):
-    """The per-item seams re-read from their own cursor too: an asset probe newer than an asset whose
-    turn was cut off comes round on the next pass, and is not acked a second time."""
-    serve_messages(platform, page())
-    MarkStore(tmp_path).set(TIMELINE_UUID, "019e7780-0000-7000-8000-000000000000", kind="assets")
-    platform.get("/assets").mock(
-        return_value=httpx.Response(
-            200,
-            json=asset_page(
-                asset(uuid=A1, description=probe_marker()),
-                asset(uuid=A0),
-            ),
-        )
-    )
-    brain = _CutOff(
-        Message.assistant(content="A barn owl, perched on a fe"),
-        Message.assistant(content="nce post. That is the picture."),
-        reasons=("length", "stop"),
-    )
-    agent, _ = build_wake(tmp_path, brain, probe_secret=PROBE_SECRET)
-
-    agent.wake()
-
-    assert brain.calls == 2
-    assert len([p for p in _posts(platform) if "ACK" in p]) == 1
-    assert _claim(tmp_path, A0, kind="assets").phase == "done"
 
 
 def test_a_note_refused_then_posted_in_the_same_wake_is_not_reported_as_waiting(

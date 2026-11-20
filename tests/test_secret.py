@@ -20,6 +20,7 @@ import logging
 import pickle
 import pprint
 import subprocess
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -39,7 +40,7 @@ from basecradle_harness._secret import Secret, reveal, secret
 from basecradle_harness._token import SelfHealingBaseCradle
 from basecradle_harness._xai_account import XaiAccountBalanceTool
 from basecradle_harness._xai_sdk import XaiSdkProvider
-from tests.test_probe import NONCE, signed
+from tests.test_probe import AUTHOR, NONCE, marked
 from tests.test_token import NEW_TOKEN, minted, unauthorized
 from tests.test_wake import BC_URL, TIMELINE_UUID, build_wake, platform  # noqa: F401 - fixture
 
@@ -242,9 +243,11 @@ def test_a_remint_sends_the_real_password(tmp_path):
     assert client.token == NEW_TOKEN
 
 
-def test_a_probe_still_verifies_against_the_real_secret(platform, tmp_path):  # noqa: F811
+def test_a_marker_still_verifies_against_the_real_secret(platform, tmp_path):  # noqa: F811
     agent, _ = build_wake(tmp_path, probe_secret=PROBE)
-    assert agent._probe_nonce(signed(NONCE, PROBE)) == NONCE
+    body = marked(NONCE, timeline=TIMELINE_UUID, secret=PROBE)
+    message = SimpleNamespace(user=SimpleNamespace(uuid=AUTHOR), content=SimpleNamespace(body=body))
+    assert agent._marked(message, "messages")
 
 
 def test_a_rebuilt_xai_client_gets_the_key_itself(monkeypatch):

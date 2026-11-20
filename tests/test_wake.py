@@ -2782,15 +2782,24 @@ def test_main_returns_nonzero_on_missing_provider_config(platform, wake_env, mon
     assert main(["--timeline", TIMELINE_UUID]) == 1
 
 
-# --- NOC synthetic-probe short-circuit (issue #106) --------------------------
+# --- a BCNOC1 in a platform item is ordinary content (issue #955) -----------
 #
-# A woken harness recognizes a signed NOC probe (see `_probe`) and acks it at the
-# reconcile layer WITHOUT a model call, so the message-seam heartbeat is token-free at
-# rest. These pin the wake-level contract: ack the probe, no provider call, advance the
-# mark, leave the transcript clean; an unsigned/forged marker falls through to the model.
+# The harness once acked a signed `BCNOC1` (the NOC's synthetic probe) found in a message, a task, a
+# webhook event or an asset, before the model. The marker is signed over its nonce alone, so a copy
+# of one valid marker in anyone's item made a real item acked and never seen. The probe travels only
+# on the router's synthetic route now, so a valid `BCNOC1` here is, by construction, a copy: it is
+# claimed, answered by the model, and mined, like any other content.
 
 PROBE_SECRET = "noc-probe-secret-do-not-use-in-prod"
 PROBE_NONCE = "0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d"
+
+#: The pinned vector basecradle-noc#1648 confirmed verifies against the pre-#955 `verify_probe`; the
+#: NOC pins the same string on its side. A test value, never a real secret.
+VECTOR_SECRET = "basecradle-noc#1648 vector secret"
+VECTOR = (
+    "BCNOC1 0123456789abcdef0123456789abcdef "
+    "a69dfb14e7c8e3bb16cdc2e81448dfdc4955fe3c9be963458c8fb889f273886b"
+)
 
 
 def probe_marker(nonce=PROBE_NONCE, secret=PROBE_SECRET):
@@ -2799,322 +2808,72 @@ def probe_marker(nonce=PROBE_NONCE, secret=PROBE_SECRET):
     return f"BCNOC1 {nonce} {sig}"
 
 
-def _conversational_turns(agent):
-    """The user/assistant turns in the wake's session — empty means a clean transcript."""
-    history = agent.harness.session(agent.source).history
-    return [turn for turn in history if turn.role in ("user", "assistant")]
+def test_the_pinned_vector_is_a_valid_bcnoc1():
+    """The vector is genuinely signed, so the carrier tests below prove a *valid* one is ordinary."""
+    assert probe_marker("0123456789abcdef0123456789abcdef", VECTOR_SECRET) == VECTOR
 
 
-def test_a_signed_probe_is_acked_without_the_model(platform, tmp_path):
-    """A valid probe from a peer → a BCNOC1-ACK, zero model calls, mark advanced, clean transcript."""
-    body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
-    serve_messages(platform, page(message(uuid=M0, body=body)))
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert len(posted) == 1  # the ack
-    assert provider.prompts == []  # the model never ran — token-free
-    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
-    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
-    assert agent.marks.get(TIMELINE_UUID) == M0  # mark advanced exactly as a normal reply
-    assert _conversational_turns(agent) == []  # probe never entered the session transcript
+def agent_mark(tmp_path, kind):
+    return MarkStore(tmp_path).get(TIMELINE_UUID, kind=kind)
 
 
-def test_an_acked_probe_is_idempotent_across_wakes(platform, tmp_path):
-    """The mark advance means a second process re-reconciling acks nothing more."""
+def _serve_message_carrier(platform, tmp_path):
+    serve_messages(platform, page(message(uuid=M0, body=f"NOC probe.\n{VECTOR}")))
+    return "messages", M0, lambda: agent_mark(tmp_path, "messages") == M0
+
+
+def _serve_task_carrier(platform, tmp_path):
+    serve_messages(platform, page())
+    serve_tasks(platform, task_page(task(uuid=T0, instructions=f"NOC probe.\n{VECTOR}")))
+    return "tasks", T0, lambda: T0 in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
+
+
+def _serve_event_carrier(platform, tmp_path):
+    serve_messages(platform, page())
+    serve_events(platform, event_page(event(uuid=E0, payload=f"webhook probe\n{VECTOR}")))
+    return "webhook_events", E0, lambda: agent_mark(tmp_path, "webhook_events") == E0
+
+
+def _serve_asset_carrier(platform, tmp_path):
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="probe.png", description=VECTOR)))
+    return "assets", A1, lambda: agent_mark(tmp_path, "assets") == A1
+
+
+@pytest.mark.parametrize(
+    "serve",
+    [_serve_message_carrier, _serve_task_carrier, _serve_event_carrier, _serve_asset_carrier],
+    ids=["message", "task", "webhook_event", "asset_description"],
+)
+def test_a_valid_bcnoc1_in_a_platform_item_is_ordinary_content(platform, tmp_path, serve):
+    """Claimed, answered by the model, mined, and settled — and no `BCNOC1-ACK` is posted."""
+    kind, uuid, recorded = serve(platform, tmp_path)
+    memory = _Mined()
+    agent, provider = build_wake(tmp_path, probe_secret=VECTOR_SECRET, memory_provider=memory)
+
+    agent.wake()
+
+    assert len(provider.prompts) == 1 and VECTOR in provider.prompts[0]  # the model read it
+    assert len(_posts(platform)) == 1  # the agent's own reply, through its tool
+    assert not any(body.startswith("BCNOC1-ACK") for body in _posts(platform))
+    assert [VECTOR in exchange.user for exchange in memory.observed] == [True]  # mined
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, uuid, kind=kind).phase == "done"  # claimed
+    assert recorded()  # and recorded, so the next wake does not read it again
+
+
+def test_a_bcnoc1_is_ordinary_with_or_without_a_secret(platform, tmp_path):
+    """No secret, a blank one, or the right one: the marker is the same ordinary text."""
     body = probe_marker()
-    serve_messages(
-        platform,
-        page(message(uuid=M0, body=body)),  # first wake sees the probe
-        page(message(uuid=M0, body=body)),  # second wake re-reads, now past the mark
-    )
-    agent1, _ = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-    agent1.wake()
-
-    agent2, provider2 = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-    posted = agent2.wake()
-
-    assert posted == []  # nothing newer than the mark
-    assert provider2.prompts == []
-
-
-def test_a_forged_marker_falls_through_to_the_model(platform, tmp_path):
-    """Right shape, wrong signature → an ordinary message answered by the model."""
-    forged = f"BCNOC1 {PROBE_NONCE} {'0' * 64}"
-    serve_messages(platform, page(message(uuid=M0, body=forged)))
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert len(posted) == 1
-    assert provider.prompts == [
-        f"[2026-06-04T00:00:00.000Z] john: {forged}"
-    ]  # the model ran on it as a normal message
-    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
-    assert json.loads(sent.content) == {"message": {"body": "Hello, John."}}
-
-
-def test_without_a_probe_secret_a_valid_marker_is_an_ordinary_message(platform, tmp_path):
-    """Feature off (no NOC_PROBE_SECRET) → even a real probe goes to the model, unchanged."""
-    serve_messages(platform, page(message(uuid=M0, body=probe_marker())))
-    agent, provider = build_wake(tmp_path)  # no probe_secret
-
-    agent.wake()
-
-    assert provider.prompts == [
-        f"[2026-06-04T00:00:00.000Z] john: {probe_marker()}"
-    ]  # short-circuit disabled
-
-
-def test_a_self_authored_probe_is_filtered_not_acked(platform, tmp_path):
-    """Self-filter precedence: a probe the agent itself posted is skipped, never acked."""
-    serve_messages(platform, page(message(uuid=M0, body=probe_marker(), mine=True)))
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert posted == []  # own item: never acted on
-    assert provider.prompts == []
-    assert agent.marks.get(TIMELINE_UUID) == M0  # but the mark still advances
-
-
-def test_a_blank_probe_secret_keeps_the_short_circuit_off(platform, tmp_path):
-    """A set-but-empty secret must not enable verification against an empty HMAC key."""
-    serve_messages(platform, page(message(uuid=M0, body=probe_marker())))
-    agent, provider = build_wake(tmp_path, probe_secret="")  # blank, e.g. an unfilled env var
-
-    agent.wake()
-
-    assert provider.prompts == [
-        f"[2026-06-04T00:00:00.000Z] john: {probe_marker()}"
-    ]  # treated as an ordinary message
-
-
-# --- NOC probe short-circuit: the TASK seam (issue #110) ---------------------
-#
-# The same recognize-and-ack discipline as the message seam, but the marker rides the
-# task's *instructions*. The load-bearing subtlety is ordering: `_act_on` checks `probe`
-# BEFORE the atomic claim, so a probe task is acked at-least-once (post, then record) and
-# never claimed — the safe failure direction for a monitor (task-seam.md §4).
-
-
-def test_a_signed_probe_task_is_acked_without_the_model(platform, tmp_path):
-    """A probe in a task's instructions → a BCNOC1-ACK, zero model calls, task recorded
-    seen, clean transcript. The task-seam heartbeat runs token-free at rest."""
-    instructions = f"NOC task-seam probe — please disregard.\n{probe_marker()}"
-    serve_messages(platform, page())
-    serve_tasks(platform, task_page(task(uuid=T0, instructions=instructions)))
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert len(posted) == 1  # the ack
-    assert provider.prompts == []  # the model never ran — token-free
-    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
-    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
-    assert T0 in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")  # recorded seen
-    assert _conversational_turns(agent) == []  # probe never entered the session transcript
-
-
-def test_a_probe_task_is_acked_at_least_once_not_claimed(platform, tmp_path):
-    """LOAD-BEARING: `_act_on` checks `probe` before claiming, so a probe task is acked
-    at-least-once (post, THEN record), never pre-claimed. If the ack post is refused, the
-    task is NOT recorded seen — it retries next wake. This is the safe failure direction:
-    were the probe path 'fixed' to claim-first, the task would be marked seen with no ack
-    ever posted → the loop never closes → a false FAIL (task-seam.md §4).
-
-    Under B2 a refused post no longer crashes the wake; the at-least-once guarantee is
-    preserved by recording only after a *successful* ack, and the probe seam stays
-    trace-free — a refused ack degrades SILENTLY (no transcript note), never polluting the
-    deliberately-empty probe transcript or mislabeling the heartbeat ack as a 'reply'."""
-    serve_messages(platform, page())
-    serve_tasks(platform, task_page(task(uuid=T0, instructions=probe_marker())))
-    # The ack post is refused this wake (a locked timeline / transient 5xx).
-    platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
-        return_value=httpx.Response(500, json={"error": "boom"})
-    )
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()  # B2: degrades gracefully, never crashes
-
-    assert posted == []  # the ack never made it out
-    assert provider.prompts == []  # still no model call — the probe was recognized
-    # NOT recorded: a failed ack must retry, never mark the task seen with no ack posted.
-    assert T0 not in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
-    # Trace-free: a refused probe ack writes NO note, so the probe transcript stays empty.
-    assert agent.harness.session(agent.source).history == []
-
-
-def test_a_task_without_a_marker_falls_through_to_the_model(platform, tmp_path):
-    """An ordinary activated task (no marker) is still carried out by the model, unchanged."""
-    serve_messages(platform, page())
-    serve_tasks(platform, task_page(task(uuid=T0, instructions="post the daily summary")))
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert len(posted) == 1
-    assert len(provider.prompts) == 1
-    assert "post the daily summary" in provider.prompts[0]  # the model ran on it
-
-
-# --- NOC probe short-circuit: the WEBHOOK seam (issue #110) ------------------
-#
-# The closest of the three to the message seam: a probe webhook delivery is acked
-# at-least-once and never claimed; the marker rides the event *payload*.
-# The short-circuit runs inside `_act_on`, after `_bootstrap_stream` selects the item, so
-# the #100 cold-first-wake bootstrap (newest unseen delivery only) is preserved.
-
-
-def test_a_signed_probe_event_is_acked_without_the_model(platform, tmp_path):
-    """A probe in a webhook payload, on a cold first wake → a BCNOC1-ACK, zero model
-    calls, event mark advanced, clean transcript. The webhook-seam heartbeat is token-free
-    at rest. This is the cold-first-wake path (no mark, no trigger → newest delivery), so
-    it also pins that the #100 bootstrap composes with the short-circuit: one delivery on a
-    quiet probe timeline, so newest = the probe, and it is acked rather than sent to the model."""
-    serve_messages(platform, page())
-    serve_events(platform, event_page(event(uuid=E0, payload=f"webhook probe\n{probe_marker()}")))
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert len(posted) == 1  # the ack
-    assert provider.prompts == []  # the model never ran — token-free
-    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
-    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
-    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0  # mark advanced
-    assert _conversational_turns(agent) == []  # probe never entered the session transcript
-
-
-def test_a_probe_event_after_a_mark_is_acked(platform, tmp_path):
-    """Steady state (mark exists): a probe delivery newer than the mark is acked token-free,
-    and the older already-seen delivery is left alone."""
-    MarkStore(tmp_path).set(TIMELINE_UUID, E0, kind="webhook_events")
-    serve_messages(platform, page())
-    serve_events(
-        platform,
-        event_page(event(uuid=E1, payload=probe_marker()), event(uuid=E0, payload="old")),
-    )
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert len(posted) == 1
-    assert provider.prompts == []  # no model call
-    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E1
-
-
-def test_an_event_without_a_marker_falls_through_to_the_model(platform, tmp_path):
-    """An ordinary inbound delivery (no marker) still reaches the model, unchanged."""
-    serve_messages(platform, page())
-    serve_events(platform, event_page(event(uuid=E0, payload='{"action":"opened"}')))
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert len(posted) == 1
-    assert len(provider.prompts) == 1
-    assert "inbound webhook" in provider.prompts[0]  # the model ran on it
-
-
-# --- NOC probe short-circuit: the ASSET seam (issue #114) --------------------
-#
-# The 4th seam. The marker rides the asset's **description** — the asset analog of a
-# message body / task instructions / webhook payload (see `_asset_marker_carrier`). Like
-# the message and webhook seams the probe is at-least-once and never claimed, and it is
-# acked *before* the asset's file is ever fetched, so a synthetic asset probe costs no
-# download and no model call. The carrier field (`description`) is the contract the NOC's
-# asset probe must agree with.
-
-
-def test_a_signed_probe_asset_is_acked_without_the_model(platform, tmp_path):
-    """A probe in an asset's description → a BCNOC1-ACK, zero model calls, mark advanced,
-    clean transcript. The asset-seam heartbeat runs token-free at rest."""
-    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
-    serve_messages(platform, page())
-    serve_assets(
-        platform,
-        asset_page(asset(uuid=A1, filename="probe.png", description=probe_marker())),
-    )
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert len(posted) == 1  # the ack
-    assert provider.prompts == []  # the model never ran — token-free
-    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
-    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
-    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # mark advanced
-    assert _conversational_turns(agent) == []  # probe never entered the session transcript
-
-
-def test_a_probe_asset_is_acked_before_its_file_is_fetched(platform, tmp_path):
-    """The short-circuit runs before perception: a probe asset is acked with no blob
-    download at all — the asset analog of acking before a model call."""
-    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
-    serve_messages(platform, page())
-    serve_assets(
-        platform,
-        asset_page(asset(uuid=A1, filename="probe.png", description=probe_marker())),
-    )
-    agent, _ = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    agent.wake()
-
-    assert not platform.get(path__regex=r"^/blobs/").called  # the file was never fetched
-
-
-def test_a_probe_asset_on_a_cold_first_wake_is_acked(platform, tmp_path):
-    """The #100 cold-first-wake bootstrap (no mark, no trigger → newest unseen asset)
-    composes with the short-circuit: on a quiet probe timeline the newest asset is the
-    probe, and it is acked token-free rather than perceived."""
-    serve_messages(platform, page())
-    serve_assets(
-        platform, asset_page(asset(uuid=A1, filename="probe.png", description=probe_marker()))
-    )
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()  # no asset_trigger — the real router contract
-
-    assert len(posted) == 1
-    assert provider.prompts == []  # the model never ran
-    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
-    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
-    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
-
-
-def test_an_asset_without_a_marker_is_perceived_not_acked(platform, tmp_path):
-    """An ordinary posted file (no marker in its description) is perceived by the model,
-    unchanged — the short-circuit only fires on a correctly-signed probe."""
-    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
-    serve_messages(platform, page())
-    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert len(posted) == 1
-    assert len(provider.prompts) == 1
-    assert "diagram.png" in provider.prompts[0]  # the model perceived it
-
-
-def test_a_self_authored_probe_asset_is_filtered_not_acked(platform, tmp_path):
-    """Self-filter precedence holds on the asset seam too: a probe asset the agent itself
-    posted is skipped, never acked (and its file is never fetched)."""
-    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
-    serve_messages(platform, page())
-    serve_assets(
-        platform,
-        asset_page(asset(uuid=A1, filename="mine.png", description=probe_marker(), mine=True)),
-    )
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    posted = agent.wake()
-
-    assert posted == []  # own item: never acted on, never acked
-    assert provider.prompts == []
-    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # but the mark advances
+    for secret in (None, "", PROBE_SECRET):
+        home = tmp_path / repr(secret)
+        home.mkdir()
+        serve_messages(platform, page(message(uuid=M0, body=body)))
+        agent, provider = build_wake(home, probe_secret=secret)
+
+        agent.wake()
+
+        assert provider.prompts == [f"[2026-06-04T00:00:00.000Z] john: {body}"]
 
 
 # --- the persistent Turn-0 brief (Phase 2 · Group 3) -------------------------
@@ -3954,28 +3713,6 @@ def test_a_long_hold_keeps_the_claims_it_is_holding_alive(platform, tmp_path):
     assert beats[:3] == [tripped_at + 300, tripped_at + 600, tripped_at + 720]
 
 
-def test_a_probe_on_a_tripped_timeline_is_acked_without_holding(platform, tmp_path):
-    """A wake whose only item is the NOC's heartbeat never reaches the breaker: the probe is acked
-    model-free in `_absorb`, so there is no model work to admit, nothing to hold for and nothing to
-    count — where a tripped wake used to decline the ack along with everything else."""
-    clock = FakeClock()
-    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
-    standing = _breaker(tmp_path, clock, max_wakes=1)
-    standing.admit(TIMELINE_UUID)
-    assert standing.admit(TIMELINE_UUID).tripped
-    serve_messages(
-        platform, page(message(uuid=M1, body=probe_marker()), message(uuid=M0, body="old"))
-    )
-    provider = CountingProvider()
-
-    posted = _wake_with_breaker(
-        tmp_path, provider, clock, max_wakes=1, probe_secret=PROBE_SECRET
-    ).wake()
-
-    assert len(posted) == 1 and provider.prompts == []  # the ack, and no model
-    assert clock.slept == [] and _counted(tmp_path) == 2  # no hold, nothing recorded
-
-
 def test_the_hold_comes_before_a_posted_image_is_rendered(platform, tmp_path):
     """On the per-item path the wake is admitted *before* the item is rendered — because rendering
     a picture is perception (a blob fetch, and for a blind brain a describer call), and the whole
@@ -4113,12 +3850,12 @@ def test_an_error_folding_in_after_a_hold_fails_the_wake_and_commits_nothing(pla
     absorb = agent._absorb
     calls: list[int] = []
 
-    def failing_fold(session, items, posted):
+    def failing_fold(items):
         calls.append(len(items))
         if len(calls) == 2:  # the fold after the hold: it claims the arrival, then fails
-            absorb(session, items, posted)
+            absorb(items)
             raise OSError(28, "No space left on device")
-        return absorb(session, items, posted)
+        return absorb(items)
 
     agent._absorb = failing_fold
     with pytest.raises(OSError):
@@ -4661,45 +4398,18 @@ def test_a_task_only_wake_does_not_pace(platform, tmp_path):
     assert sleep.calls == []  # the task path never routes through the paced message reply
 
 
-def test_a_signed_probe_is_not_paced(platform, tmp_path):
-    """A NOC probe must stay a sub-second token-free ack — pacing is skipped even from an AI peer."""
+def test_a_bcnoc1_from_an_ai_peer_is_paced_like_any_other_message(platform, tmp_path):
+    """No pacing exemption for a marker (issue #955): a `BCNOC1` is ordinary content, read-paced."""
     body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
-    serve_messages(platform, page(peer_ai_message(uuid=M0, body=body)))  # AI-authored probe
+    serve_messages(platform, page(peer_ai_message(uuid=M0, body=body)))
     pacer, sleep = _pacer()
     agent, provider = build_wake(tmp_path, pacer=pacer, probe_secret=PROBE_SECRET)
 
-    posted = agent.wake()
-
-    assert sleep.calls == []  # the heartbeat is never delayed by the read-pace
-    assert len(posted) == 1  # the ack still went out
-    assert provider.prompts == []  # still token-free — the model never ran
-    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
-    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
-
-
-def test_a_probe_earlier_in_the_batch_still_skips_pacing(platform, tmp_path):
-    """A probe that is NOT the newest item still skips pacing — its ack must stay sub-second.
-
-    The sleep precedes `_act_on`, which acks every message in the batch; a probe older than a
-    real peer-AI message would otherwise have its ack delayed by pacing the newer message. So
-    *any* probe in the batch short-circuits pacing for the wake.
-    """
-    # A mark older than both served messages, so the batch is [probe (older), peer-AI (newer)].
-    MarkStore(tmp_path).set(TIMELINE_UUID, "019e7740-0000-7000-8000-000000000000")
-    body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
-    serve_messages(
-        platform,
-        page(
-            peer_ai_message(uuid=M1, body="a real reply that would otherwise be paced"),
-            peer_ai_message(uuid=M0, body=body),  # older — the probe, not the newest item
-        ),
-    )
-    pacer, sleep = _pacer()
-    agent, _provider = build_wake(tmp_path, pacer=pacer, probe_secret=PROBE_SECRET)
-
     agent.wake()
 
-    assert sleep.calls == []  # a probe anywhere in the batch → no pacing, heartbeat preserved
+    assert sleep.calls != []  # read-paced, as any peer AI message is
+    assert len(provider.prompts) == 1  # and answered by the model
+    assert not any(body.startswith("BCNOC1-ACK") for body in _posts(platform))
 
 
 def test_pacing_never_crashes_the_wake_on_a_bad_timestamp(platform, tmp_path):
@@ -4832,12 +4542,12 @@ def test_a_fold_that_fails_mid_read_pace_fails_the_wake_and_commits_nothing(plat
     absorb = agent._absorb
     calls: list[int] = []
 
-    def half_fold(session, items, posted):
+    def half_fold(items):
         calls.append(len(items))
         if len(calls) == 2:  # the settle's fold: claim the arrival, then fail
-            absorb(session, items, posted)
+            absorb(items)
             raise OSError(28, "No space left on device")
-        return absorb(session, items, posted)
+        return absorb(items)
 
     agent._absorb = half_fold
     with pytest.raises(OSError):
@@ -5184,35 +4894,6 @@ def test_a_build_that_spoke_is_never_rebuilt_so_the_agent_never_speaks_twice(pla
     assert len(posted) == 1
     assert _posts(platform) == ["Hello, John."]  # one body on the timeline, not two
     assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages") is True  # M1 → next wake
-
-
-def test_a_probe_arriving_during_generation_is_acked_this_wake(platform, tmp_path):
-    """A NOC probe landing mid-generation is acked THIS wake — its heartbeat stays sub-second.
-
-    Loop 2 re-reads after generating; even when the only fresh item is a probe (not a peer, so
-    no rebuild), it is absorbed and acked here rather than deferred to a later wake that may be
-    serialized behind this one.
-    """
-    scripted = ScriptedMessages(platform, message(uuid=M0, body="a question"))  # human
-
-    def on_chat(call_index):
-        if call_index == 1:
-            body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
-            scripted.arrive(peer_ai_message(uuid=M1, body=body))
-
-    agent, provider = build_wake(
-        tmp_path, HookedProvider(on_chat=on_chat), probe_secret=PROBE_SECRET
-    )
-
-    agent.wake()
-
-    assert len(provider.prompts) == 1  # a lone probe is not a peer → no rebuild
-    bodies = [
-        json.loads(call.request.content)["message"]["body"]
-        for call in platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls
-    ]
-    assert f"BCNOC1-ACK {PROBE_NONCE}" in bodies  # the probe was acked, not deferred
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # and marked, so it is not re-acked
 
 
 def test_the_settle_loop_is_bounded_by_max_builds(platform, tmp_path):
@@ -5715,20 +5396,6 @@ def test_the_breaker_alert_is_a_log_line_not_a_post(platform, tmp_path, caplog):
     assert _posts(platform) == ["Hello, John.", "Hello, John."]  # the agent's two replies, only
 
 
-def test_a_probe_ack_is_logged_as_an_ack_not_as_the_agent_speaking(platform, tmp_path, caplog):
-    """The probe seam is trace-free in the *transcript*, never in the log — but a heartbeat ack
-    must not read as the agent talking, so it carries its own kind."""
-    body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
-    serve_messages(platform, page(message(uuid=M0, body=body)))
-    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
-
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        agent.wake()
-
-    assert provider.prompts == []  # token-free: the model was never engaged
-    assert "kind=probe-ack" in _line(caplog, "posted")
-
-
 # --- issue #285: a hard-failed wake no longer drops the peer's message -------
 #
 # The guarantee: **at-least-once for the read, at-most-once for every side effect, exactly-once
@@ -5938,9 +5605,9 @@ def test_a_silent_completed_turn_is_committed_too(platform, tmp_path):
 def test_recovery_reads_the_transcript_never_the_timeline(platform, tmp_path):
     """A newer own post on the timeline is now *irrelevant* to recovery — the transcript decides.
 
-    This was the sharpest edge of the old design. `_absorb` posts a NOC probe ack **before** the
-    model call, so a wake that acked a probe, claimed a peer message and then died leaves an own
-    post newer than a message it never answered; the cheap test ("any own post newer than X?")
+    This was the sharpest edge of the old design. `_absorb` posted a NOC probe ack **before** the
+    model call (until issue #955), so a wake that acked a probe, claimed a peer message and then
+    died left an own post newer than a message it never answered; the cheap test ("any own post newer than X?")
     would have read that ack as the reply and dropped the peer. Body-equality closed that hole at
     the cost of comparing message bodies forever.
 
@@ -7145,15 +6812,16 @@ def test_a_resumed_turn_is_marked_only_when_it_carried_that_one_item(
     assert any("reason=marked" in r.getMessage() for r in caplog.records) is alone
 
 
-def test_the_synthetic_probe_is_unchanged_beside_the_marked_wake(platform, tmp_path):
+def test_a_bcnoc1_beside_the_marked_wake_is_an_ordinary_mined_message(platform, tmp_path):
+    """The secret that verifies a `BCNOC2` verifies no `BCNOC1` (issue #955)."""
     serve_messages(platform, page(message(uuid=M0, body=probe_marker())))
     agent, provider, memory = _marked_wake(tmp_path, probe_secret=PROBE_SECRET)
 
     agent.wake()
 
-    assert provider.prompts == []
-    assert _posts(platform) == [f"BCNOC1-ACK {PROBE_NONCE}"]
-    assert memory.observed == []
+    assert provider.prompts == [f"[2026-06-04T00:00:00.000Z] john: {probe_marker()}"]
+    assert _posts(platform) == ["Hello, John."]
+    assert len(memory.observed) == 1
 
 
 def test_a_recovered_turn_counts_as_marked_only_when_it_carried_that_one_item(platform, tmp_path):

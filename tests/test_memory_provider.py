@@ -12,6 +12,8 @@ Two layers are pinned here:
    Doe (`john`).
 """
 
+import hmac
+from hashlib import sha256
 from importlib import metadata
 
 import httpx
@@ -497,9 +499,9 @@ PROBE_SECRET = "noc-probe-secret-for-tests"
 
 
 def _probe(nonce="n0nce"):
-    from basecradle_harness._probe import _signature
-
-    return f"BCNOC1 {nonce} {_signature(nonce, PROBE_SECRET)}"
+    """A valid `BCNOC1` under PROBE_SECRET: ordinary content to the harness since issue #955."""
+    payload = f"BCNOC1 {nonce}".encode()
+    return f"BCNOC1 {nonce} {hmac.new(PROBE_SECRET.encode(), payload, sha256).hexdigest()}"
 
 
 def test_a_first_wake_observes_the_backlog_it_seeded_as_context(platform, tmp_path):
@@ -538,11 +540,11 @@ def test_a_first_wake_observes_the_backlog_it_seeded_as_context(platform, tmp_pa
 
 
 def test_the_seeded_backlog_keeps_out_what_the_live_path_never_mines(platform, tmp_path):
-    """The agent's own posts and a NOC probe are seeded as context and still never mined.
+    """The agent's own posts are seeded as context and still never mined; a `BCNOC1` is mined.
 
-    Each is excluded on the live path for its own reason — the self-filter drops an own post before
-    any turn, and a probe is a machine contract acked without the model — so seeding one as context
-    must not become a back door into the palace.
+    The self-filter drops an own post before any turn on the live path, so seeding one as context
+    must not become a back door into the palace. A `BCNOC1` is ordinary content (issue #955): the
+    live path mines it, so the seed does too.
     """
     _serve_messages(
         platform,
@@ -571,8 +573,9 @@ def test_the_seeded_backlog_keeps_out_what_the_live_path_never_mines(platform, t
 
     mined = [exchange.user for exchange in provider.observed]
     assert any(FACT in user for user in mined)
-    assert not any("my own earlier post" in user or "BCNOC1" in user for user in mined)
-    assert len(mined) == 2  # the turn's exchange, and the one peer message seeded above it
+    assert any(_probe() in user for user in mined)
+    assert not any("my own earlier post" in user for user in mined)
+    assert len(mined) == 3  # the turn's exchange, and the two peer messages seeded above it
 
 
 def test_the_seeded_backlog_is_in_memory_before_the_model_is_called(platform, tmp_path):
@@ -614,7 +617,7 @@ def test_the_seeded_backlog_is_in_memory_before_the_model_is_called(platform, tm
 
 
 def test_a_seeded_message_with_no_body_is_observed_and_never_breaks_the_wake(platform, tmp_path):
-    """The SDK hands a JSON ``null`` body through as ``None``; the probe check must not raise on it,
+    """The SDK hands a JSON ``null`` body through as ``None``; the marker check must not raise on it,
     because it now runs before the turn, where a raise would cost the peer their reply."""
     empty = _message(uuid=BRIEF, body=None)
     _serve_messages(
@@ -809,8 +812,11 @@ def test_a_burst_keeps_its_newest_message_whole_and_first_and_caps_the_rest(plat
     assert "burst message 0 " not in scope.query
 
 
-def test_the_recall_query_keeps_out_own_posts_and_probes(platform, tmp_path):
-    """The query ranks against the seeded messages memory keeps, and no others (`_seeded_peers`)."""
+def test_the_recall_query_keeps_out_own_posts(platform, tmp_path):
+    """The query ranks against the seeded messages memory keeps, and no others (`_seeded_peers`).
+
+    A `BCNOC1` is a peer's ordinary message (issue #955), so it is in the query like any other.
+    """
     _serve_messages(
         platform,
         {
@@ -836,7 +842,8 @@ def test_the_recall_query_keeps_out_own_posts_and_probes(platform, tmp_path):
     agent.wake()
 
     (scope,) = provider.context_scopes
-    assert scope.query == f"{STAMP} john: {POINTER}\n{STAMP} john: {FACT}"
+    probe = _probe()
+    assert scope.query == f"{STAMP} john: {POINTER}\n{STAMP} john: {probe}\n{STAMP} john: {FACT}"
 
 
 def test_turn0_recall_skips_what_this_wake_filed_from_its_seed_and_the_tool_does_not(
