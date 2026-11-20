@@ -52,6 +52,7 @@ from basecradle_harness import _arguments
 from basecradle_harness._assets import model_sees_images, model_sees_video
 from basecradle_harness._elision import archive_marker, refusal
 from basecradle_harness._exceptions import (
+    TRANSIENT_FAILURES,
     EngineError,
     ProviderConnectionError,
     ProviderError,
@@ -173,12 +174,10 @@ DEFAULT_RESPONSE_RETRIES = 2
 #: provider, and the wake fails either way, slowly. The *sleep* half has the total-time deadline
 #: (`_retry.RETRY_BUDGET_SECONDS`, issue #506); the per-attempt budget is the fitted one
 #: (`basecradle_harness._timeouts`).
-_TRANSIENT = (
-    ProviderResponseError,
-    ProviderServerError,
-    ProviderRateLimitError,
-    ProviderConnectionError,
-)
+#:
+#: **The tuple itself lives in `_exceptions`** (issue #951), because a fault that outlasts this retry
+#: is what a wake then gives up on as an outage: one definition, read at both distances.
+_TRANSIENT = TRANSIENT_FAILURES
 
 #: The backoff before a transient retry, in seconds, scaled by attempt number (0.5s, then 1.0s, …).
 #: Deliberately sub-second-to-low: these are momentary server hiccups, so the retry should add a

@@ -345,3 +345,24 @@ class ProviderRateLimitError(ProviderAPIError):
     `retry_after`, and the routing diagnostics beside it, are declared on `ProviderAPIError` — see
     there for why they belong to every status error rather than to this one.
     """
+
+
+#: The provider faults that are **temporary** — the class the engine retries inside a call
+#: (`_engine._TRANSIENT`) and, when they outlast every retry, the class a wake gives up on as an
+#: **outage** (issue #951): it exits ``EX_TEMPFAIL`` so the router tries again later, and on the
+#: router's last attempt it tells the timeline once (`_report.outage_body`). One tuple, because "a
+#: second identical request could fix this" and "this wake should be tried again later" are the same
+#: verdict read at two distances: a class that may be retried in-call but not re-woken, or the
+#: reverse, would be a policy that disagrees with itself.
+#:
+#: An unparseable answer and a runaway generation (`ProviderTruncatedError`) belong here with the
+#: 5xx, the 429 and the transport failure (a timeout included), because each is a property of one
+#: attempt, never of the request. Everything else is not temporary: a config-class refusal
+#: (an auth error, an empty account) is dead until a human acts, and a permanent one is a verdict
+#: about the content.
+TRANSIENT_FAILURES: tuple[type[ProviderError], ...] = (
+    ProviderResponseError,
+    ProviderServerError,
+    ProviderRateLimitError,
+    ProviderConnectionError,
+)

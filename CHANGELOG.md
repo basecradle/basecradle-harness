@@ -7,6 +7,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.202.0] - 2026-11-20
+
+### Added: A wake that gives up on an outage exits 75 and tells the timeline once (issue #951)
+
+`@origin` ruled on 2026-11-20: when a wake gives up for a temporary reason, the timeline is told once, plainly; and success resets it. Before this, a temporary failure that outlasted every retry ended silently (2026-11-02): the work stayed pending, nothing woke the agent again, and the person who wrote saw nothing. The router's half (basecradle-router#527, live) retries a wake that exits `75` at once and then at about 1, 5 and 30 minutes, and tells each attempt which it is.
+
+- **Exit `75` (`EX_TEMPFAIL`) for an outage, and nothing else changes code.** An outage is a temporary provider fault that outlasted every in-call retry: a rate limit, a `5xx`, a dropped connection, a timeout, an unreadable answer or a runaway generation. It is exactly the class the engine retries, now one tuple, `_exceptions.TRANSIENT_FAILURES`, read at both distances. The wake exits `75` whether the fault propagated out of it or a resume absorbed it while the wake answered the rest and its item is still waiting. Every other ending keeps the code it had: `0` for success and for a reported failure, `1` for any other failure.
+- **Only the router's last attempt tells the timeline** (`last_attempt`: `BASECRADLE_WAKE_ATTEMPT` equal to `BASECRADLE_WAKE_ATTEMPTS`). An earlier attempt posts nothing, because the next may simply succeed. A wake with neither variable (run by hand, or by an older router) posts nothing, as before. A malformed pair is logged and read as not-last.
+- **The notice is the reporter's fourth shape, in the harness's own words** (`_report.outage_body`): that the agent could not answer here, the vendor's reason relayed verbatim with credential-shaped spans redacted and an error page cut short, that nothing is lost and it will be picked up on the next wake, and that a new message on the timeline starts one. It names no item. No model is in the path.
+- **Once per outage per timeline, and success resets it.** A marker, `outage/<timeline>.notified` under `HARNESS_HOME` (`OutageState`), is written only once the notice posted, so a refused post is tried again by the next last attempt. The first successful model call clears it, so the next outage is told again.
+- **One per-timeline marker piece for both debounces.** `BillingState` and the new `OutageState` are subclasses of `_report.TimelineNotice`, each naming its folder and suffix. The orphan sweep purges the new marker with a deleted timeline's other artifacts, seven kinds now.
+- **Telemetry contract:** `wake reported_failure` gains `kind=outage`, with the brain's fault slug as `reason` and no `item`, written once when the notice posts. The NOC's only predicate on that head keys `kind=billing`, so it pages nothing new. `wake failed` and `wake end … outcome=error` are unchanged on an outage. The Palette records the router's `outcome=deferred` in its Warning tier.
+- **Fleet effect:** after the NOC converges this release, a wake that gives up on an outage earns the router's patient schedule, and its last attempt posts one notice to the timeline.
+
 ## [0.201.0] - 2026-11-20
 
 ### Added: A real wake the NOC marks with `BCNOC2` is answered and not mined (issue #950)
