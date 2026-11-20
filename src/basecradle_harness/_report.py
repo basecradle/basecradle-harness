@@ -8,8 +8,7 @@ decisions (2026-07-21) shape every line of it:
   thing that just failed, so it cannot be asked to compose the notice. The harness posts the notice
   itself, through the BaseCradle SDK, under the agent's identity (the platform API costs no vendor
   credit). This module only *builds the text and holds the debounce state*; the actual post is the
-  wake's existing mechanical poster (`_wake.WakeAgent._post` → ``timeline.messages.create``), the
-  same path the NOC probe ack uses.
+  wake's existing mechanical poster (`_wake.WakeAgent._post` → ``timeline.messages.create``).
 
 - **The vendor error is relayed verbatim, never softened** (decision 3). `verbatim` digs the vendor's
   own words out of the error and the report carries them unchanged, so the human — and any peer AI on

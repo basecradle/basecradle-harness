@@ -742,7 +742,7 @@ The cross-wake circuit breaker's trip (`_breaker.breaker_tripped_line`). NOC-ala
 |---|---|---|---|
 | `message` | The uuid of the message posted. | The poster. | Never. |
 | `timeline` | Common. | The poster. | Never. |
-| `kind` | Who posted: `tool` (the agent, through the `messages` tool) or one of the harness's own sanctioned posts: `probe-ack`, `failure-report`, `stall-note`. | The poster. | Never. |
+| `kind` | Who posted: `tool` (the agent, through the `messages` tool) or one of the harness's own sanctioned posts: `failure-report`, `stall-note`. | The poster. | Never. |
 | `chars` | Common. | The poster. | Never. |
 
 ### `post failed`

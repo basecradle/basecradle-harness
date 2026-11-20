@@ -48,11 +48,8 @@ weighed and are worth recording, because each looks right until its cost is name
 Holding in-process keeps both invariants by construction — it touches no timeline, and it *is* the
 serialized wake — and it has a precedent: `ReadPacer` already holds a wake to simulate reading. The
 price is stated rather than hidden. The router runs one wake per agent at a time, so while a wake
-holds, **every** timeline of that agent waits behind it. A NOC probe is never skipped, as it was
-when a tripped wake declined — but one can wait up to a cooldown for its ack: behind a hold on
-another timeline, behind a hold taken on another item before it is read, or behind a resume held
-ahead of the batch it sits in. At the default 60 s cooldown that is a pause; an operator who sets a
-cooldown of hours sets a pause of hours. And the
+holds, **every** timeline of that agent waits behind it. At the default 60 s cooldown that is a
+pause; an operator who sets a cooldown of hours sets a pause of hours. And the
 hold is part of the wake's wall-clock, so a long turn that also held can cross the fleet's
 wake-duration outlier line and page a second time for the same trip.
 

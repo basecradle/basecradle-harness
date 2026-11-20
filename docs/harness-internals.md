@@ -169,7 +169,7 @@ reference adapter to prove it end-to-end, **without changing the default's behav
   unchanged**). `MemoryTool(path=…)` still works standalone; `MemoryTool(store=…)` shares a
   provider's store.
 - **The wake hooks.** A `WakeAgent` fires `observe` after each real exchange (never on a
-  probe ack or a self-skip) and injects `context` into Turn 0 — relevant to the turn, since
+  self-skip) and injects `context` into Turn 0 — relevant to the turn, since
   the incoming text is the retrieval query. **A hook failure degrades gracefully and never
   breaks the wake** (the dashboard-fetch invariant). Hooks are a wake-mode property: the
   poll-loop `TimelineAgent` keeps the memory tool but does not fire them.

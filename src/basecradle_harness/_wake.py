@@ -47,10 +47,11 @@ model on what it found; whether anything reaches the timeline is the model's dec
 taken by calling the `messages` tool. The turn's final text is *unspoken* — written to
 the agent's log (`log_unspoken`), handed to its memory, shown to its own next turn, and
 never posted.
-The only message this file still creates is the NOC probe ack, which is a machine
-contract (a signed nonce, model-free) rather than the agent talking. So a wake in which
-the agent chose silence posts nothing and says `posted=0` — and that is a *decision on
-the record*, not a failure: the reasoning behind it is in the journal.
+The only messages this file still creates are the harness's own notices for when the model
+cannot be reached (the provider-failure report, its outage notice, the stall note), never the
+agent talking. So a wake in which the agent chose silence posts nothing and says `posted=0` —
+and that is a *decision on the record*, not a failure: the reasoning behind it is in the
+journal.
 
 Everything else — identity, Dashboard onboarding, turning messages into turns,
 the newest-first scan up to the mark — is shared with `TimelineAgent`.
@@ -226,7 +227,7 @@ from basecradle_harness._observability import (
 )
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._plugins import ResolvedTools
-from basecradle_harness._probe import ack_line, verify_marked, verify_probe
+from basecradle_harness._probe import verify_marked
 from basecradle_harness._provider import Provider
 from basecradle_harness._report import (
     BILLING,
@@ -376,13 +377,12 @@ class SeenStore:
 
 #: What this wake decided about one item it read — the input to the two things `_settle` does.
 #:
-#: - `_FINAL`  — its fate is already decided (settled claim, own post, acked probe). Mark may pass.
+#: - `_FINAL`  — its fate is already decided (settled claim, own post). Mark may pass.
 #: - `_OURS`   — this wake is answering it; `_settle` commits it, and *then* the mark may pass.
-#: - `_PENDING`— **not** settled and **not** ours, so the mark may **never** pass it. Two things land
-#:   here: an item a *live* concurrent wake is holding (it could still die holding it, and a mark
-#:   past it would hide it forever), and a probe ack that failed to post (at-least-once: it must be
-#:   re-acked on the next wake, so the cursor must not sail past it either). Both mean the same
-#:   thing to the mark — *undecided* — which is the only thing the mark cares about.
+#: - `_PENDING`— **not** settled and **not** ours, so the mark may **never** pass it: an item a *live*
+#:   concurrent wake is holding (it could still die holding it, and a mark past it would hide it
+#:   forever), or one this wake declined to start (out of funds, a turn left cut off). Each means
+#:   the same thing to the mark — *undecided* — which is the only thing the mark cares about.
 _FINAL = "final"
 _OURS = "ours"
 _PENDING = "pending"
@@ -1446,9 +1446,8 @@ class ReadPacer:
 
         A no-op returning ``0.0`` — no sleep — when: pacing is disabled (the kill switch); there
         is no message (asset/task/webhook-only wake); or the author is **not** an AI peer (a
-        human gets an instant reply). The caller passes the newest *non-self* message and has
-        already excluded a recognized NOC probe (which must stay a sub-second token-free ack), so
-        `pace` need only apply the ``kind == "ai"`` gate and the read-time math.
+        human gets an instant reply). The caller passes the newest *non-self* message, so `pace`
+        need only apply the ``kind == "ai"`` gate and the read-time math.
 
         Otherwise it sleeps the *remainder* of the message's human read-time (``target - age``,
         clamped at 0) and returns the seconds slept, so a message already older than its read-time
@@ -1644,7 +1643,7 @@ class WakeAgent:
         # packaging bug is impossible to miss — empty when every shipped default loaded.
         self.defect_notices = defect_notices
         # The persistent brief is composed at most once per `wake()` — lazily, right before the
-        # first time the model is actually engaged — so an idle or probe-only wake never fetches
+        # first time the model is actually engaged — so an idle or self-only wake never fetches
         # the live dashboard. It is then handed to every model call this wake makes as *ephemeral*
         # context (`Session.send(brief=…)`): the model reads it, and nothing brief-shaped is
         # written to the transcript (issue #275). Reset each wake.
@@ -1655,12 +1654,12 @@ class WakeAgent:
         # one opaque block (issue #369). Composed from the same `brief_parts` list the text is
         # joined from, so the two can never describe different briefs.
         self._brief_sections: dict[str, int] = {}
-        # The shared HMAC key for the NOC synthetic-probe marker (see `_probe`). Set → the
-        # message, webhook, and task reconciles each recognize a signed probe in their own
-        # carrier field and ack it token-free, before the model. Unset → the short-circuit
-        # is off and every item goes to the model.
+        # The shared HMAC key for the NOC's `BCNOC2` marker (see `_probe`). Set → a message whose
+        # body carries a verified marker for this timeline and its author is answered as any other
+        # and not mined (`_marked`, issue #950). Unset → nothing verifies, and every message is
+        # mined. It verifies no `BCNOC1` (issue #955): that marker is ordinary content here.
         # Held as a `Secret` (issue #599): an HMAC key in `__dict__` is one crash report away from
-        # anyone who can forge a probe ack.
+        # anyone who can forge a marker.
         self.probe_secret = secret(probe_secret)
         self.marks = marks or MarkStore(harness.home)  # type: ignore[arg-type]
         # Activated tasks are tracked by a seen-set, not a high-water mark (see
@@ -1801,11 +1800,9 @@ class WakeAgent:
         self._truncated: tuple[str, str | None] | None = None
         self._pass = 1
         #: Per wake (issue #596): the items whose turns were cut off in this wake — a resume clears
-        #: its count on progress only the first time this wake continues a turn — the NOC probes
-        #: this wake has already acked, so a later pass re-reading them does not ack twice, and the
-        #: work the latch held back in the current pass.
+        #: its count on progress only the first time this wake continues a turn — and the work the
+        #: latch held back in the current pass.
         self._cut_off_this_wake: set[str] = set()
-        self._acked_probes: set[str] = set()
         self._held_back: list[tuple[str, str]] = []
         #: Items this wake saw left waiting, and why — reported at the end of the wake, and only
         #: for the ones still unsettled then, since a later pass may yet finish them (#596).
@@ -1831,11 +1828,11 @@ class WakeAgent:
         or dead and writes it back to `BASECRADLE_ENV_FILE`, so the next wake — which
         sources that same file — reuses it. See `_token` for the full lifecycle.
 
-        `NOC_PROBE_SECRET` (optional) is the shared HMAC key for the NOC's synthetic-probe
-        marker. Set → a recognized probe is acked token-free before the model (see
-        `_probe`), across the message, webhook, and task seams alike; unset → the
-        short-circuit is off. The same var name the NOC box uses, so one provisioned value
-        serves the harness half of all three seam contracts.
+        `NOC_PROBE_SECRET` (optional) is the shared HMAC key for the NOC's `BCNOC2` marker: a
+        message carrying a verified one is answered as any other and not mined (see `_probe`,
+        issue #950); unset → nothing verifies. The same var name the NOC box uses, so one
+        provisioned value serves both halves. The NOC's synthetic probe, `BCNOC1`, is not
+        verified here at all (issue #955): it travels only on the router's synthetic route.
         """
         home = os.environ.get("HARNESS_HOME")
         if not home:
@@ -1913,8 +1910,9 @@ class WakeAgent:
         asset_trigger: str | None = None,
     ) -> list[object]:
         """Reconcile this timeline once — unseen messages, posted assets, inbound webhook
-        deliveries, *and* newly-activated tasks — and return every message that reached the
-        timeline (the agent's own, through its tools, plus any probe ack the harness sent).
+        deliveries, *and* newly-activated tasks — and return every message the harness itself
+        posted (its notices for a model that cannot be reached; the agent's own speech, through its
+        tools, is in `self.speech`).
 
         A wake surfaces every kind of unseen actionable item on the timeline, not just
         new messages, because each kind arrives by a different route: a message and an
@@ -1988,7 +1986,7 @@ class WakeAgent:
                 mcp_servers=",".join(self.mcp_servers) or None,
             ),
         )
-        # `posted` is what the *harness* put on the timeline (today: NOC probe acks). What the
+        # `posted` is what the *harness* put on the timeline (its model-unreachable notices). What the
         # *agent* said is in `self.speech` — it speaks only through its tools now — so the two are
         # summed at the end rather than merged as they go, which is what keeps the bookend's count
         # honest without double-counting. Reset before any work, so a second wake in one process can
@@ -2026,7 +2024,6 @@ class WakeAgent:
             self._brief_sections = {}
             self._pass = 1
             self._cut_off_this_wake = set()
-            self._acked_probes = set()
             self._deferred = {}
             posted += self._reconcile(session, trigger, event_trigger, asset_trigger)
             # A turn cut off at the output budget latched the wake to keep its evidence safe (#490),
@@ -2111,7 +2108,7 @@ class WakeAgent:
                     signal=stopped_by,
                     turns=engine.turns_run,
                     steps=f"{engine.steps_used}/{engine.max_steps}",
-                    # Everything that reached a timeline: the harness's own posts (probe acks) plus
+                    # Everything that reached a timeline: the harness's own notices plus
                     # every message the agent *chose* to send through its tools. `posted=0` is now a
                     # real and legitimate outcome — the agent read, thought, and decided not to speak
                     # — so this count is what makes a silent wake **visibly** silent rather than
@@ -2318,11 +2315,7 @@ class WakeAgent:
 
         **Every line is a log line, never a timeline post** (issue #293). The breaker once also
         posted in the agent's voice ("I appear to be in a wake loop here…"), words the agent never
-        wrote; under the Unspoken Channel the harness does not speak for the agent. A NOC probe is
-        never skipped by a hold, only delayed by one: a message probe already in the batch is acked
-        in `_absorb` before a hold taken at the batch, but a resume held ahead of the batch, a hold
-        on another item, or a hold on another timeline delays its ack by up to a cooldown (see
-        `_breaker`).
+        wrote; under the Unspoken Channel the harness does not speak for the agent.
 
         Returns True when *this* call held, and `_breaker_held` records that the wake did, so the
         message path can fold in what landed meanwhile (`_absorb_after_hold`) whether the hold
@@ -2417,11 +2410,8 @@ class WakeAgent:
 
         `_perceive_asset` fetches the file and presents an image **inline** so the agent
         actually sees a peer's picture (not just a description of it); media it cannot yet
-        fully perceive degrades to a description rather than erroring. A recognized NOC
-        synthetic-probe — read from the asset's **description**, the asset analog of a
-        message body / task instructions / webhook payload (see `_asset_marker_carrier`) —
-        is acked token-free before the model (`probe=`), the 4th seam's short-circuit. The
-        probe check runs *before* the fetch, so a probe asset is acked without any download.
+        fully perceive degrades to a description rather than erroring. A `BCNOC1` marker in an
+        asset's description is ordinary content (issue #955): perceived and answered like any other.
         """
         return self._act_on(
             session,
@@ -2430,7 +2420,6 @@ class WakeAgent:
             _incoming_asset_text,
             kind=_ASSETS,
             skip=self._is_own,
-            probe=lambda asset: self._probe_nonce(_carrier(asset, _ASSETS)),
         )
 
     def _perceive_asset(self, asset: object) -> tuple[str, list[ImageContent]]:
@@ -2673,19 +2662,16 @@ class WakeAgent:
         posted = respond(session, stranded + to_act)
         # **The baseline may not sail past an undecided item** (issues #285, #289). `respond` has
         # just held the mark back from anything still in flight — an item a live concurrent wake
-        # holds, a probe ack that failed to post — and jumping the mark to the true newest here
+        # holds, one this wake declined to start — and jumping the mark to the true newest here
         # would step straight over it, hiding it from every future wake if its owner then died.
         # The bootstrap's baseline is a *jump*, not a step, so it is the one place the guard has to
         # be restated.
         #
-        # Declining is safe rather than a stall, but the reason has **two** branches, not one. An
-        # item held by a *claim* resolves itself: its owner either settles it (the next bootstrap
-        # reads a settled claim and the mark advances) or dies (the next bootstrap finds it orphaned
-        # and recovers it). A **probe whose ack was refused** has no owner at all — it is never
-        # claimed — so nothing settles it but a successful post, and until then the mark stays put
-        # and the window it re-reads grows. That is the correct trade and it is bounded by the thing
-        # causing it: a refused post means a locked (or unreachable) timeline, where the agent could
-        # not speak anyway, and the first ack that lands releases the mark past everything at once.
+        # Declining is safe rather than a stall. An item held by a *claim* resolves itself: its
+        # owner either settles it (the next bootstrap reads a settled claim and the mark advances)
+        # or dies (the next bootstrap finds it orphaned and recovers it). An item this wake declined
+        # to start (out of funds, or behind a turn left cut off) is unclaimed, and the next pass or
+        # wake takes it.
         if any(disposition == _PENDING for _, disposition in self._ledger[kind]):
             return posted
         newest = recent[0].content.uuid if recent else to_act[-1].content.uuid
@@ -2757,12 +2743,8 @@ class WakeAgent:
     def _respond_events(self, session: Session, events: list[object]) -> list[object]:
         """Act on each webhook delivery in order, advancing the event mark per delivery.
 
-        A recognized NOC probe — read from the delivery's **payload** — is acked token-free
-        before the model (`probe=`), at-least-once (post the ack, then record): the probe
-        seam is never claimed, so a refused ack re-acks next wake rather than going silent.
-        The short-circuit runs *inside* `_act_on`, after `_bootstrap_stream` has already
-        selected the item, so the #100 cold-first-wake bootstrap (newest unseen delivery
-        only — which on a quiet probe timeline is the probe) is preserved unchanged.
+        A `BCNOC1` marker in a delivery's payload is ordinary content (issue #955), claimed and
+        answered like any other.
         """
         return self._act_on(
             session,
@@ -2770,7 +2752,6 @@ class WakeAgent:
             _incoming_event_text,
             _incoming_event_text,
             kind=_EVENTS,
-            probe=lambda event: self._probe_nonce(_carrier(event, _EVENTS)),
         )
 
     # --- activated tasks -----------------------------------------------------
@@ -2827,15 +2808,6 @@ class WakeAgent:
             _activated_task_text,
             _activated_task_text,
             kind=_TASKS,
-            # A NOC probe task is recognized from its **instructions** and acked token-free.
-            # `_act_on` checks `probe` *before* claiming, so the probe is acked at-least-once
-            # (post, then record) and never claimed. That is correct and must be preserved: a
-            # probe's only side-effect is @jt's own ack (self-filtered, and router wakes are
-            # serialized), so there is no re-fire hazard to guard against, and at-least-once
-            # is the safe failure direction for a monitor — a crash before recording re-acks
-            # (harmless) rather than leaving the task claimed-but-unacked, which would
-            # manufacture a false FAIL. See task-seam.md §4.
-            probe=lambda task: self._probe_nonce(_carrier(task, _TASKS)),
         )
 
     # --- the shared act-on loop ----------------------------------------------
@@ -2848,7 +2820,6 @@ class WakeAgent:
         text,
         kind: str,
         skip=None,
-        probe=None,
     ) -> list[object]:
         """Engage the model on each item in order, recording it as handled **once it is settled**.
 
@@ -2895,24 +2866,15 @@ class WakeAgent:
         spoken (`_evidence_lost`). Running the pass up front is what keeps that rare; the summary's
         uuids are what keep it *correct*.
 
-        `probe(item)` is the **NOC synthetic-probe short-circuit**, passed by all four
-        reconcilers — messages, webhook events, activated tasks, and posted assets — each
-        reading the marker from its own carrier field (a message body, a webhook payload, a
-        task's instructions, an asset's description). When it returns a nonce (the item is a
-        valid signed probe — see `_probe`), the loop posts the deterministic ack **without calling
-        the model** — no provider request, no tokens, nothing into the transcript — so the
-        message-, webhook-, task-, and asset-seam heartbeats all run token-free at rest (an asset
-        probe is acked before its file is ever fetched). It is checked *after* the self-filter (a
-        probe is from a distinct peer, never the agent's own) and **before the claim**, and is
-        at-least-once: a failed ack lands `_PENDING` in the ledger, so the record does not pass it
-        and the next wake re-acks rather than recording it with no ack ever posted (a false monitor
-        FAIL — task-seam.md §4). This probe-before-claim order is **load-bearing for the task
-        seam**: a probe is never claimed, so a crash before settling re-acks (harmless — the prober
-        matches the first ack carrying its nonce).
+        **No item is answered without the model** (issue #955). This loop once short-circuited a
+        NOC synthetic probe (a signed `BCNOC1` in any of the four carriers) to a mechanical ack before
+        the claim; that marker is signed over its nonce alone, so a copy in anyone's item made a real
+        item acked and never seen. The probe travels only on the router's synthetic route now, so
+        every item here is either the agent's own or claimed and engaged.
 
         **Never crash the wake (B2).** Both platform-touching steps degrade instead of
-        raising: a refused post (`self._post` — the probe ack) is logged and the loop carries
-        on; an engine that hits its step cap (`self._engage`) becomes a short unspoken note. So
+        raising: a refused post (`self._post` — the provider-failure report) is logged and the loop
+        carries on; an engine that hits its step cap (`self._engage`) becomes a short unspoken note. So
         a wake that hits a locked timeline or the step cap exits 0 — no unhandled exception
         reaches the entrypoint, and the item still settles (no reprocess). A locked timeline
         now surfaces to the *model*, as the refusal its `messages` tool call returns, which is
@@ -2931,20 +2893,6 @@ class WakeAgent:
             uuid = item.content.uuid
             if skip is not None and skip(item):
                 ledger.append((uuid, _FINAL))  # own post: never acted on, but never re-scanned
-                continue
-            if probe is not None and (nonce := probe(item)) is not None:
-                # A verified NOC probe: ack token-free (no model call), never claimed. A refused
-                # ack degrades *silently* (`note=False` keeps the probe seam trace-free) and stays
-                # undecided, so the next wake re-acks. Acked once per wake: a later pass re-reads
-                # it while the record is held behind an older item, and must not ack again (#596).
-                if uuid in self._acked_probes:
-                    ledger.append((uuid, _FINAL))
-                    continue
-                ack = self._post(ack_line(nonce), kind="probe-ack")
-                if ack is not None:
-                    posted.append(ack)
-                    self._acked_probes.add(uuid)
-                ledger.append((uuid, _FINAL if ack is not None else _PENDING))
                 continue
             if self._recovered.get(uuid) == _FINAL:
                 # `_recover` settled this item already (committed a finished turn, or stalled one),
@@ -3218,7 +3166,7 @@ class WakeAgent:
         754 K-token context was ~66 near-identical briefs). So it is composed here and handed to
         `Session.send(brief=…)`, which shows it to the model and persists none of it.
 
-        Composed lazily and at most once per wake — so a probe-only or idle wake never pays the
+        Composed lazily and at most once per wake — so a self-only or idle wake never pays the
         live dashboard fetch — and `None` when onboarding is off.
         """
         if not self.onboard:
@@ -3378,8 +3326,8 @@ class WakeAgent:
           one INFO line says so, ``memory op=observe result=skipped reason=marked``. A batch with
           any unmarked message in it is mined whole.
 
-        Fires after each real exchange (never on a probe ack or a self-skip — those never
-        reach here), and before the turn for a first wake's seeded backlog, which says so
+        Fires after each real exchange (never on a self-skip — that never reaches here), and
+        before the turn for a first wake's seeded backlog, which says so
         (``seeded``, issue #746). A no provider, or one whose hook is a no-op (the default SQLite
         provider), does nothing. A hook that *raises* is swallowed: auto-capture is a
         best-effort side channel and must never break the wake or drop the reply that already
@@ -3433,10 +3381,9 @@ class WakeAgent:
         Each message is observed as **its own user-only exchange**, rendered by `_dialogue_of`
         exactly as it would have been had it arrived as an item of its own, so a seeded message
         and a live one land in the palace in one shape, and a long backlog does not become one
-        exchange cut into slices across message boundaries. Two kinds stay out, because the live
-        path never mines them either: the agent's **own** posts (the self-filter drops them before
-        any turn) and a **NOC probe** (a machine contract, acked without the model, never
-        dialogue). At most the newest `DEFAULT_CONTEXT_MESSAGES` are observed: each observe is a
+        exchange cut into slices across message boundaries. The agent's **own** posts stay out,
+        because the live path never mines them either (the self-filter drops them before any
+        turn). At most the newest `DEFAULT_CONTEXT_MESSAGES` are observed: each observe is a
         mining pass of its own, and `HARNESS_CONTEXT_MESSAGES=all` seeds a whole timeline.
 
         **Called before the turn, and that order is the point.** `Session.send` persists the seeded
@@ -3469,13 +3416,9 @@ class WakeAgent:
 
         The one filter both readers of the seed apply — memory (`_observe_seeded`) and the Turn-0
         recall query (`_recall_query`, issue #744) — so what is remembered and what recall ranks
-        against are the same messages: never the agent's **own** posts, never a **NOC probe**.
+        against are the same messages: never the agent's **own** posts.
         """
-        return [
-            message
-            for message in seeded
-            if not self._is_own(message) and self._probe_nonce(_carrier(message, _MESSAGES)) is None
-        ]
+        return [message for message in seeded if not self._is_own(message)]
 
     def _manifest_entries(self) -> list[tuple[str, str | None]]:
         """The ``(name, note)`` pairs for the tool manifest — the resolved set, else the registry.
@@ -3493,12 +3436,10 @@ class WakeAgent:
         """The **harness's own** post — degrading any SDK refusal instead of crashing.
 
         Since the Unspoken Channel (issue #293) its callers are the model-unreachable ones only:
-        the NOC probe ack — not the agent talking, but a machine contract (a signed nonce, acked
-        model-free, so the fleet's seam heartbeats run token-free at rest) — the provider-failure
-        report (issue #336) with its outage notice (issue #951), and the stall note (issue #589),
-        both posted because the model is the
-        thing that failed. **The agent's speech goes through the `messages` tool**, and nowhere
-        else. `idempotency_key` makes a post safe to repeat across a wake that died after it; only
+        the provider-failure report (issue #336) with its outage notice (issue #951), and the stall
+        note (issue #589), each posted because the model is the thing that failed. (The NOC probe
+        ack was one until issue #955; the probe travels only on the router's synthetic route now.)
+        **The agent's speech goes through the `messages` tool**, and nowhere else. `idempotency_key` makes a post safe to repeat across a wake that died after it; only
         the stall note needs one today.
 
         Refusals still degrade rather than raise: a locked timeline raises `TimelineLockedError`
@@ -3508,7 +3449,7 @@ class WakeAgent:
 
         **Both outcomes are logged**, because degrading gracefully is exactly what once made this
         failure invisible. A refusal is an **ERROR**; a success is an INFO naming the message
-        created. `kind` says what it was, so a heartbeat ack never reads as the agent talking.
+        created. `kind` says what it was, so a harness notice never reads as the agent talking.
         """
         try:
             sent = self.timeline.messages.create(body=body, idempotency_key=idempotency_key)
@@ -3533,29 +3474,14 @@ class WakeAgent:
         """Whether an item was authored by this agent — the actor self-filter's test."""
         return item.user.uuid == self.me_uuid
 
-    def _probe_nonce(self, carrier: str) -> str | None:
-        """The nonce if `carrier` holds a valid signed NOC probe, else `None` (the short-circuit).
-
-        Off unless `NOC_PROBE_SECRET` was provisioned (`probe_secret` set and non-empty):
-        with no secret there is nothing to verify against, so every item falls through to
-        the model, exactly as before this capability existed. A falsy secret (`None` *or*
-        an empty string) keeps it off, so a blank env var never enables verification against
-        an empty key. `carrier` is the field each reconciler reads the marker from — a
-        message body, a task's instructions, a webhook payload, or an asset's description —
-        so one signed-marker check serves all four seams (the NOC's message, task, webhook,
-        and asset contracts).
-        """
-        if not self.probe_secret:
-            return None
-        return verify_probe(carrier, self.probe_secret.reveal())
-
     def _marked(self, item: object, kind: str) -> bool:
         """Whether `item` carries a verified `BCNOC2` marker for this timeline (issue #950).
 
         A **marked real wake**: the NOC's own verification wake (a roll, a move, a check on demand,
         basecradle-noc#1636), which runs as any other wake, model included, and is not handed to
-        memory (`_observe`). Off unless `NOC_PROBE_SECRET` was provisioned, exactly as the probe is:
-        with no secret nothing verifies, and a marked item is an ordinary one.
+        memory (`_observe`). Off unless `NOC_PROBE_SECRET` was provisioned (set and non-empty, so a
+        blank env var never verifies against an empty key): with no secret nothing verifies, and a
+        marked item is an ordinary one.
 
         **A message only.** The NOC posts the marker only in the body of a real platform message, so
         a task's instructions, a webhook payload and an asset's description are never read for it:
@@ -3570,7 +3496,8 @@ class WakeAgent:
         if not author:
             return False  # no author to bind to, so nothing can verify: an ordinary message
         secret = self.probe_secret.reveal()
-        return verify_marked(_carrier(item, kind), secret, self.timeline_uuid, author) is not None
+        body = item.content.body or ""
+        return verify_marked(body, secret, self.timeline_uuid, author) is not None
 
     def _turn_marked(self, turn: Message, item: object, kind: str) -> bool:
         """Whether a recovered turn (a resume, a stall) was a marked real wake and nothing else.
@@ -3635,7 +3562,7 @@ class WakeAgent:
         # mid-wake arrival.
         # **The baseline may not sail past an undecided message** (issue #285). `_settle` has just
         # held the mark back from any `_PENDING` item — one a *live* concurrent wake is holding, or
-        # a probe ack that failed to post — and baselining to `recent[0]` here would step straight
+        # one this wake declined to start — and baselining to `recent[0]` here would step straight
         # over it, hiding it from every future wake if that wake then died. That is precisely the
         # bug this issue fixes, and the bootstrap path is the one place it can sneak back in.
         #
@@ -3726,8 +3653,7 @@ class WakeAgent:
         #226). Three coupled behaviors:
 
         1. **Many-to-one batch turn (`_absorb`).** Own posts are self-filtered (marked, not
-           acted on); a recognized NOC probe — read from the message **body** — is acked
-           token-free before the model; every remaining peer message is atomically claimed,
+           acted on); every remaining peer message is atomically claimed,
            marked, and collected into the batch. So the exactly-once machinery
            (`ClaimStore`/`MarkStore`, `kind=_MESSAGES`) moves to batch semantics: claim every
            message in the batch, advance the mark past the newest — but a *single* model turn
@@ -3766,17 +3692,16 @@ class WakeAgent:
         posted: list[object] = []
         self._cursor = self.marks.get(self.timeline_uuid)
         self._recover(session, messages, kind=_MESSAGES, text=_incoming_text)
-        batch, probe_seen = self._absorb(session, messages, posted)
+        batch = self._absorb(messages)
         if self._breaker_held and not (self._billing_blocked or self._unfinished_turn):
             # A resume above was held by the breaker (issue #592), and `messages` was read before
             # it waited — so fold in what landed meanwhile before deciding there is nothing to do.
             # Not under a latch: this wake will answer nothing more, and what landed has deliveries
             # of its own, so claiming it here would only hand the next wake an orphan to recover.
-            probe_seen = self._absorb_after_hold(session, batch, posted) or probe_seen
+            self._absorb_after_hold(batch)
         if not batch:
-            # Self-only / probe-only / empty: any probe acked, nothing to engage on. The model is
-            # never engaged (and the brief never fetched) — but the mark still advances, so these
-            # are not re-read forever.
+            # Self-only / empty: nothing to engage on. The model is never engaged (and the brief
+            # never fetched) — but the mark still advances, so these are not re-read forever.
             self._settle(_MESSAGES)
             return posted
         if self._billing_blocked or self._unfinished_turn:
@@ -3797,8 +3722,8 @@ class WakeAgent:
         if self._admit():
             # The breaker held this wake here (issue #592). Fold in what landed while it waited, as
             # the read-pacer does after its own sleep, so one turn answers the lot.
-            probe_seen = self._absorb_after_hold(session, batch, posted) or probe_seen
-        self._pace_and_settle(session, batch, posted, probe_seen)
+            self._absorb_after_hold(batch)
+        self._pace_and_settle(batch)
         try:
             narration = self._generate_settled(session, batch, posted, backlog)
         except _REPORTED_FAILURES as exc:
@@ -3851,9 +3776,7 @@ class WakeAgent:
         self._settle(_MESSAGES)
         return posted
 
-    def _absorb(
-        self, session: Session, items: list[object], posted: list[object]
-    ) -> tuple[list[object], bool]:
+    def _absorb(self, items: list[object]) -> list[object]:
         """Fold a freshly-read chronological set into the reply batch, exactly once.
 
         Walks the items oldest→newest, applying the same per-item disposition `_act_on` does —
@@ -3861,10 +3784,6 @@ class WakeAgent:
 
         - **Own post** (the actor self-filter) → never acted on; its disposition is final at once
           (no claim needed — there is nothing to make exclusive, and nothing to lose).
-        - **NOC probe** (a valid signed marker in the body) → ack token-free (no model call),
-          final only on a successful ack (at-least-once, never claimed), and set `probe_seen`.
-          The ack posts *here*, before any pacing sleep, so a probe's heartbeat stays sub-second
-          even when a real peer message is paced alongside it.
         - **Peer message** → atomically claim it **in-flight** and collect it into the batch. A
           message that is *already* claimed goes to `_readmit`, which decides whether a live wake
           owns it, whether it is already settled, or whether the wake that owned it **died** — in
@@ -3884,12 +3803,12 @@ class WakeAgent:
         is therefore: *the mark may never pass an item whose disposition is not final*, and
         `_settle` is the only place it moves.
 
-        Returns `(peers, probe_seen)`. Reused by the initial gather and by every re-read
-        (`_fetch_fresh`) during Loop 1 settle and Loop 2 rebuild, so the claiming/acking/ledger
-        invariants are identical on every read.
+        Returns the peer messages it claimed. Reused by the initial gather and by every re-read
+        (`_fetch_fresh`) during Loop 1 settle and Loop 2 rebuild, so the claiming/ledger
+        invariants are identical on every read. A `BCNOC1` marker in a body is ordinary content
+        (issue #955): the message is claimed and answered like any other.
         """
         peers: list[object] = []
-        probe_seen = False
         ledger = self._ledger[_MESSAGES]
         for item in items:
             uuid = item.content.uuid
@@ -3900,18 +3819,6 @@ class WakeAgent:
             if self._is_own(item):
                 ledger.append((uuid, _FINAL))
                 continue
-            nonce = self._probe_nonce(_carrier(item, _MESSAGES))
-            if nonce is not None:
-                if uuid in self._acked_probes:  # acked by an earlier pass of this wake (#596)
-                    ledger.append((uuid, _FINAL))
-                    continue
-                probe_seen = True
-                ack = self._post(ack_line(nonce), kind="probe-ack")
-                if ack is not None:
-                    posted.append(ack)
-                    self._acked_probes.add(uuid)
-                ledger.append((uuid, _FINAL if ack is not None else _PENDING))
-                continue
             if self.claims.claim(self.timeline_uuid, uuid, kind=_MESSAGES):
                 ledger.append((uuid, _OURS))
                 peers.append(item)
@@ -3920,10 +3827,10 @@ class WakeAgent:
             ledger.append((uuid, disposition))
             if disposition == _OURS:
                 peers.append(item)
-        return peers, probe_seen
+        return peers
 
     def _fetch_fresh(self) -> list[object]:
-        """Re-read the messages past this wake's cursor, chronological (may include self/probes).
+        """Re-read the messages past this wake's cursor, chronological (may include the agent's own).
 
         **The cursor is the in-wake one (`self._cursor`), not the persisted mark.** `_absorb`
         advances it past every message it looks at, so a re-read after absorbing returns only what
@@ -4056,7 +3963,7 @@ class WakeAgent:
                 continue
             claim = self.claims.read(self.timeline_uuid, uuid, kind=kind)
             if claim is None or claim.settled or not self.claims.orphaned(claim):
-                continue  # never claimed (a peer's own post, a probe), already decided, or alive
+                continue  # never claimed (the agent's own post), already decided, or alive
             # A take-over that won its token and died before it could rewrite the claim leaves the
             # claim naming a wake that no longer holds the item. Judge the wake that really does.
             claim = self.claims.effective_owner(self.timeline_uuid, uuid, kind=kind, claim=claim)
@@ -4846,13 +4753,10 @@ class WakeAgent:
         if newest is not None:
             self.marks.set(self.timeline_uuid, newest, kind=kind)
 
-    def _absorb_after_hold(
-        self, session: Session, batch: list[object], posted: list[object]
-    ) -> bool:
+    def _absorb_after_hold(self, batch: list[object]) -> None:
         """Fold into `batch` the messages that landed while the breaker held this wake (issue #592).
 
-        Returns whether a NOC probe was among them (acked by `_absorb`, as ever), so the caller
-        skips read-pacing for it. Only the *read* may degrade: a platform that will not answer after
+        Only the *read* may degrade: a platform that will not answer after
         the hold leaves the batch as it was, and nothing is lost by answering what is in hand —
         the router queued a delivery for every message that landed, and the next wake reads past
         the mark. The fold itself is never guarded, because `_absorb` claims as it goes, and a
@@ -4867,14 +4771,10 @@ class WakeAgent:
                 self.timeline_uuid,
                 exc_info=True,
             )
-            return False
-        new, probe_seen = self._absorb(session, fresh, posted)
-        batch.extend(new)
-        return probe_seen
+            return
+        batch.extend(self._absorb(fresh))
 
-    def _pace_and_settle(
-        self, session: Session, batch: list[object], posted: list[object], probe_seen: bool
-    ) -> None:
+    def _pace_and_settle(self, batch: list[object]) -> None:
         """Loop 1 — read-pace the newest peer AI message, settling if a newer one lands mid-read.
 
         Simulate a human reading the newest peer *AI* message before replying, so an AI↔AI
@@ -4885,8 +4785,7 @@ class WakeAgent:
         reply reacts to the settled newest, not a snapshot taken before the sleep.
 
         Skipped entirely — an instant reply, exactly as before — when: pacing is disabled (the
-        kill switch); a NOC probe was in the batch (its heartbeat must stay sub-second, and it
-        was already acked in `_absorb`); or the newest peer message is a **human** (the
+        kill switch); or the newest peer message is a **human** (the
         ``kind == "ai"`` gate is the whole opt-in). New peer messages folded in here are marked
         and claimed by `_absorb`, so they are answered by this wake, not dropped.
 
@@ -4910,7 +4809,7 @@ class WakeAgent:
         propagates instead: the claims stay in flight, the mark holds, and the next wake re-drives
         them. (Loop 2's fold was never guarded; this one was, until it was found reviewing #592.)
         """
-        if probe_seen or not self.pacer.enabled:
+        if not self.pacer.enabled:
             return
         newest = batch[-1]
         if getattr(newest.user, "kind", None) != "ai":
@@ -4924,7 +4823,7 @@ class WakeAgent:
             except Exception:  # noqa: BLE001 - pacing must never break the wake; degrade to no delay
                 _log.warning("Read-pacing failed; answering without further delay.", exc_info=True)
                 return
-            new_peers, _ = self._absorb(session, fresh, posted)
+            new_peers = self._absorb(fresh)
             batch.extend(new_peers)
             if not (new_peers and getattr(new_peers[-1].user, "kind", None) == "ai"):
                 return  # settled: the newest is stable (or the latest arrival is a human)
@@ -5022,12 +4921,11 @@ class WakeAgent:
             used_tools = any(turn.role == "tool" for turn in session.history[base_len:])
             if not self.pacer.enabled or builds >= self.max_builds or used_tools or compacted:
                 return narration  # pacing off → one build; the cap, tools, or a compaction → stand
-            # Absorb the fresh read regardless — this marks any self post and, crucially, keeps a
-            # NOC probe's ack sub-second even when it lands mid-generation (it is acked here, not
-            # deferred to the next wake). Only peer messages fold in and trigger a rebuild.
-            new_peers, _ = self._absorb(session, self._fetch_fresh(), posted)
+            # Absorb the fresh read regardless — this marks any self post. Only peer messages fold
+            # in and trigger a rebuild.
+            new_peers = self._absorb(self._fetch_fresh())
             if not new_peers:
-                return narration  # snapshot still current (any probe/self just handled) — stand
+                return narration  # snapshot still current (any self post just handled) — stand
             # Stale: a peer message landed during generation. Fold it in, roll the stale build out
             # of the transcript, and regenerate against the current batch. Safe precisely because
             # this build ran no tools: it has said nothing, so there is nothing to unsay.
@@ -5106,8 +5004,7 @@ class WakeAgent:
         """Report a permanent / billing provider failure to the timeline — **model-free** (issue #336).
 
         The model is the thing that just failed, so the harness posts the notice itself, mechanically,
-        through the SDK under the agent's identity (`_post` — the probe-ack path, which costs no vendor
-        credit). The vendor error rides inside **verbatim** (decision 3). This is the sanctioned
+        through the SDK under the agent's identity (`_post`, which costs no vendor credit). The vendor error rides inside **verbatim** (decision 3). This is the sanctioned
         Unspoken-Channel exception: the model cannot be reached to speak, which is the one case that
         invariant could not cover (see `_report`).
 
@@ -5651,37 +5548,6 @@ def _has_conversation(session: Session) -> bool:
 # (not re-implemented) to keep them in lockstep.
 _events_since = _messages_since
 _assets_since = _messages_since
-
-
-def _asset_marker_carrier(asset: object) -> str:
-    """The asset field the NOC synthetic-probe marker rides in — the 4th seam's carrier.
-
-    The asset analog of a message body / task instructions / webhook payload. The chosen
-    field is the asset's **description**: the one free-text field a peer (or the NOC
-    prober) controls on an upload, so a synthetic asset probe is minted by creating a tiny
-    asset whose `description` is the `BCNOC1 …` marker. This is the contract the NOC's
-    asset probe must agree with byte-for-byte. The field is optional, so an absent (or
-    `None`) description reads as empty — an ordinary file with no description simply falls
-    through to perception, never mistaken for a probe.
-    """
-    return getattr(asset.content, "description", None) or ""
-
-
-def _carrier(item: object, kind: str) -> str:
-    """The field of an item a NOC marker rides in: one mapping, read by both marker kinds.
-
-    A message's body, a task's instructions, a webhook delivery's payload, an asset's description
-    (`_asset_marker_carrier`). The synthetic probe (`BCNOC1`, `_probe_nonce`) reads all four; the
-    marked real wake (`BCNOC2`, `WakeAgent._marked`) reads a message's, through the same mapping, so
-    the two can never disagree about where a message's marker is.
-    """
-    if kind == _ASSETS:
-        return _asset_marker_carrier(item)
-    if kind == _EVENTS:
-        return item.content.payload or ""
-    if kind == _TASKS:
-        return item.content.instructions or ""
-    return item.content.body or ""
 
 
 def wake_harness(

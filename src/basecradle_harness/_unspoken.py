@@ -123,7 +123,7 @@ class SpeechLedger:
 
     - **"Did the agent speak?"** — the wake's bookend line reports `posted=N`, and now that the
       final text is never auto-posted, the *only* messages that exist are the ones a tool created.
-      A bookend that counted just the harness's own posts (probe acks) would report `posted=0` for
+      A bookend that counted just the harness's own posts (its notices) would report `posted=0` for
       a wake in which the agent spoke — reading a talking agent as a silent one.
     - **"Did the agent act at all this turn?"** — what `NoReplyInformer` turns on. Scanning the
       transcript for a `messages` tool call would mean parsing tool arguments to tell a `create`
