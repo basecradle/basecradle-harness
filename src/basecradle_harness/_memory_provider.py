@@ -120,7 +120,20 @@ class MemoryProvider(ABC):
         """Capture a completed exchange. Default: no-op (explicit-memory only)."""
 
     def context(self, scope: MemoryScope) -> str | None:
-        """Prompt-ready memory to inject at Turn 0, or ``None``. Default: no-op."""
+        """Prompt-ready memory to inject at Turn 0, or ``None``. Default: no-op.
+
+        A provider that returns its own framed block (a heading, a reading guide, fence tags)
+        owes the engine two things that exist today only for the MemPalace adapter: a render
+        fence around what it injects (`_mempalace`'s `<mempalace-recall>` pair, which bounds the
+        block and names its generator, with the tag literals stripped from the hits so a peer
+        cannot forge its end), and its framing literals in what `_mining.strip_injected` removes. Without the second, a reply that quotes the block
+        is genuine model output on a mined path, so the framing is filed back into memory as
+        something the agent was told and recalled on the next wake.
+
+        When a second injecting provider lands, hoist both to this seam (a provider declares
+        its framing; the engine fences and strips for every provider) rather than copying
+        MemPalace's into the new adapter. The design is on issue #442.
+        """
         return None
 
     def begin_wake(self) -> None:
