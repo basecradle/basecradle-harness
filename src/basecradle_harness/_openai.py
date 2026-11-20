@@ -135,6 +135,7 @@ from basecradle_harness._openai_wire import (
 from basecradle_harness._refuseless_pricing import beyond_any_row, pricing_of
 from basecradle_harness._refuseless_pricing import call_cost as listed_call_cost
 from basecradle_harness._refuseless_pricing import usage_of as listed_usage
+from basecradle_harness._system_turns import ANYWHERE, BEFORE_USER, PLACEMENTS, before_user
 from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
@@ -531,10 +532,15 @@ class OpenAIProvider:
         code_container: Callable[[], dict[str, Any] | str | None] | None = None,
         reported_tuning: Mapping[str, Any] | None = None,
         catalog: ModelCatalog | None = None,
+        system_turns: str = ANYWHERE,
         **default_params: Any,
     ) -> None:
         if surface not in SURFACES:
             raise ValueError(f"Unknown surface {surface!r}; expected one of {SURFACES}.")
+        if system_turns not in PLACEMENTS:
+            raise ValueError(
+                f"Unknown system_turns {system_turns!r}; expected one of {PLACEMENTS}."
+            )
         key = api_key or os.environ.get("AI_API_KEY")
         if not key:
             raise ValueError(
@@ -596,6 +602,11 @@ class OpenAIProvider:
         #: the line folds it in (`reasoning_apart`, issue #759). xAI does, on both surfaces; an
         #: equality on the known vendor, so every other endpoint keeps the wire's own reading.
         self._reasoning_apart = provider == "xai"
+        #: Where a system turn may travel in the system role for this model (`_system_turns`, issue
+        #: #945): ``anywhere`` (every one in place, the wire as it always was) or ``before_user``
+        #: (only where a user turn follows it, every other one a labelled user turn). Declared by
+        #: the operator with ``AI_SYSTEM_TURNS``, never inferred from the vendor or the model name.
+        self.system_turns = system_turns
         #: The cost gaps already stated this wake (an unknown model, an unpriced host, a container),
         #: so each WARNING is written once per adapter — one wake — rather than once per call.
         self._gaps_stated: set[str] = set()
@@ -703,6 +714,8 @@ class OpenAIProvider:
 
     def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> Message:
         """Run one model turn through the SDK and return the assistant's reply."""
+        if self.system_turns == BEFORE_USER:
+            messages = before_user(messages)
         if self.surface == "responses":
             return self._responses_turn(messages, tools)
         return self._chat_turn(messages, tools)

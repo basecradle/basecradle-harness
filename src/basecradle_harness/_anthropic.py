@@ -242,6 +242,10 @@ from basecradle_harness._observability import (
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._secret import Sealed
 from basecradle_harness._server_tools import mark_failed, record, summarize
+
+# How a system turn that is **not** at the head of the conversation reads to Claude, which takes
+# its system prompt at the top level only: the one label every wire uses (`_system_turns`).
+from basecradle_harness._system_turns import SYSTEM_LABEL
 from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
@@ -297,10 +301,6 @@ SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
 #: on it as a transient fault. Each pause is the server's own iteration limit on its tools, so this
 #: many is already a pathological turn.
 PAUSE_CONTINUATIONS = 8
-
-#: How a system turn that is **not** at the head of the conversation reads to Claude, which takes
-#: its system prompt at the top level only. The Google adapter's label, for the same reason.
-SYSTEM_LABEL = "[System]\n"
 
 #: The cache-control TTLs Anthropic offers, and the one the breakpoint gets when none is configured.
 CACHE_TTLS = ("5m", "1h")

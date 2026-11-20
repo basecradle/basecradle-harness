@@ -7,6 +7,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.199.0] - 2026-11-19
+
+### Added: A model that refuses a system turn no user turn follows is declared, and gets one it accepts (issue #945)
+
+An agent moved to refuseless's `kimi-k3.1-pro-abliterated` failed every wake at step 1 with a 400, `Invalid or unsupported request parameters`. The capital measured why: the vendor refuses this model's request whenever a system-role message is not followed by a user turn, on both surfaces, and every wake ends its input with one, the per-step note. `deepseek-v4.1-flash-abliterated-fast` at the same vendor takes the same request.
+
+- **`AI_SYSTEM_TURNS=before_user` declares such a model.** The `openai` adapter then sends every system turn no user turn follows as a user turn opening `[System]`: the trailing step note, every earlier step note (which a later step finds before the assistant turn it preceded, an order nobody measured), the reserve nudge, a truncation or failure note. A system turn a user turn follows keeps its role, so the per-wake brief still reads as instructions. The agent still gets the time and the step count on every step.
+- **Only the request changes** (`_system_turns.before_user`, a copy made at the wire). The transcript, the context attribution line, compaction and every recovery reader still see a system turn.
+- **Unset, nothing changes**, on any adapter: the wire is what it was, byte for byte. The setting is the brain's alone; a describer on the brain's stack runs another model and never inherits it.
+- **Declared, never detected.** The vendor's refusal names nothing, so detecting it would mean re-sending every request any vendor refuses with a 400 in a second shape, on every agent. Nor is it a table of model names.
+- **Refused where it would not apply.** Any value but `anywhere` or `before_user`, or `before_user` with an SDK other than `openai`, refuses the wake at startup and fails `--resolved-config`, which now reports `ai_system_turns`. The Anthropic and Gemini adapters already send every system turn after the head as a labelled user turn, so the setting has no effect there; the native `openrouter` and `xai-sdk` adapters are not wired for it.
+- **One label for every wire.** `[System]\n` was spelled separately in the Anthropic and Google adapters; both now read `_system_turns.SYSTEM_LABEL`, unchanged.
+- **The live gate gains four arms** on `kimi-k3.1-pro-abliterated` (`REFUSELESS_LIVE_ORDER_MODEL`): on each surface, a wake's real order through the engine with a tool in play, declared (it must complete, every call priced) and undeclared (the vendor must still answer 400).
+- **Fleet effect:** none until an agent declares it. The agent on `kimi-k3.1-pro-abliterated` needs `AI_SYSTEM_TURNS=before_user` in its `agent.env`.
+
 ## [0.198.4] - 2026-11-18
 
 ### Added: A credential-named JSON member loses its string value, for an exact list of names (issue #943)

@@ -176,6 +176,12 @@ from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._retry import diagnostics, fault_slug
 from basecradle_harness._secret import Sealed as _Sealed
 from basecradle_harness._server_tools import record
+
+# How a system turn that is **not** at the head of the conversation reads to Gemini, which has no
+# system role inside ``contents``. A label rather than a silent re-role, so the model can tell the
+# harness's own notes (the per-wake brief, a step note) from a peer's words: the one label every
+# wire uses (`_system_turns`).
+from basecradle_harness._system_turns import SYSTEM_LABEL
 from basecradle_harness._timeouts import (
     METADATA_TIMEOUT,
     CallTimeout,
@@ -231,11 +237,6 @@ SKIP_SIGNATURE = b"skip_thought_signature_validator"
 #: call with its result inside the transcript. An id the model did issue is echoed back exactly, as
 #: Google asks ("include the exact id of the function_call in the function_response").
 LOCAL_CALL_ID_PREFIX = "local-call-"
-
-#: How a system turn that is **not** at the head of the conversation reads to Gemini, which has no
-#: system role inside ``contents``. A label rather than a silent re-role, so the model can tell the
-#: harness's own notes (the per-wake brief, a step note) from a peer's words.
-SYSTEM_LABEL = "[System]\n"
 
 #: The longest value a credential-file *setting* may hold. A path is short; anything longer is
 #: almost certainly the key itself pasted where its path belongs.

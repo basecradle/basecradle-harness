@@ -156,6 +156,7 @@ from basecradle_harness._plugins import (
 from basecradle_harness._policy import Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._search_params import load_search_params
+from basecradle_harness._system_turns import ANYWHERE, BEFORE_USER, PLACEMENTS
 from basecradle_harness._timeouts import OUTPUT_CAP_KEYS, output_cap
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
 from basecradle_harness._tools import Tool
@@ -917,7 +918,58 @@ def _config_from_env() -> tuple[str, str, str]:
     sdk = (os.environ.get("AI_SDK") or DEFAULT_SDK).strip().lower()
     _require_generic_profile(provider, sdk, base_url_override())
     surface = _resolve_surface(sdk, provider)
+    system_turns_from_env(sdk)  # refused here, so a wake and `--resolved-config` refuse it alike
     return provider, sdk, surface
+
+
+#: The variable that declares where the brain's model takes a system turn (`_system_turns`).
+SYSTEM_TURNS_ENV = "AI_SYSTEM_TURNS"
+
+#: The SDKs on which ``before_user`` changes the wire. Anthropic's and Gemini's wires have no system
+#: role inside the conversation, so their adapters already send every system turn after the head as
+#: a labelled user turn (`_system_turns.SYSTEM_LABEL`); the native ``openrouter`` and ``xai-sdk``
+#: adapters have not been wired for it, because no model reached through them has needed it.
+_SYSTEM_TURNS_WIRED = ("openai",)
+
+
+def system_turns_from_env(sdk: str) -> str:
+    """Read ``AI_SYSTEM_TURNS``: where the brain's model takes a system turn (issue #945).
+
+    Unset or blank is ``anywhere``, the wire as it has always been. ``before_user`` (trimmed,
+    case-insensitive) declares a model that refuses a system-role message no user turn follows, so
+    every such turn is sent as a labelled user turn. Anything else is refused, never read as the
+    default: a typo here would leave the agent failing every wake with the vendor's 400. Validated
+    against the SDK too (`_require_system_turns_wired`), because an SDK that ignored it would leave
+    the operator believing the declaration took.
+    """
+    raw = (os.environ.get(SYSTEM_TURNS_ENV) or "").strip().lower()
+    if not raw:
+        return ANYWHERE
+    if raw not in PLACEMENTS:
+        raise ValueError(
+            f"{SYSTEM_TURNS_ENV} must be one of {', '.join(PLACEMENTS)}, got {raw!r}. Set "
+            f"{BEFORE_USER} only for a model that refuses a system-role message no user turn "
+            "follows; leave it unset otherwise."
+        )
+    _require_system_turns_wired(sdk, raw)
+    return raw
+
+
+def _require_system_turns_wired(sdk: str, system_turns: str) -> None:
+    """Refuse ``before_user`` on an SDK whose adapter does not apply it — the one place it is spelled."""
+    if system_turns == ANYWHERE or sdk in _SYSTEM_TURNS_WIRED:
+        return
+    if sdk in ("anthropic", "google-genai"):
+        raise ValueError(
+            f"{SYSTEM_TURNS_ENV}={system_turns} has no effect with AI_SDK={sdk}: that adapter "
+            "already sends every system turn after the head of the conversation as a labelled user "
+            f"turn. Unset {SYSTEM_TURNS_ENV}."
+        )
+    raise ValueError(
+        f"{SYSTEM_TURNS_ENV}={system_turns} is applied by the openai SDK's adapter only, and "
+        f"AI_SDK={sdk} does not apply it. Unset {SYSTEM_TURNS_ENV}, or reach this model over "
+        "AI_SDK=openai."
+    )
 
 
 def base_url_override() -> str | None:
@@ -1387,6 +1439,7 @@ def _provider_from_config(
     project: str | None = None,
     inherit_endpoint: bool = True,
     catalog: ModelCatalog | None = None,
+    system_turns: str = ANYWHERE,
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
@@ -1467,6 +1520,10 @@ def _provider_from_config(
     #   shares its endpoint by design; one on a *different* vendor must never be pointed at the
     #   brain's (issue #655), so it reaches its own vendor's default host.
     #
+    # ``system_turns`` is the brain's alone and is never inherited: it declares how the brain's
+    # *model* is served (`_system_turns`, issue #945), and a describer runs a different model, so
+    # it builds with the default and the wire every model takes.
+    #
     # ``AI_MODEL`` is still required either way, so a config missing it fails on the brain, where
     # the error is actionable.
     model = model or os.environ.get("AI_MODEL")
@@ -1484,6 +1541,7 @@ def _provider_from_config(
     # rule the config triple reads (`sdk_pairing_problem`), so every branch below may assume its
     # SDK reaches `provider` and no branch spells the rule a second time (issue #846).
     _require_generic_profile(provider, sdk, endpoint)
+    _require_system_turns_wired(sdk, system_turns)
 
     if sdk == "xai-sdk":
         params, extra_body = _split_model_params(
@@ -1596,6 +1654,7 @@ def _provider_from_config(
             load_params=loaded_params,
             max_output_tokens=max_output_tokens,
             default_output_tokens=default_output_tokens,
+            system_turns=system_turns,
         )
     if provider == "openrouter" and surface != "chat":
         # OpenRouter's Responses API is beta upstream, so the openai-SDK-at-OpenRouter cell is
@@ -1634,6 +1693,7 @@ def _provider_from_config(
             base_url=base_url,
             provider=provider,
             surface=surface,
+            system_turns=system_turns,
             extra_body=extra_body,
             extra_headers=params_extra_headers,
             reported_tuning=_reported_tuning(
@@ -1659,6 +1719,7 @@ def _provider_from_config(
             base_url=base_url,
             provider=provider,
             surface=surface,
+            system_turns=system_turns,
             extra_body=params_extra_body,
             extra_headers=params_extra_headers,
             reported_tuning=_reported_tuning(
@@ -1689,6 +1750,7 @@ def _provider_from_config(
             base_url=base_url,
             provider=provider,
             surface=surface,
+            system_turns=system_turns,
             extra_body=routed,
             extra_headers=_merge_extra_headers(
                 params_extra_headers, OPENROUTER_ROUTING_METADATA_HEADER
@@ -1711,6 +1773,7 @@ def _provider_from_config(
         base_url=base_url,
         provider=provider,
         surface=surface,
+        system_turns=system_turns,
         builtin_tools=list(builtins),
         code_container=code_container,
         extra_body=params_extra_body,
@@ -1763,6 +1826,7 @@ def _generic_openai_provider(
     load_params: Any,
     max_output_tokens: int | None,
     default_output_tokens: int | None = None,
+    system_turns: str = ANYWHERE,
 ) -> Provider:
     """The **generic** OpenAI-compatible profile: a vendor the harness knows only by name (#670).
 
@@ -1825,6 +1889,7 @@ def _generic_openai_provider(
         base_url=endpoint,
         provider=provider,
         surface=surface,
+        system_turns=system_turns,
         extra_body=params_extra_body,
         extra_headers=params_extra_headers,
         reported_tuning=_reported_tuning(
@@ -1912,6 +1977,7 @@ def _resolve_tools_and_provider() -> tuple[
         builtins=resolved.builtins,
         code_bridge=bridge,
         default_output_tokens=_max_output_tokens_from_env(),
+        system_turns=system_turns_from_env(sdk),
     )
     return provider, resolved, memory, bridge
 

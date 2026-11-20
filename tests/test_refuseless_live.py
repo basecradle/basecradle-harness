@@ -32,8 +32,13 @@ import os
 
 import pytest
 
-from basecradle_harness import Message, ToolCall, ToolSpec
-from basecradle_harness._basecradle import _config_from_env, _provider_from_config
+from basecradle_harness import Engine, Message, Tool, ToolCall, ToolRegistry, ToolSpec
+from basecradle_harness._basecradle import (
+    _config_from_env,
+    _provider_from_config,
+    system_turns_from_env,
+)
+from basecradle_harness._exceptions import ProviderAPIError
 from basecradle_harness._observability import _money
 from tests._line_expectations import assert_direct_call
 
@@ -189,3 +194,123 @@ def test_a_real_responses_call_takes_a_charter_a_tool_and_a_tool_round_trip(monk
     fields = assert_direct_call(llm, provider="refuseless", model=MODEL, cost="computed")
     assert fields.get("generation_id", "").startswith("resp"), llm
     assert not [line for line in lines if line.startswith("cost unpriced")], lines
+
+
+#: The model whose vendor refuses a system turn no user turn follows (issue #945), and the setting
+#: that declares it. A separate variable from ``REFUSELESS_LIVE_MODEL``, because the arms above run
+#: on any refuseless model and these are about one.
+ORDER_MODEL = (os.environ.get("REFUSELESS_LIVE_ORDER_MODEL") or "kimi-k3.1-pro-abliterated").strip()
+
+
+class _Echo(Tool):
+    """The tool in play: the model is asked to call it, and its result must reach the answer."""
+
+    name = "get_weather"
+    description = "The current weather in a city."
+    parameters = {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    }
+
+    def run(self, **kwargs):
+        return '{"city": "Dallas", "sky": "clear", "temperature_f": 71}'
+
+
+def _order_env(monkeypatch, surface: str, system_turns: str | None) -> None:
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("AI_PROVIDER", "refuseless")
+    monkeypatch.setenv("AI_MODEL", ORDER_MODEL)
+    monkeypatch.setenv("AI_API_KEY", KEY)
+    monkeypatch.setenv("AI_SDK_SURFACE", surface)
+    if system_turns is None:
+        monkeypatch.delenv("AI_SYSTEM_TURNS", raising=False)
+    else:
+        monkeypatch.setenv("AI_SYSTEM_TURNS", system_turns)
+    for var in ("AI_SDK", "AI_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _wake_order() -> list[Message]:
+    """The order a wake sends: an earlier wake's tool turn (its step notes in place), the brief, the
+    newest message. The engine appends the step note last on every step."""
+    return [
+        Message.user("What is the weather in Austin?"),
+        Message.system("Current Time: 2026-11-19 18:00:00 UTC\n\nStep 1 of 24."),
+        Message.assistant(
+            tool_calls=[ToolCall(id="call_0001", name="get_weather", arguments={"city": "Austin"})]
+        ),
+        Message.tool("call_0001", '{"city": "Austin", "sky": "rain", "temperature_f": 58}'),
+        Message.system("Current Time: 2026-11-19 18:00:05 UTC\n\nStep 2 of 24."),
+        Message.assistant("Austin: rain, 58°F."),
+        Message.system("You are a terse assistant. Use your tools; answer in one short sentence."),
+        Message.user("Now call get_weather for Dallas and tell me what it says."),
+    ]
+
+
+@needs_key
+@pytest.mark.parametrize("surface", ["responses", "chat"])
+def test_the_wake_order_is_refused_without_the_declaration(monkeypatch, surface):
+    """The control: the vendor still refuses the shape, so the declaration is what the fix is.
+
+    If this goes red because the vendor now answers, the vendor changed, not the harness: the
+    declaration can then be retired from the agents that carry it.
+    """
+    pytest.importorskip("openai")
+    _order_env(monkeypatch, surface, None)
+    provider, sdk, surface = _config_from_env()
+    provider = _provider_from_config(
+        provider, sdk, surface, max_output_tokens=512, system_turns=system_turns_from_env(sdk)
+    )
+    try:
+        assert provider.system_turns == "anywhere"
+        registry = ToolRegistry()
+        registry.register(_Echo())
+        with pytest.raises(ProviderAPIError) as refused:
+            provider.chat(
+                [*_wake_order(), Message.system("Current Time: now\n\nStep 1 of 24.")],
+                tools=registry.specs(),
+            )
+    finally:
+        provider.close()
+    print(f"\n{refused.value}")
+    assert refused.value.status_code == 400
+
+
+@needs_key
+@pytest.mark.parametrize("surface", ["responses", "chat"])
+def test_a_wake_with_a_tool_in_play_completes_when_declared(monkeypatch, caplog, surface):
+    """Issue #945's definition of done: the real order, through the engine, answered 200."""
+    pytest.importorskip("openai")
+    _order_env(monkeypatch, surface, "before_user")
+    caplog.set_level(logging.INFO, logger="basecradle_harness")
+    provider, sdk, surface = _config_from_env()
+    # Built as the wake builds its brain (`_resolve_tools_and_provider`): the setting is the brain's.
+    provider = _provider_from_config(
+        provider,
+        sdk,
+        surface,
+        max_output_tokens=4096,
+        system_turns=system_turns_from_env(sdk),
+    )
+    registry = ToolRegistry()
+    registry.register(_Echo())
+    try:
+        assert provider.system_turns == "before_user"
+        reply = Engine(provider, registry, max_steps=4).run(_wake_order())
+    finally:
+        provider.close()
+
+    print(f"\nreply: {reply.content!r}")
+    lines = [record.getMessage() for record in caplog.records]
+    calls = [line for line in lines if line.startswith("llm ")]
+    for line in calls:
+        print(line)
+    tools = [line for line in lines if line.startswith("tool ")]
+    print("\n".join(tools))
+    # Every attempt answered, and the tool ran before the final reply: at least two calls.
+    assert len(calls) >= 2, calls
+    for line in calls:
+        assert_direct_call(line, provider="refuseless", model=ORDER_MODEL, cost="computed")
+    assert any("get_weather" in line for line in tools), tools
+    assert reply.content and ("71" in reply.content or "clear" in reply.content.lower())
