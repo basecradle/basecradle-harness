@@ -9,6 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.204.3] - 2026-11-21
 
+### Fixed: An HTTP status a gRPC endpoint answered with is named as the HTTP adapters name it, so an edge's 525 is retried in place (issue #962)
+
+One wake of an agent on xAI, 2026-11-21: the edge answered a model call with HTTP 525, the call gave up on `attempt=1/3` as `reason=provider_error`, and the wake wrote `ERROR wake failed` and exited 1, so the router's quick retry ran it again and it succeeded 65 seconds later.
+
+- **gRPC's account of an HTTP status is read back.** gRPC has no code for an HTTP status: gRPC core folds it into one (`400` → `INTERNAL`, `401` → `UNAUTHENTICATED`, `403` → `PERMISSION_DENIED`, `404` → `UNIMPLEMENTED`, `429` and `502`–`504` → `UNAVAILABLE`, every other status, an edge's `520`–`527` among them, → `UNKNOWN`) and keeps the number only in the detail (`Received http2 header with status: 525`). The native xAI adapter now reads it (`_faults.folded_http_status`) and raises the class an HTTP adapter raises for the same status, row for row the Fault Slugs table in `docs/telemetry.md`.
+- **What moves on the native xAI path:** any 5xx but `504` is `server_error`, retried in place (a `525` under `UNKNOWN` was `provider_error`, never retried; a `502`/`503` under `UNAVAILABLE` was `transport`, retried the same way). A `504` is `timeout`, the vendor's own deadline, retried once (it was `transport`). A `429` is `rate_limited`, on the rate-limit schedule (it was `transport`). A `403` is `config:auth`, a `402` `config:billing`, a `413` `payload_too_large`, a `404` `config:model_not_found`. A `400` under `INTERNAL` is `api_error` and propagates on the first raise, as a `400` does on every HTTP adapter (it was `invalid_response`, retried).
+- **Nothing moves without the sentence.** A code with no status in its detail is classified by the code as before, and so is the sentence under a code gRPC core never folds into. If every attempt at a transient fault fails, the wake ends on the outage exit (`75`), where issue #957's rule decides what is written.
+
 ### Changed: Your Home names the seventh standing folder, `~/software` (issue #964)
 
 The agent's home gains a seventh standing folder, `~/software`, for programs an agent installs or compiles for itself, catalogued in its `INDEX.md` and linked into `~/.local/bin` (basecradle-noc#1664). `src/basecradle_harness/_agent_home/your-home.md` is re-synced byte for byte from the NOC's canonical (`deploy/agent-home/your-home.md` at `e743c8e`), and every place that named six folders names seven: the README's Your Home section, the `shell` tool's note, the brief's docstrings, and the checksum `tests/test_brief.py` pins. No behavior changes: the shell already runs a login shell, so `~/.local/bin` is on the PATH when it exists.
