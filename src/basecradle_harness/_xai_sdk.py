@@ -186,6 +186,21 @@ def _fits_grpc_metadata(value: str) -> bool:
     return all(" " <= ch <= "~" for ch in value)
 
 
+#: The channel options every ``xai_sdk`` client this adapter builds carries (issue #966): one, a gRPC
+#: service config with no ``retryPolicy``, in place of the SDK's default one. That default retries
+#: ``UNAVAILABLE`` up to five times, and gRPC core folds an HTTP ``429``, ``502``, ``503`` or ``504``
+#: the endpoint **did answer** into ``UNAVAILABLE`` (issue #962), so one harness attempt reached the
+#: vendor five times, a ``429`` was answered by sending the same request again at once, and a gateway
+#: ``504`` was re-sent although the request may have run. Measured on loopback: five requests per
+#: attempt before, one after. The harness's own retry (`_retry`) is the one policy for a model call;
+#: gRPC's transparent retry, which fires only for a request that never left the client, is kept,
+#: because it is not a policy and ``grpc.enable_retries`` stays on. Passed on every build, so the
+#: client the adapter rebuilds for a new conversation or deadline (`_bound_client`) carries it too.
+CHANNEL_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("grpc.service_config", json.dumps({"methodConfig": [{"name": [{}]}]})),
+)
+
+
 def require_xai_sdk():
     """Import and return the ``xai_sdk`` package, or raise a clear "no LLM, by design" error.
 
@@ -327,7 +342,7 @@ class XaiSdkProvider:
                 raise ValueError(
                     "No API key: pass api_key=... or set the AI_API_KEY environment variable."
                 )
-            kwargs: dict[str, Any] = {"api_key": key}
+            kwargs: dict[str, Any] = {"api_key": key, "channel_options": list(CHANNEL_OPTIONS)}
             if api_host:
                 kwargs["api_host"] = api_host
             # No ``timeout`` here: the deadline is fitted per call and set by `_bound_client`, which
