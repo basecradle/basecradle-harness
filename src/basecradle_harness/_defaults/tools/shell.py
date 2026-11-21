@@ -23,7 +23,11 @@ PLUGIN = ToolPlugin(
         "and network calls with no sandbox beyond your Unix permissions. "
         'Your home directory and its seven standing folders are described under "Your Home" '
         "in your instructions; each folder's README is its law. "
-        "The command-line tools installed alongside your harness are on your PATH — run them "
-        "by name (`mempalace status` reads your own memory palace, if that is your backend)."
+        "Your harness's own commands (`basecradle-harness-*`, and `mempalace` where it is "
+        "installed) come first on your PATH, from a directory that holds nothing else — run "
+        "them by name (`mempalace status` reads your own memory palace, if that is your "
+        "backend). The Python environment your harness runs from is not on your PATH: "
+        "`python3`, `pip` and every other command resolve to the system's or your own, never "
+        "to your harness's."
     ),
 )

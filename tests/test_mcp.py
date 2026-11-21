@@ -53,6 +53,7 @@ from basecradle_harness._mcp import (
     withheld_refusal,
 )
 from basecradle_harness._policy import SHELL
+from basecradle_harness._venv import MEMPALACE
 
 # A 1×1 PNG, base64 — a real, decodable image for the image-block tests.
 _PNG_B64 = (
@@ -1081,30 +1082,56 @@ def test_colliding_sanitized_tool_names_dedup_not_crash(tmp_path):
             client.close()
 
 
-def _bare_name_launcher(tmp_path, monkeypatch, name="nova-mcp"):
-    """A fake MCP server reachable only as `name`, from a bin dir `sys.executable` now sits in.
+def _bare_name_launcher(tmp_path, monkeypatch, name=MEMPALACE):
+    """A fake MCP server reachable only as `name`, from the bin dir `sys.executable` now sits in.
 
-    The shape of a server installed *into the agent's venv*: its console script lands beside
-    the harness's own entry points, in a directory nothing puts on ``PATH`` (issue #409).
+    The shape of a server installed *into the agent's venv*: its console script lands beside the
+    harness's own entry points. Only a name on the allowlist (`_venv.own_commands`) is reachable
+    by name from there (issue #969); anything else in that directory is not on the PATH at all.
     """
     script = _write_server_script(tmp_path)
-    bin_dir = tmp_path / "venv" / "bin"
-    bin_dir.mkdir(parents=True)
+    root = tmp_path / "venv"
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
     launcher = bin_dir / name
     command = f"exec {shlex.quote(sys.executable)} {shlex.quote(str(script))}"
     launcher.write_text(f"#!/bin/sh\n{command}\n", encoding="utf-8")
     launcher.chmod(0o755)
     monkeypatch.setattr(sys, "executable", str(bin_dir / "python3"))
+    monkeypatch.setattr(sys, "prefix", str(root))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "system"))
+    monkeypatch.setenv("PATH", os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"]))
     return name
 
 
-def test_a_stdio_server_beside_the_interpreter_launches_by_bare_name(tmp_path, monkeypatch):
-    """A bare `command` resolves against exactly the PATH it is handed — so it carries the venv."""
+def test_a_stdio_server_started_by_a_harness_command_name_still_starts(tmp_path, monkeypatch):
+    """A bare `command` resolves against exactly the PATH it is handed, and ours carries it."""
     _drop_config(tmp_path, "fake", {"command": _bare_name_launcher(tmp_path, monkeypatch)})
     resolution = load_mcp_tools(tmp_path, timeout=10)
     try:
         assert [t.name for t in resolution.tools] == ["fake__echo"]
         assert resolution.skipped == []
+    finally:
+        for client in resolution.clients:
+            client.close()
+
+
+def test_a_dependency_script_in_the_harness_environment_is_not_found_by_name(tmp_path, monkeypatch):
+    """Issue #969: the environment's ``bin`` leaves the PATH, even when the server inherited it."""
+    name = _bare_name_launcher(tmp_path, monkeypatch, name="nova-mcp")
+    _drop_config(tmp_path, "fake", {"command": name})
+    resolution = load_mcp_tools(tmp_path, timeout=5)
+    assert resolution.tools == []
+    assert resolution.skipped[0][0] == "fake"
+
+
+def test_a_stdio_server_started_by_absolute_path_is_unaffected(tmp_path, monkeypatch):
+    """``mempalace-mcp`` is started this way: its path names it, whatever the PATH holds."""
+    name = _bare_name_launcher(tmp_path, monkeypatch, name="mempalace-mcp")
+    _drop_config(tmp_path, "fake", {"command": str(tmp_path / "venv" / "bin" / name)})
+    resolution = load_mcp_tools(tmp_path, timeout=10)
+    try:
+        assert [t.name for t in resolution.tools] == ["fake__echo"]
     finally:
         for client in resolution.clients:
             client.close()

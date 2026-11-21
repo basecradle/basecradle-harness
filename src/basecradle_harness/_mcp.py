@@ -135,7 +135,7 @@ from basecradle_harness._messages import ImageContent, ToolResult
 from basecradle_harness._observability import MCP_EXECUTOR, tool_failed
 from basecradle_harness._secret import Secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
-from basecradle_harness._venv import with_interpreter_bin
+from basecradle_harness._venv import spawn_env
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -664,11 +664,13 @@ class StdioMcpClient(McpClient):
     daemon reader thread drains stdout into a queue, so a blocking ``readline`` can never
     wedge the wake; ``stderr`` is discarded (server logging is not our transport).
 
-    That environment carries the harness's own venv ``bin`` on ``PATH`` (`_venv`), because a
-    bare ``command`` is resolved against exactly the ``PATH`` it is handed — so a server
-    installed *into the agent's venv* is launchable by name rather than only by absolute path.
-    It is applied under the config's ``env``, so an operator who sets ``PATH`` explicitly still
-    wins outright.
+    That environment's ``PATH`` follows the harness's contract (`_venv.spawn_env`, issue #969):
+    the harness's own commands first, and the environment the harness runs from taken off. A bare
+    ``command`` is resolved against exactly the ``PATH`` it is handed, so a server started by a
+    harness command's name still launches by name, one started by absolute path is unaffected,
+    and anything else in the harness's environment (a dependency's script) is no longer found by
+    name. It is applied under the config's ``env``, so an operator who sets ``PATH`` explicitly
+    still wins outright.
 
     The child runs in this process's working directory, and it is **pinned** on the ``Popen``
     rather than inherited, so `workdir` is the directory the server was actually handed — the root
@@ -695,7 +697,7 @@ class StdioMcpClient(McpClient):
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env={**with_interpreter_bin(os.environ), **revealed(self.config.env)},
+                env={**spawn_env(os.environ), **revealed(self.config.env)},
                 cwd=self.workdir,
                 text=True,
                 bufsize=1,

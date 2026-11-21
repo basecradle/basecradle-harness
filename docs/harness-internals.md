@@ -1034,3 +1034,33 @@ derived from the vendor. The shape of the change:
 The wire claim is proven against a real loopback HTTP server (`tests/test_generic_provider.py`),
 with a known vendor on the same server as the control, and mutation-checked: re-introducing an
 OpenAI fallback in the affinity lookup, or letting a generic label reach the rate table, fails it.
+
+### The Spawned `PATH` — the harness's own commands only, first (issue #969)
+
+**The contract changed, knowingly.** Issue #409 put the harness venv's whole `bin` on the `PATH` of
+every subprocess under the contract *reachable, not first*, so a bare `mempalace status` would work.
+Measured on a fleet server on 2026-11-21, that also made `python3`, `pip` and `pip3` the harness's
+own (a plain `pip install` installed into the harness; four agents had packages there it never
+brought), let a link in `~/.local/bin` (ahead of it) replace a harness command, and let every
+dependency's script shadow an agent's own tools. `@origin`'s decision of that day, after advice
+from `@rowan` and `@briggs`, replaced the contract with **the harness's commands only, first**.
+
+`_venv.py` is the whole mechanism, and its module docstring carries the reasoning:
+
+- **The allowlist** (`own_commands`) is this distribution's `console_scripts` entry points, read
+  from the installed metadata, plus `mempalace`. Not the interpreter, not `pip`, not a dependency's
+  script, not `mempalace-mcp`/`mempalace-light-mcp` (absolute shebangs; started by path).
+- **The commands directory** (`commands_dir`) is a per-process `mkdtemp` (`0700`) of symlinks into
+  the directory `sys.executable` sits in, re-linked on every spawn. Removed at exit; a predecessor
+  that was killed (or stopped, which skips `atexit`) is removed by the next process once its stamped
+  pid is dead **and** it is an hour old. Failing to make it costs reachability, never the removal.
+- **`spawn_env`** removes every spelling of the venv `bin` (as derived, resolved, with a trailing
+  separator, or a symlinked alias on the inherited `PATH`) and puts the commands directory first.
+  Outside a virtual environment nothing is removed: the interpreter's `bin` is the system's.
+- **`path_preamble`** applies the same after a login shell's profile, entry by entry, keeping
+  every other entry in its place (empty ones included), with each removed spelling quoted into the
+  `case` pattern so a glob character matches literally.
+
+Every subprocess the harness spawns takes it: the `shell` tool (both halves), MCP stdio servers
+(under the config's own `env`), and `journalctl` in the log-grammar probe (`commands=False`: the
+venv leaves, and no directory is made for a child that runs nothing of ours).

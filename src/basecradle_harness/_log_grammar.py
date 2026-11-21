@@ -171,6 +171,7 @@ from basecradle_harness._report import (
     billing_onset_line,
     billing_repeat_line,
 )
+from basecradle_harness._venv import spawn_env
 
 #: The journald identifier these synthetic lines are written under — this repo's to own, per the
 #: capital's ruling 6 (2026-08-18): *a probe line lands under an identifier its emitting repo owns,
@@ -357,8 +358,17 @@ def _read_back(messages: list[str], *, since: float) -> bool:
             # caller-controlled, so there is nothing for a PATH to redirect that a compromised
             # agent could not already run as itself. It resolves under the stripped environment the
             # wrapper runs a probe in, too: with no PATH at all, exec falls back to the system
-            # default (`/bin:/usr/bin`), where journalctl lives.
-            done = subprocess.run(argv, capture_output=True, text=True, timeout=15, check=False)
+            # default (`/bin:/usr/bin`), where journalctl lives. Like everything the harness
+            # spawns, it runs with the harness's own environment off its PATH (issue #969); it runs
+            # nothing of the harness's, so no commands directory is made for it.
+            done = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+                env=spawn_env(commands=False),
+            )
         except FileNotFoundError as error:
             raise Unprovable("journalctl is not available on this box") from error
         except (OSError, subprocess.SubprocessError) as error:

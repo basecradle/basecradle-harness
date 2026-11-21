@@ -21,7 +21,7 @@ import respx
 import respx.mocks
 from respx.mocks import HTTPCoreMocker
 
-from basecradle_harness import OpenAIProvider, _mempalace, _mining, _openai
+from basecradle_harness import OpenAIProvider, _mempalace, _mining, _openai, _venv
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -289,6 +289,21 @@ def fake_mempalace(monkeypatch):
     monkeypatch.setitem(sys.modules, "mempalace.normalize", normalize)
     monkeypatch.setattr(_mempalace, "mempalace_version", lambda: "3.10.0")
     return convo_miner, searcher
+
+
+@pytest.fixture(autouse=True)
+def _isolated_commands_dir(tmp_path_factory, monkeypatch):
+    """Make the harness's commands directory (`_venv.commands_dir`) inside the test's own temp tree.
+
+    Every spawn through `_venv.spawn_env` makes one, in the system temp directory by default, and
+    the process that made it removes it only at exit: a test must leave nothing outside its own
+    ``tmp_path`` (CLAUDE.md, "Whatever creates, cleans up"), and must not reuse the directory an
+    earlier test made against a different interpreter directory.
+    """
+    monkeypatch.setattr(_venv, "_PARENT", str(tmp_path_factory.mktemp("commands")))
+    _venv._reset()
+    yield
+    _venv._reset()
 
 
 @pytest.fixture(autouse=True)

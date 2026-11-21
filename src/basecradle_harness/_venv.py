@@ -1,75 +1,126 @@
-"""Put the harness's own console scripts on the PATH of the subprocesses it spawns.
+"""Only the harness's own commands on the PATH of what it spawns: its environment leaves it.
 
-A harness agent is installed into a virtualenv, and every console script that comes with it —
-``basecradle-harness-wake``, ``basecradle-harness-verify``, ``basecradle-harness-claims``, and
-the entry points its extras bring (``mempalace`` foremost) — lands in that venv's ``bin``
-directory. Nothing puts that directory on the agent's own ``PATH``: a wake is launched by
-absolute path (the router runs ``/home/<agent>/venv/bin/basecradle-harness-wake``), which needs
-no activation and therefore never performs one. Every subprocess the agent spawns inherits that
-un-activated environment.
+A harness agent is installed into a virtualenv, and that environment's ``bin`` directory holds
+three kinds of thing: the harness's own console scripts (``basecradle-harness-wake``,
+``basecradle-harness-verify``, …, and ``mempalace`` when the extra is installed), the
+environment's own interpreter and installer (``python``, ``python3``, ``pip``), and every console
+script a dependency brings (``httpx``, ``uvicorn``, ``tqdm``, ``pygmentize``, …).
 
-The consequence is the failure this module exists to remove (issue #409, found by the live
-acceptance run rather than by any test). On a MemPalace-provider agent the harness publishes its
-palace binding into ``~/.mempalace/config.json`` precisely so that a **bare** ``mempalace status``
-reads the live palace — and then the agent's own `shell` tool answered ``mempalace: command not
-found``, because ``/home/<agent>/venv/bin`` was not on the PATH it spawned with. The documented
-CLI worked only for someone who already knew the private venv path and typed it every time: the
-same knowing-the-private-path defect #409 exists to remove, one layer up.
+The history, because the contract changed knowingly
+--------------------------------------------------
+Issue #409 found that a wake, launched by absolute path, activates nothing, so the agent's `shell`
+tool answered ``mempalace: command not found``. The fix put the environment's whole ``bin`` on the
+child's ``PATH`` under the contract *reachable, not first*. Measured on a fleet server on
+2026-11-21 (issue #969), that made three things true that an agent's ``~/software`` law forbids:
+``python3``, ``pip`` and ``pip3`` resolved to the harness's own environment, so a plain
+``pip install`` installed **into the harness** (four agents had packages there the harness never
+brought); ``~/.local/bin`` sat ahead of that directory, so a link there could replace a harness
+command; and every dependency's script shadowed a tool an agent installed for itself.
 
-Derived, never configured
--------------------------
-The directory is read off ``sys.executable`` **at spawn time**, so it is whatever venv this
-process is actually running from. There is no env var, no config key, and nothing for provisioning
-to mirror: move or rebuild the venv and the next wake derives the new location, because it *is*
-the running interpreter's location. That is the same property that makes the palace publication
-safe — a projection of the binding, never an input to it — and it is why the alternatives were
-rejected. A symlink into ``/usr/local/bin`` is *shared*, so it collapses per-agent isolation the
-moment a second agent lands on the box (the same isolation the palace lives under ``$HARNESS_HOME``
-to preserve); a ``PATH`` written into ``agent.env`` or a wrapper script is a second source of truth
-that goes stale the first time a venv moves, silently, with nothing able to say so.
+The founder's decision (`@origin`, 2026-11-21, issue #969) is the contract now: **only the
+harness's own commands are on an agent's PATH, from a directory that holds nothing else, placed
+first.** Its requirements, each with a tempting broken form:
 
-It only ever **adds**, and only when the directory is not already there: an operator who activated
-the venv, or who ordered ``PATH`` deliberately, is left exactly as they are. On an interpreter that
-is not in a venv at all (a system ``python3``) the directory is ``/usr/bin``, which is already on
-every sane PATH — so this is a no-op for a non-venv install rather than a reordering of it.
+- **Remove, do not cover.** The environment's ``bin`` is taken **off** the ``PATH`` (`spawn_env`,
+  `path_preamble`). Putting a curated directory in front of it and leaving the old entry in place
+  still resolves ``python3`` to the harness.
+- **The allowlist is the harness's own console scripts plus ``mempalace``** (`own_commands`) — read
+  from this distribution's installed metadata, so there is no second list to go stale. Not the
+  interpreter, not ``pip``, not a dependency's scripts, and not ``mempalace-mcp`` or
+  ``mempalace-light-mcp``: their shebangs are absolute and they are started by path.
+- **Derived, never configured.** The links point into the directory ``sys.executable`` sits in, read
+  at spawn. No env var, no config key, nothing for provisioning to mirror: a moved or rebuilt venv
+  is followed by the next wake because it *is* the running interpreter's location.
+- **First, and after the profile.** The `shell` tool runs ``/bin/bash -lc``, a login shell, and
+  some ``/etc/profile``s assign ``PATH`` outright (Debian's does; macOS's ``path_helper`` rebuilds
+  and reorders it). So `spawn_env` is only half of it: `path_preamble` is one line of shell placed
+  ahead of the model's command, which runs **after** the profile, removes the environment's
+  ``bin`` from whatever the profile built, and puts the commands directory in front. The order the
+  command sees is: the commands directory, then what the profile built (``~/.local/bin`` first on
+  a fleet server), then the system.
+- **Every subprocess, not only the shell**, and on every machine, not only a fleet server.
 
-Two mechanisms for the shell, because one is not enough
-------------------------------------------------------
-The `shell` tool runs its command through ``/bin/bash -lc`` — a **login** shell, deliberately, so
-the profile is sourced and the agent's terminal matches a human's. That is what makes an inherited
-PATH insufficient on its own: a login shell sources ``/etc/profile`` *before* running the command,
-and some distributions' ``/etc/profile`` **assigns** ``PATH`` outright rather than appending to it
-(Debian's does; macOS's ``path_helper`` rebuilds and reorders it). An inherited prepend is
-discarded there — invisibly, with the tool working perfectly and only the console script missing.
+The commands directory
+----------------------
+A directory of symlinks, one per allowlisted name present in the environment's ``bin``, made by this
+process with `tempfile.mkdtemp` (mode ``0700``) the first time something is spawned, and named
+``basecradle-harness-commands-<pid>-<random>``. A symlink is enough because a console script's
+interpreter is named by its own shebang (absolute, or ``realpath``-relative in a relocatable venv),
+never by the ``PATH`` it runs under. It is per process because it can be: a wake is one process, and
+a directory nothing else writes to is one that holds nothing else.
 
-So both halves are used, and they cover different things:
+**Whatever creates, cleans up.** The process removes its own directory at exit (`atexit`). A process
+that dies without running `atexit` — killed, or stopped, since `_stop.die` ends a stopped wake by
+its signal — leaves it behind, so the next process to make one removes its predecessors: an entry
+in the same place, by this exact name, owned by this user, untouched for `STRANDED_AFTER` **and**
+whose stamped pid is dead (`_sweep_stranded`). Age is never the reason by itself.
 
-- `with_interpreter_bin` prepends the directory to the child's inherited environment. This is what
-  keeps the venv **first** when a profile merely appends to what it was given, and it is the whole
-  fix for a subprocess spawned without a shell at all (an MCP stdio server, whose ``command`` is
-  resolved against the ``PATH`` it is handed).
-- `path_preamble` is one line of shell placed ahead of the model's command, so it runs *after* the
-  profile has had its say. This is the half that holds **by construction**, on any POSIX box,
-  whatever the profile does.
+**Losing it costs reachability, never the removal.** If the directory cannot be made (a read-only
+temp directory, a path that cannot be a ``PATH`` entry), the environment's ``bin`` still leaves the
+``PATH`` and one WARNING says the harness's commands are not reachable by name this wake. The
+removal is the property the decision is about; the reach is the convenience #409 asked for.
 
-**The contract is *reachable*, not *first*.** Both halves are idempotent and match the directory
-the same way — a literal, exact ``PATH`` entry — so a profile that kept the inherited prepend
-costs no duplicate, and one that kept it *and moved it* is left as it is (macOS's ``path_helper``
-does exactly this: measured, the directory came back present at position 12 of 20). Prepending
-unconditionally would guarantee the lead at the price of a duplicate on every well-behaved box,
-and re-ordering a ``PATH`` the box deliberately arranged is not this module's business. On the
-common case — a profile that leaves ``PATH`` alone — the inherited prepend leaves it first anyway.
+On an interpreter that is not in a virtual environment (a system ``python3``, where
+``sys.prefix == sys.base_prefix``) its ``bin`` is the system's own, so nothing is removed: there is
+no separate environment to take away, and removing ``/usr/bin`` would break the box.
+
+Its one residual, named: a background process the agent starts from a `shell` call keeps the
+directory on its ``PATH`` after the wake that made it has exited and removed it, so in that process
+the harness's commands are reachable only by absolute path.
 """
 
 from __future__ import annotations
 
+import atexit
+import functools
+import importlib.metadata
+import logging
 import os
+import re
 import shlex
+import shutil
 import sys
-from collections.abc import Mapping
+import tempfile
+import threading
+import time
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
+_log = logging.getLogger("basecradle_harness")
+
 _PATH = "PATH"
+
+#: The distribution whose console scripts are the harness's own commands.
+_DISTRIBUTION = "basecradle-harness"
+
+#: The one command from outside this distribution on the allowlist (issue #969): the palace's own
+#: CLI, which a bare ``mempalace status`` must reach (issue #409).
+MEMPALACE = "mempalace"
+
+#: The commands directory's name, ahead of the pid and `tempfile.mkdtemp`'s random suffix.
+_PREFIX = "basecradle-harness-commands-"
+_STAMPED = re.compile(rf"^{re.escape(_PREFIX)}(?P<pid>\d+)-[^{re.escape(os.sep)}]+$")
+
+#: How long another process's commands directory must sit untouched, with its pid dead, before it
+#: is called stranded and removed. A live wake re-links into its own directory on every spawn, and
+#: its pid is alive besides; an hour is far past any doubt that two clocks or pid namespaces can
+#: raise. The same reasoning, and the same hour, as the orphan sweep's ``STRANDED_AFTER``.
+STRANDED_AFTER = 60 * 60
+
+#: Where the commands directory is made: `tempfile.gettempdir` when ``None``. A test points it at
+#: its own ``tmp_path``.
+_PARENT: str | None = None
+
+_lock = threading.Lock()
+
+#: The directory this process made, and the environment ``bin`` its links point into.
+_made: tuple[str, str] | None = None
+
+#: Every directory this process made, removed at exit; with the pid that made them, so a forked
+#: child's exit never removes its parent's.
+_owned: list[tuple[int, str]] = []
+
+_warned = False
 
 
 def interpreter_bin_dir() -> str | None:
@@ -77,10 +128,9 @@ def interpreter_bin_dir() -> str | None:
 
     ``Path(sys.executable).parent`` — a venv's ``bin/`` when the harness runs from one, and the
     system ``bin`` when it does not. ``None`` in the three cases where there is nothing honest to
-    add: an interpreter that reports no ``sys.executable`` at all (an embedded/frozen host), a
-    directory that does not exist, and — the one worth naming — a directory whose name contains
-    ``os.pathsep``, which simply *cannot* be represented as a ``PATH`` entry. Prepending it would
-    not fail; it would silently split into two wrong entries.
+    use: an interpreter that reports no ``sys.executable`` at all (an embedded/frozen host), a
+    directory that does not exist, and a directory whose name contains ``os.pathsep``, which
+    *cannot* be represented as a ``PATH`` entry and would silently split into two wrong ones.
     """
     executable = sys.executable
     if not executable:
@@ -91,53 +141,236 @@ def interpreter_bin_dir() -> str | None:
     return bin_dir if os.path.isdir(bin_dir) else None
 
 
-def with_interpreter_bin(env: Mapping[str, str] | None = None) -> dict[str, str]:
-    """A copy of `env` (default: this process's) with `interpreter_bin_dir` first on ``PATH``.
+def _in_virtual_environment() -> bool:
+    """True when this interpreter runs from a virtual environment of its own."""
+    return sys.prefix != sys.base_prefix
 
-    Never mutates its argument, never removes an entry, and never reorders one that is already
-    there: a ``PATH`` that already names the directory is returned untouched, so an activated venv
-    or a deliberately-ordered ``PATH`` is not second-guessed. The match is exact string equality
-    against the split entries — the same test `path_preamble` makes in shell, so the two agree.
 
-    A missing ``PATH`` is filled with the directory plus ``os.defpath``, not with the directory
-    alone: an env with no ``PATH`` resolves against ``os.defpath`` today, and replacing that with a
-    one-entry ``PATH`` would take ``/bin`` and ``/usr/bin`` away from the child. The leading empty
-    entry POSIX ``os.defpath`` carries (which means *the current directory*) is dropped rather than
-    passed on.
+@functools.cache
+def own_commands() -> tuple[str, ...]:
+    """The allowlist: this distribution's console scripts, plus `MEMPALACE`, sorted.
+
+    Read from the installed distribution's metadata, the record the installer wrote the scripts
+    from, so it cannot disagree with what is in ``bin``. A harness running without its metadata
+    (vendored, not installed) has no console scripts to name and contributes only `MEMPALACE`.
     """
-    result = dict(os.environ if env is None else env)
+    try:
+        points = importlib.metadata.distribution(_DISTRIBUTION).entry_points
+    except importlib.metadata.PackageNotFoundError:
+        names: set[str] = set()
+    else:
+        names = {point.name for point in points if point.group == "console_scripts"}
+    return tuple(sorted(names | {MEMPALACE}))
+
+
+def _process_alive(pid: int) -> bool:
+    """Is a process with this pid running? One another user owns is running."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OverflowError, ValueError):
+        return False  # a number no process can hold
+    return True
+
+
+def _parent() -> str:
+    return _PARENT or tempfile.gettempdir()
+
+
+def _sweep_stranded(parent: str) -> None:
+    """Remove the commands directories processes that are gone left in `parent` (see the module).
+
+    Only an entry this harness names, owned by this user, a real directory (never a link), untouched
+    for `STRANDED_AFTER`, whose stamped pid is dead. Best-effort: a directory that cannot be listed
+    or removed is left, and the next process to make one tries again.
+    """
+    now = time.time()
+    try:
+        entries = list(os.scandir(parent))
+    except OSError:
+        return
+    for entry in entries:
+        match = _STAMPED.match(entry.name)
+        if match is None or int(match["pid"]) == os.getpid():
+            continue
+        try:
+            stat = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        if hasattr(os, "geteuid") and stat.st_uid != os.geteuid():
+            continue
+        if now - stat.st_mtime < STRANDED_AFTER or _process_alive(int(match["pid"])):
+            continue
+        shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _link(path: str, target: str) -> None:
+    """Make `path` a symlink to `target`, atomically, unless it already is one."""
+    try:
+        if os.readlink(path) == target:
+            return
+    except OSError:
+        pass
+    staged = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.unlink(staged)
+    except FileNotFoundError:
+        pass
+    os.symlink(target, staged)
+    os.replace(staged, path)
+
+
+def _remove_owned() -> None:
+    """At exit: remove every commands directory this process made."""
+    for pid, path in _owned:
+        if pid == os.getpid():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_remove_owned)
+
+
+def _reset() -> None:
+    """Forget the directory this process made, for a test that points `_PARENT` somewhere new."""
+    global _made, _warned
+    with _lock:
+        _made = None
+        _warned = False
+
+
+def commands_dir() -> str | None:
+    """The directory holding links to the harness's own commands, made on first use, or ``None``.
+
+    ``None`` when there is no interpreter directory, when none of `own_commands` is in it, or when
+    the directory cannot be made — that last case logged once at WARNING. Re-links on every call,
+    so a command the environment gained after the directory was made (``mempalace`` installed
+    under a running wake) is reachable at the next spawn, and a directory removed under the process
+    is made again.
+    """
+    global _made, _warned
     bin_dir = interpreter_bin_dir()
     if bin_dir is None:
-        return result
+        return None
+    links = {
+        name: os.path.join(bin_dir, name)
+        for name in own_commands()
+        if os.path.isfile(os.path.join(bin_dir, name))
+    }
+    if not links:
+        return None
+    with _lock:
+        try:
+            made = _made[0] if _made is not None and _made[1] == bin_dir else None
+            if made is None or not os.path.isdir(made):
+                parent = _parent()
+                _sweep_stranded(parent)
+                made = tempfile.mkdtemp(prefix=f"{_PREFIX}{os.getpid()}-", dir=parent)
+                if os.pathsep in made:
+                    os.rmdir(made)
+                    raise OSError(f"{made!r} cannot be a PATH entry")
+                _owned.append((os.getpid(), made))
+                _made = (made, bin_dir)
+            for name, target in links.items():
+                _link(os.path.join(made, name), target)
+        except OSError as error:
+            if not _warned:
+                _warned = True
+                _log.warning(
+                    "harness commands are not on the PATH of what this process spawns, "
+                    "because their directory could not be made: %s",
+                    error,
+                )
+            return None
+    return made
+
+
+def _dropped(entries: Iterable[str]) -> set[str]:
+    """The ``PATH`` entries that name this interpreter's environment ``bin``, as literal strings.
+
+    Empty outside a virtual environment (see the module). Inside one: the directory as derived and
+    as resolved, each with and without a trailing separator, plus any absolute entry of `entries`
+    that is the same directory under another spelling (a symlinked alias).
+    """
+    bin_dir = interpreter_bin_dir()
+    if bin_dir is None or not _in_virtual_environment():
+        return set()
+    forms = {bin_dir, os.path.realpath(bin_dir)}
+    forms |= {form.rstrip(os.sep) + os.sep for form in forms}
+    for entry in entries:
+        if entry and os.path.isabs(entry) and entry not in forms:
+            try:
+                if os.path.samefile(entry, bin_dir):
+                    forms.add(entry)
+            except OSError:
+                continue
+    return forms
+
+
+def spawn_env(env: Mapping[str, str] | None = None, *, commands: bool = True) -> dict[str, str]:
+    """A copy of `env` (default: this process's) with the harness's ``PATH`` contract applied.
+
+    The interpreter's environment ``bin`` is removed from ``PATH`` in every spelling `_dropped`
+    finds, and, when `commands` is true and there is one, `commands_dir` goes first. Every other
+    entry keeps its place, empty ones included. Never mutates its argument.
+
+    A missing ``PATH`` stays missing when there is nothing to add (the child resolves against
+    ``os.defpath`` as it would have), and becomes the commands directory plus ``os.defpath`` when
+    there is, so ``/bin`` and ``/usr/bin`` are not taken from the child. The leading empty entry
+    POSIX ``os.defpath`` carries (*the current directory*) is dropped rather than passed on.
+
+    `commands` false is for a child that runs nothing of the harness's (``journalctl``): the
+    environment still leaves its ``PATH``, and no directory is made for it.
+    """
+    result = dict(os.environ if env is None else env)
     current = result.get(_PATH)
     if current is None:
-        result[_PATH] = os.pathsep.join([bin_dir, os.defpath.lstrip(os.pathsep)])
-    elif bin_dir not in current.split(os.pathsep):
-        result[_PATH] = os.pathsep.join([bin_dir, current]) if current else bin_dir
+        entries = os.defpath.lstrip(os.pathsep).split(os.pathsep)
+    else:
+        entries = current.split(os.pathsep) if current else []
+    first = commands_dir() if commands else None
+    drop = _dropped(entries) | ({first} if first else set())
+    kept = [entry for entry in entries if entry not in drop]
+    if current is None and first is None:
+        return result
+    result[_PATH] = os.pathsep.join([first, *kept] if first else kept)
     return result
 
 
-def path_preamble() -> str:
-    """One line of POSIX shell that puts `interpreter_bin_dir` on ``PATH``, idempotently.
+def path_preamble(env: Mapping[str, str] | None = None) -> str:
+    """One line of POSIX shell applying the same contract as `spawn_env`, after the profile ran.
 
     Placed ahead of a model-authored command so it runs *after* the login shell has sourced the
-    profile — the half of the fix that survives a profile which assigns ``PATH`` outright (see the
-    module docstring). Empty string when there is nothing to add, so a caller splices it in only
-    when it says something.
+    profile — the half that survives a profile which assigns ``PATH`` outright. It walks ``PATH``
+    entry by entry, drops every spelling of the environment ``bin`` that `_dropped` finds in `env`
+    (default: this process's) and the commands directory itself, keeps the rest in order (empty
+    entries included), and puts the commands directory in front. Empty string when there is
+    nothing to remove and nothing to add, so a caller splices it in only when it says something.
 
-    The directory is held in a shell variable rather than written into the ``case`` pattern
-    directly: a quoted expansion is matched **literally** in a pattern, so a path containing a glob
-    character (``*``, ``?``, ``[``) cannot turn the presence test into a wildcard match. The
-    variable is unset afterwards, so the model's command sees the shell it would have seen anyway.
-    ``${PATH:+:$PATH}`` is what keeps an empty ``PATH`` from gaining a trailing empty entry, which
-    a shell reads as the current directory.
+    Every dropped spelling is written into the ``case`` pattern **quoted** (`shlex.quote`), and the
+    commands directory is matched through a quoted expansion, so a glob character in a path is
+    matched literally and can never turn the test into a wildcard. ``${PATH-}`` keeps a profile
+    running under ``set -u`` working, an empty ``PATH`` gains no empty entry (which a shell reads as
+    the current directory), and every variable the line uses is unset afterwards, so the model's
+    command sees the shell it would have seen anyway.
     """
-    bin_dir = interpreter_bin_dir()
-    if bin_dir is None:
+    source = os.environ if env is None else env
+    current = source.get(_PATH)
+    first = commands_dir()
+    drop = _dropped(current.split(os.pathsep) if current else [])
+    patterns = (['"$__bc_c"'] if first else []) + [shlex.quote(form) for form in sorted(drop)]
+    if not patterns:
         return ""
+    assign = 'PATH="$__bc_c$__bc_p"' if first else 'PATH="${__bc_p#:}"'
     return (
-        f"__bc_bin={shlex.quote(bin_dir)}; "
-        'case ":$PATH:" in *":$__bc_bin:"*) ;; '
-        '*) PATH="$__bc_bin${PATH:+:$PATH}"; export PATH ;; esac; '
-        "unset __bc_bin"
+        f"__bc_c={shlex.quote(first or '')}; __bc_p=; __bc_r=${{PATH-}}; "
+        'case "$__bc_r" in "") ;; *) __bc_r="$__bc_r:"; '
+        'while [ -n "$__bc_r" ]; do __bc_e="${__bc_r%%:*}"; __bc_r="${__bc_r#*:}"; '
+        f'case "$__bc_e" in {"|".join(patterns)}) ;; *) __bc_p="$__bc_p:$__bc_e" ;; esac; '
+        "done ;; esac; "
+        f"{assign}; export PATH; unset __bc_c __bc_p __bc_r __bc_e"
     )
