@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.204.3] - 2026-11-21
+
+### Changed: Your Home names the seventh standing folder, `~/software` (issue #964)
+
+The agent's home gains a seventh standing folder, `~/software`, for programs an agent installs or compiles for itself, catalogued in its `INDEX.md` and linked into `~/.local/bin` (basecradle-noc#1664). `src/basecradle_harness/_agent_home/your-home.md` is re-synced byte for byte from the NOC's canonical (`deploy/agent-home/your-home.md` at `e743c8e`), and every place that named six folders names seven: the README's Your Home section, the `shell` tool's note, the brief's docstrings, and the checksum `tests/test_brief.py` pins. No behavior changes: the shell already runs a login shell, so `~/.local/bin` is on the PATH when it exists.
+
 ## [0.204.2] - 2026-11-21
 
 ### Changed: The Anthropic price table re-read against the page, and Claude Fable 5.2 priced (issue #959)

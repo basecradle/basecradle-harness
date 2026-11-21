@@ -86,7 +86,7 @@ def test_the_note_is_the_text_the_handoff_specified():
     assert _shipped_shell_plugin().note == (
         "Full shell as your OS user — unlocked-profile only. Runs arbitrary commands, code, and "
         "network calls with no sandbox beyond your Unix permissions. Your home directory and its "
-        'six standing folders are described under "Your Home" in your instructions; each '
+        'seven standing folders are described under "Your Home" in your instructions; each '
         "folder's README is its law. The command-line tools installed alongside your harness are "
         "on your PATH — run them by name (`mempalace status` reads your own memory palace, if "
         "that is your backend)."

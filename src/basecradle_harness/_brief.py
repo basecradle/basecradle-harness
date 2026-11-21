@@ -38,7 +38,7 @@ The brief is composed, in order, of a current-time anchor followed by four parts
    described itself in its ``initialize`` ``instructions`` or carries an operator's ``note``, both,
    each labelled with whose words it is. Right after the safe-by-default notice that names the
    servers, so an agent reads which servers it has, then what they are.
-2c. **Your Home** (`render_your_home`, issue #571) — the agent's home directory, its six standing
+2c. **Your Home** (`render_your_home`, issue #571) — the agent's home directory, its seven standing
    folders and the law that governs each, and the binding for `~/vault`. Composed for every agent
    that holds the ``SHELL`` capability — the only way to reach those folders — from the same
    packaged bytes (`_agent_home/your-home.md`, a verbatim copy of the NOC's canonical) on the same
@@ -271,7 +271,7 @@ def render_your_home(tools: Iterable[object]) -> str | None:
     """The brief's ``your_home`` part for an agent with a shell, or ``None`` (issue #571).
 
     **One question decides it, and it is about the agent's capability, never its words:** does a
-    registered tool require ``SHELL``? The six folders are reachable only through a shell on the
+    registered tool require ``SHELL``? The seven folders are reachable only through a shell on the
     agent's own machine, so an agent that has one needs their law, and an agent that does not would
     be reading rules about places it cannot go. The policy layer is what grants ``SHELL`` (the
     unlocked profile, plus the ``shell`` opt-in), so a tool that holds it is the fact of a shell

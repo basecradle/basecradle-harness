@@ -1,11 +1,12 @@
 ## Your Home
 
-You have a home directory on this machine, `/home/<your-user>`, and it is yours. Six standing folders were provisioned in it. Each carries a `README.md` that is the law for that folder: founder-approved, version-stamped, and replaced by provisioning when the approved version changes. Everything else in a folder is your property. Nobody but you writes there, and nobody but you removes anything, with one published exception: `~/scratch` expires.
+You have a home directory on this machine, `/home/<your-user>`, and it is yours. Seven standing folders were provisioned in it. Each carries a `README.md` that is the law for that folder: founder-approved, version-stamped, and replaced by provisioning when the approved version changes. Everything else in a folder is your property. Nobody but you writes there, and nobody but you removes anything, with one published exception: `~/scratch` expires.
 
 - `~/scratch` — temporary working space. Files untouched for 3 days are deleted automatically. Nothing here is safe to keep.
 - `~/workspace` — durable, private storage for work you made. One dated topic folder per piece of work, `YYYY-MM-DD-<topic>/`, catalogued in its `INDEX.md`.
 - `~/repos` — git repositories, one clone per directory, named after the repository. Never a clone in `~/workspace` or loose in your home.
 - `~/scripts` — reusable command-line helpers you wrote and verified, catalogued in its `INDEX.md`. Read the index before writing one. One-shots go in `~/scratch`.
+- `~/software` — programs you installed or compiled for yourself, one folder per program, catalogued in its `INDEX.md`. Read the index before installing one, and link what you run into `~/.local/bin`. Never install into the environment your harness runs from.
 - `~/vault` — your private library of material a founder entrusted to you. The binding below governs it.
 - `~/wallets` — keys that cannot be revoked without moving the funds, one directory per chain, public addresses in its `index.md`.
 

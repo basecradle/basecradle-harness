@@ -3209,7 +3209,7 @@ class WakeAgent:
         shipped default that failed to load), the **safe-by-default opt-out notice** (active MCP
         servers / policy-refused drop-ins — omitted when there are none), what each **MCP server**
         is (`render_mcp` — omitted when none has anything to say), **Your Home** (`render_your_home`
-        — the six standing folders and their law, composed for every agent holding the ``SHELL``
+        — the seven standing folders and their law, composed for every agent holding the ``SHELL``
         capability and for no other, issue #571), the live `dashboard.md` primer (fetched fresh each
         wake; a fetch failure degrades to omitting it, never breaking the wake), the memory
         provider's recalled **context** for this turn (its `context` hook — omitted when there is
