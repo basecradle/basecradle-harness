@@ -7,6 +7,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.204.1] - 2026-11-21
+
+### Fixed: The outage notice's own delivery held only on a timeline that already had a mark (issue #957)
+
+The capital's canary proof of 0.204.0 found the notice still starting a second chain of attempts: the notice's delivery woke `@jt`, and that wake re-drove the waiting message (`re-driving … reason=died_in_model_call`) instead of writing `wake skipped reason=outage_notice`. The re-drive was the symptom; the hold had already judged wrongly. On a timeline where nothing had settled yet, so no mark, the hold read the bootstrap's window and counted every unclaimed peer message as untried, including the older message the first wake had deliberately seeded as context and never claimed.
+
+- **An unclaimed item is untried only above what the wake that gave up read**: above the newest item any wake claimed in that stream. One below it was read past and left as context, so it holds; one above it landed after that wake's read (during the last attempt's retries) and still starts the work. A stream in which no listed item is claimed has no read point, so an unclaimed peer item there still attempts the work, as before.
+- **A wake that declines the hold says why**, in one INFO line naming the item: `Timeline <uuid> has an outage notice, and <kind> item <uuid> has not been tried; attempting the waiting work.`
+- **The test reproduces the canary's sequence**: four real attempts, the last posting the notice, then the notice's delivery, on a timeline the agent answers for the first time and on one with a mark.
+- **Fleet effect:** after the NOC converges this release, the notice is followed by one held wake on a timeline the agent answers for the first time, as on one it already had a mark on. One case still attempts the work by design: a stream the giving-up wake never reached that holds an older peer item no wake claimed (it may never have been tried), which costs at worst the one extra chain, never an item.
+
 ## [0.204.0] - 2026-11-20
 
 ### Changed: A retried attempt is not a failure, and the outage notice does not start a new chain (issue #957)
