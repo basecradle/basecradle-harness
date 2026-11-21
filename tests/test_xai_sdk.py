@@ -30,6 +30,7 @@ from basecradle_harness import (
     ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderServerError,
     ProviderTimeoutError,
     ProviderToolSchemaError,
     ToolCall,
@@ -37,7 +38,7 @@ from basecradle_harness import (
     XaiSdkProvider,
 )
 from basecradle_harness._engine import _TRANSIENT
-from basecradle_harness._retry import connection_reason
+from basecradle_harness._retry import connection_reason, fault_slug
 from basecradle_harness._xai_sdk import CONVERSATION_METADATA_KEY
 from tests.conftest import mail_tool, tool_lines
 
@@ -466,6 +467,164 @@ def test_an_unavailable_endpoint_is_retried_and_reads_transport():
     assert isinstance(raised.value, _TRANSIENT)
     assert not isinstance(raised.value, ProviderTimeoutError)
     assert connection_reason(raised.value) == "transport"
+
+
+#: The detail gRPC core wrote for the 2026-11-21 edge failure, byte for byte (issue #962): the
+#: endpoint's edge answered HTTP 525, and gRPC folded it into ``UNKNOWN``.
+_EDGE_525 = "Received http2 header with status: 525"
+
+
+def _raising_detail(code, detail):
+    return XaiSdkProvider(
+        "grok-4.3", api_key=FAKE_KEY, client=_RaisingClient(_FakeRpcError(code, details=detail))
+    )
+
+
+def test_the_edge_525_that_gave_up_on_its_first_attempt_is_a_retried_5xx():
+    """The incident's own error (issue #962): ``UNKNOWN`` carrying an HTTP 525 is the server's 5xx.
+
+    It fell through to a plain `ProviderError`, so the call gave up on ``attempt=1/3`` as
+    ``provider_error``. A 525 is the edge failing to reach the origin: transient, and the shared
+    5xx class every HTTP adapter raises for the same status.
+    """
+    with pytest.raises(ProviderServerError) as raised:
+        _raising_detail(grpc.StatusCode.UNKNOWN, _EDGE_525).chat([Message.user("hi")])
+
+    assert isinstance(raised.value, _TRANSIENT)
+    assert raised.value.status_code == 525
+    assert str(raised.value) == f"xAI gRPC error (UNKNOWN): {_EDGE_525}"
+
+
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [
+        *((grpc.StatusCode.UNKNOWN, s) for s in (500, 501, 505, *range(520, 528))),
+        # gRPC core folds these two into UNAVAILABLE; they are the server's 5xx all the same.
+        *((grpc.StatusCode.UNAVAILABLE, s) for s in (502, 503)),
+    ],
+)
+def test_every_edge_5xx_is_the_server_class_whatever_code_grpc_folded_it_into(code, status):
+    """The category, not the case: any 5xx gRPC kept in its detail, under either code it uses."""
+    with pytest.raises(ProviderServerError) as raised:
+        _raising_detail(code, f"Received http2 header with status: {status}").chat(
+            [Message.user("hi")]
+        )
+
+    assert raised.value.status_code == status
+
+
+@pytest.mark.parametrize(
+    ("code", "status", "slug"),
+    [
+        # Every row of `docs/telemetry.md` -> Fault Slugs, under the code gRPC core folds it into.
+        (grpc.StatusCode.UNAUTHENTICATED, 401, "config:auth"),
+        (grpc.StatusCode.PERMISSION_DENIED, 403, "config:auth"),
+        (grpc.StatusCode.UNKNOWN, 402, "config:billing"),
+        (grpc.StatusCode.UNIMPLEMENTED, 404, "config:model_not_found"),
+        (grpc.StatusCode.UNKNOWN, 413, "payload_too_large"),
+        (grpc.StatusCode.UNAVAILABLE, 429, "rate_limited"),
+        (grpc.StatusCode.UNAVAILABLE, 504, "timeout"),
+        (grpc.StatusCode.UNKNOWN, 525, "server_error"),
+        (grpc.StatusCode.INTERNAL, 400, "api_error"),
+        (grpc.StatusCode.UNKNOWN, 418, "api_error"),
+    ],
+)
+def test_a_folded_http_status_is_named_as_every_http_adapter_names_it(code, status, slug):
+    """A fault known by its HTTP status is named by the Fault Slugs table on every producer (#786).
+
+    gRPC keeps the status only in its detail, so before issue #962 the code named it instead: a
+    504 read ``transport`` (where the table says ``timeout``), a 429 ``transport`` (``rate_limited``),
+    a 400 under INTERNAL ``invalid_response`` and was retried (``api_error``, which propagates).
+    """
+    with pytest.raises(ProviderError) as raised:
+        _raising_detail(code, f"Received http2 header with status: {status}").chat(
+            [Message.user("hi")]
+        )
+
+    assert fault_slug(raised.value) == slug
+    assert raised.value.status_code == status
+
+
+def test_a_folded_504_is_the_vendors_own_deadline():
+    """A 504 is a timeout on every vendor, retried once with more time, and the deadline is not
+    the harness's own, so its budget is never named on the line (issues #759, #589)."""
+    with pytest.raises(ProviderTimeoutError) as raised:
+        _raising_detail(grpc.StatusCode.UNAVAILABLE, "Received http2 header with status: 504").chat(
+            [Message.user("hi")]
+        )
+
+    assert raised.value.vendor_deadline is True
+    assert connection_reason(raised.value) == "timeout"
+
+
+@pytest.mark.parametrize(
+    ("code", "detail", "expected"),
+    [
+        # No HTTP status in the detail: a genuine unknown fault stays the plain, propagating error.
+        (grpc.StatusCode.UNKNOWN, "Stream removed", ProviderError),
+        # UNAVAILABLE with no status is gRPC's could-not-reach, which stays a transport failure.
+        (
+            grpc.StatusCode.UNAVAILABLE,
+            "failed to connect to all addresses",
+            ProviderConnectionError,
+        ),
+        # INTERNAL with no status is a broken payload, retried as it was (issue #259).
+        (grpc.StatusCode.INTERNAL, "Failed parsing HTTP/2", ProviderResponseError),
+        # A status-shaped sentence under a code gRPC core never folds into is not its fold.
+        (grpc.StatusCode.INVALID_ARGUMENT, _EDGE_525, ProviderError),
+    ],
+)
+def test_without_a_folded_status_the_code_decides_as_before(code, detail, expected):
+    with pytest.raises(ProviderError) as raised:
+        _raising_detail(code, detail).chat([Message.user("hi")])
+
+    assert type(raised.value) is expected
+
+
+class _FailsThenAnswers:
+    """A client whose first ``chat.create`` raises `error` and whose later ones answer `response`."""
+
+    def __init__(self, error, response):
+        self._error = error
+        self._response = response
+        self.calls = 0
+        self.chat = SimpleNamespace(create=self._create)
+
+    def _create(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            raise self._error
+        return _FakeConversation(self._response)
+
+    def close(self):
+        pass
+
+
+def test_the_edge_525_replayed_through_the_engine_is_retried_in_place_with_no_error(caplog):
+    """The definition of done for issue #962's first half, through the real adapter and engine.
+
+    The 525 is retried inside the call, the second attempt answers, and nothing written is ERROR:
+    one ``outcome=retrying`` WARNING naming ``server_error``, never ``outcome=failed``.
+    """
+    from basecradle_harness import Engine, ToolRegistry
+
+    client = _FailsThenAnswers(
+        _FakeRpcError(grpc.StatusCode.UNKNOWN, details=_EDGE_525), _response(content="answered")
+    )
+    provider = XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=client)
+    engine = Engine(provider, ToolRegistry(), sleep=lambda _s: None)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        reply = engine.run([Message.user("hi")])
+
+    assert reply.content == "answered"
+    assert client.calls == 2
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == []
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
+    retrying = [line for line in lines if "outcome=retrying" in line]
+    assert len(retrying) == 1, lines
+    assert "reason=server_error" in retrying[0] and "attempt=1/3" in retrying[0]
+    assert not any("outcome=failed" in line for line in lines), lines
 
 
 def test_a_deadline_exceeded_is_a_timeout_on_this_adapter_too():

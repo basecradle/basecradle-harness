@@ -10,7 +10,12 @@ from __future__ import annotations
 
 import pytest
 
-from basecradle_harness._faults import is_out_of_funds, is_too_large, refused_tool_schema
+from basecradle_harness._faults import (
+    folded_http_status,
+    is_out_of_funds,
+    is_too_large,
+    refused_tool_schema,
+)
 
 
 @pytest.mark.parametrize(
@@ -116,3 +121,34 @@ def test_the_bare_form_needs_the_name_where_the_vendor_puts_it():
     # A tool-schema signal is necessary but not sufficient: without a leading `NAME:` there is no
     # tool to drop, and guessing one would drop the wrong capability.
     assert refused_tool_schema("tool parameter root must be an object type") is None
+
+
+@pytest.mark.parametrize(
+    ("text", "status"),
+    [
+        ("Received http2 header with status: 525", 525),
+        ("received HTTP2 header with status:503", 503),
+        ("Received http2 header with status: 429", 429),
+        ("upstream said: Received http2 header with status: 404 (trailers)", 404),
+    ],
+)
+def test_folded_http_status_reads_grpc_cores_own_sentence(text, status):
+    """gRPC core's wording for a non-200 HTTP/2 response, the one place the status survives."""
+    assert folded_http_status(text) == status
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        None,
+        "",
+        "Received http2 header with status: 5250",  # four digits is no HTTP status
+        "Received http2 header with status: 52",
+        "Received http2 header with status: 700",
+        "Received http2 header with status:  525",  # not the library's spacing
+        "status: 525",  # a number without the library's sentence
+        "Stream removed",
+    ],
+)
+def test_folded_http_status_stays_quiet_on_anything_else(text):
+    assert folded_http_status(text) is None
