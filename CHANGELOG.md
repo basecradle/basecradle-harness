@@ -30,10 +30,10 @@ One wake of an agent on xAI, 2026-11-21: the edge answered a model call with HTT
 
 The router runs an exit `1` again inside one attempt (its quick tries), and every one of them wrote `ERROR wake failed`, because the harness could not tell a try that would be repeated from the last one. With basecradle-router#533 the router says which try a wake is, `BASECRADLE_WAKE_TRY` of `BASECRADLE_WAKE_TRIES`.
 
-- **A fault another quick try follows is deferred**, by #957's rule: no `wake failed` at any level, and `wake end … outcome=deferred` carries the error as **`error=`**, so the one line that says what went wrong is kept. A crash nothing caught is reported at `WARNING`, traceback and all. A wake whose setup failed, and so writes no `wake end`, says its error once at `WARNING`.
+- **A fault another quick try follows is deferred**, by #957's rule: no `wake failed` at any level, and `wake end … outcome=deferred` carries the error as **`error=`**, so the one line that says what went wrong is kept. A crash nothing caught is reported at `WARNING`, traceback and all. A wake whose setup failed, and so writes no `wake end`, says its error in a `WARNING` instead. An error with no text is named by its type, so `error=` is never empty.
 - **Each exit asks the pair the router answers it with:** an outage (exit `75`) asks the attempt pair, as before; any other fault (exit `1`) asks the try pair. The exit codes do not move.
 - **The last try, and a wake without the variables (or with a broken pair), fail as before:** `outcome=error`, the ERROR lines. A retry is never guessed.
-- **Two contract changes** in `docs/telemetry.md`: `deferred` on `wake end` now also means "another quick try follows", and `wake end` gains `error`, present only on a `deferred` wake that ended on a raise. The fleet's `wake_failed` reads `outcome=error` only, so no page moves; the log extraction learns the new field in step, through the pre-roll check.
+- **Two contract changes** in `docs/telemetry.md`: `deferred` on `wake end` now also means "another quick try follows", and `wake end` gains `error`, present only on a `deferred` wake that ended on a raise. The fleet's `wake_failed` reads `outcome=error` only, so no page moves. The fleet's log extraction learns the new field before the roll, through the capital's pre-roll check (its ruling on issue #962).
 
 ### Changed: Your Home names the seventh standing folder, `~/software` (issue #964)
 

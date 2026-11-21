@@ -526,7 +526,7 @@ Another pass of the same wake, because work arrived while it ran.
 |---|---|---|---|
 | `timeline` | Common. | The wake. | Never. |
 | `outcome` | `ok` (every reconcile returned, or the wake held for its outage notice: `wake skipped reason=outage_notice`), `error`, `deferred` (the router runs this wake again after the exit it makes, so it is not a failure: an outage exits `75` and another of the router's attempts follows, `BASECRADLE_WAKE_ATTEMPT` below `BASECRADLE_WAKE_ATTEMPTS`, matching the router's own `stage=wake outcome=deferred`, issue #957; or any other fault exits `1` and another of the router's quick tries inside the attempt follows, `BASECRADLE_WAKE_TRY` below `BASECRADLE_WAKE_TRIES`, basecradle-router#533, issue #962), or `stopped` (the wake received SIGTERM — the router's `stop-wake` — and settled what it held; it matches the router's own `stage=wake outcome=stopped`, and is not a failure: the fleet's `wake_failed` reads `outcome=error` only). An outage on the last attempt, a fault on the last try, and either on a wake run without the variables its exit asks, is `error`. | The wake. | Never. |
-| `error` | The fault the wake ended on, as the `wake failed` line it does not write would have said it. | The wake. | `outcome` is not `deferred`, or the wake returned deferred (a resume absorbed the outage, and the item's own lines say why). |
+| `error` | The fault the wake ended on: its text, or its type when it has none. | The wake. | `outcome` is not `deferred`, or the wake returned deferred (a resume absorbed the outage, and the item's own lines say why). |
 | `signal` | The signal that stopped the wake, without its `SIG` prefix: `TERM`. | The wake. | `outcome` is not `stopped`. |
 | `turns` | Turns the engine ran. | The engine. | Never. |
 | `steps` | Model steps used, as `used/budget`. | The engine. | Never. |
@@ -631,7 +631,7 @@ The debounced repeat for every later wake an out-of-funds account blocks (`_repo
 
 ### `wake failed`
 
-A wake that ended on a fault. The entrypoint exits `75` (`EX_TEMPFAIL`) when that fault is a temporary provider fault that outlasted every in-call retry (an outage, issue #951), and `1` for every other. **An ending the router runs again writes no `wake failed`**, at any level: an outage another attempt follows (issue #957), and any other fault another quick try follows (issue #962). The wake was deferred, which its `wake end … outcome=deferred error=…` says, and for an outage the call's own `llm … outcome=failed` (WARNING) says why too. A wake whose setup failed writes no `wake end`, so on a try another follows it says its error once in prose, at WARNING. It is never re-headed as `wake deferred`, the per-item line.
+A wake that ended on a fault. The entrypoint exits `75` (`EX_TEMPFAIL`) when that fault is a temporary provider fault that outlasted every in-call retry (an outage, issue #951), and `1` for every other. **An ending the router runs again writes no `wake failed`**, at any level: an outage another attempt follows (issue #957), and any other fault another quick try follows (issue #962). The wake was deferred, which its `wake end … outcome=deferred error=…` says, and for an outage the call's own `llm … outcome=failed` (WARNING) says why too. A wake whose setup failed writes no `wake end`, so on a try another follows it says its error in prose, at WARNING. It is never re-headed as `wake deferred`, the per-item line.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|

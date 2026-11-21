@@ -116,7 +116,7 @@ def another_try_follows() -> bool:
     one, answers no, so the ending stays the failure it was: a retry is never guessed. A probe
     carries ``1``/``1``, so it never reads as having a try after it.
     """
-    pair = _pair(WAKE_TRY_ENV, WAKE_TRIES_ENV, what="try", reading="one no try follows")
+    pair = _pair(WAKE_TRY_ENV, WAKE_TRIES_ENV, what="try", reading="the last try")
     return pair is not None and pair[0] < pair[1]
 
 

@@ -1113,7 +1113,7 @@ def test_an_exit_1_another_try_follows_is_deferred_with_its_error_on_wake_end(
     (end,) = _lines(caplog, "wake end ")
     line = plain(end.getMessage())
     assert "outcome=deferred" in line
-    assert 'error="invalid api key"' in line or "error=invalid" in line
+    assert 'error="invalid api key"' in line
 
 
 @pytest.mark.parametrize("last", [True, False], ids=["last_try", "outside_the_router"])
@@ -1215,3 +1215,44 @@ def test_an_uncaught_exception_is_a_warning_while_a_try_follows(quick_try, caplo
 
     (report,) = [r for r in caplog.records if "nothing caught" in r.getMessage()]
     assert report.levelno == level and report.exc_info is not None
+
+
+class _Crashes:
+    """A brain that raises an exception outside the provider taxonomy: a defect, by definition."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.model = "gpt-4o"
+
+    def chat(self, messages, tools=None):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ("error", "said"),
+    [
+        (RuntimeError("a harness defect"), 'error="a harness defect"'),
+        (RuntimeError(), "error=RuntimeError"),
+    ],
+    ids=["with_text", "without_text"],
+)
+def test_a_crash_nothing_catches_is_deferred_on_its_wake_end_too(
+    platform, tmp_path, monkeypatch, quick_try, caplog, error, said
+):
+    """An exception `_wake_once` does not catch still exits `1`, so the router's next try is coming;
+    the wake's own bookend says so, and names the fault even when it carries no text."""
+    quick_try(1)
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    agent = _agent(tmp_path, CountingProvider())
+    agent.harness.engine.provider = _Crashes(error)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="basecradle_harness"),
+        pytest.raises(RuntimeError),
+    ):
+        _wake_once(monkeypatch, agent)
+
+    assert _errors(caplog) == []
+    (end,) = _lines(caplog, "wake end ")
+    line = plain(end.getMessage())
+    assert "outcome=deferred" in line and said in line
