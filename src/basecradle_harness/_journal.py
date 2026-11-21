@@ -64,6 +64,7 @@ from collections.abc import Iterator
 from types import TracebackType
 from typing import Any
 
+from basecradle_harness._attempts import another_try_follows
 from basecradle_harness._observability import Rendered, _full_value
 
 _log = logging.getLogger("basecradle_harness")
@@ -209,7 +210,11 @@ def _uncaught(kind: type[BaseException], error: BaseException, trace: TracebackT
     if issubclass(kind, KeyboardInterrupt):
         sys.__excepthook__(kind, error, trace)
         return
-    _log.error("The wake raised an exception nothing caught.", exc_info=(kind, error, trace))
+    # Python exits `1` on it, and the router runs an exit `1` again while a quick try remains (issue
+    # #962), so until the last try it is not yet a failure: the report keeps its traceback, at
+    # WARNING. A thread's report stays ERROR, because a thread dying does not end the wake.
+    level = logging.WARNING if another_try_follows() else logging.ERROR
+    _log.log(level, "The wake raised an exception nothing caught.", exc_info=(kind, error, trace))
 
 
 def _uncaught_in_thread(args: threading.ExceptHookArgs) -> None:
