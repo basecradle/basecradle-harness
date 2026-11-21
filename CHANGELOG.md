@@ -22,6 +22,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The same on every machine**, not only a fleet server. On an interpreter outside a virtual environment nothing is removed, since its `bin` is the system's.
 - **Ships with the NOC's half**, which makes the harness environment read-only to the agent and carries the law's new text. Not to be released alone.
 
+### Fixed: A child does not inherit a variable that points an installer at the harness environment (issue #971)
+
+A harness started from an activated environment (an operator on a laptop, `uv run`) carries `VIRTUAL_ENV` naming that environment, and `uv pip install` installs wherever it points. So with the harness's `bin` already off the PATH, one variable still led an install into the harness.
+
+- **Every variable an installer reads as where to install is dropped from what the harness spawns when it names the harness's environment**, measured one at a time with uv 0.12 and pip 25: `VIRTUAL_ENV` and `CONDA_PREFIX` (`uv pip install`), `UV_PYTHON` given as a path (`uv pip install`), `UV_PROJECT_ENVIRONMENT` (`uv sync`, `uv run`), and `PIP_PYTHON`, `PIP_TARGET` and `PIP_PREFIX` (any `pip`). The environment is matched by what it is (by inode, as the `bin` is), and an interpreter or target directory counts by where it sits inside it. A variable that names anything else is the operator's own and is kept, as is a version request such as `UV_PYTHON=3.12`.
+- **Left alone, with the evidence:** `PYTHONHOME` naming a virtual environment stops an interpreter starting at all; `PYTHONPATH` changes imports, never where an install goes; `PIP_ROOT` writes under the directory it names at the installing interpreter's own path, where nothing in the harness's environment imports it.
+- **Pinned with a real, offline `uv`**: inherited as it is, each variable makes `uv pip install --dry-run` (or `uv sync --dry-run`) target the harness environment; in the environment the harness hands a child, it does not.
+
+### Fixed: The `shell` tool's note is true when the commands directory could not be made (issue #971)
+
+The note said the harness's commands are first on the PATH. When their directory cannot be made (one WARNING is logged), they are not on the PATH at all. The note now says they go first whenever the harness can make the directory, and that `basecradle-harness-verify` not being found by name means it is not there this wake. Its sentence about the harness's Python environment now holds on an interpreter outside a virtual environment too.
+
 ## [0.205.0] - 2026-11-21
 
 ### Fixed: An HTTP status a gRPC endpoint answered with is named as the HTTP adapters name it, so an edge's 525 is retried in place (issue #962)

@@ -89,11 +89,13 @@ def test_the_note_is_the_text_the_handoff_specified():
         "network calls with no sandbox beyond your Unix permissions. Your home directory and its "
         'seven standing folders are described under "Your Home" in your instructions; each '
         "folder's README is its law. Your harness's own commands (`basecradle-harness-*`, and "
-        "`mempalace` where it is installed) come first on your PATH, from a directory that holds "
-        "nothing else — run them by name (`mempalace status` reads your own memory palace, if "
-        "that is your backend). The Python environment your harness runs from is not on your "
-        "PATH: `python3`, `pip` and every other command resolve to the system's or your own, "
-        "never to your harness's."
+        "`mempalace` where it is installed) go first on your PATH, from a directory that holds "
+        "nothing else, whenever the harness can make that directory — run them by name "
+        "(`mempalace status` reads your own memory palace, if that is your backend). If "
+        "`basecradle-harness-verify` is not found by name, the directory is not there this wake "
+        "and none of them is on your PATH. Your harness's own Python environment, if it has one, "
+        "is never on your PATH: `python3`, `pip` and every other command resolve to the system's "
+        "or your own."
     )
 
 
@@ -116,7 +118,18 @@ def test_the_note_says_which_commands_are_on_its_path_and_which_environment_is_n
     note = _shipped_shell_plugin().note
     assert "first on your PATH" in note
     assert "mempalace" in note
-    assert "not on your PATH" in note
+    assert "never on your PATH" in note
+
+
+def test_the_note_is_true_when_the_commands_directory_could_not_be_made():
+    # Issue #971: when the directory cannot be made the harness's commands are not on the PATH at
+    # all, so the note conditions the claim and names the check that tells the two cases apart
+    # (`test_venv` proves the check answers both ways). A model told a false thing about its own
+    # tools acts on it.
+    note = _shipped_shell_plugin().note
+    assert "whenever the harness can make that directory" in note
+    assert "If `basecradle-harness-verify` is not found by name" in note
+    assert "come first on your PATH" not in note
 
 
 # --- The policy boundary (the real, shipped tool) ----------------------------

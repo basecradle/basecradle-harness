@@ -1056,7 +1056,12 @@ from `@rowan` and `@briggs`, replaced the contract with **the harness's commands
   pid is dead **and** it is an hour old. Failing to make it costs reachability, never the removal.
 - **`spawn_env`** removes every spelling of the venv `bin` (any absolute entry that is the same
   directory by inode: a trailing separator, the resolved path, a symlinked alias) and puts the
-  commands directory first.
+  commands directory first. It also drops every variable measured to point an installer at the
+  venv when that is what it names (issue #971): `VIRTUAL_ENV`, `CONDA_PREFIX`,
+  `UV_PROJECT_ENVIRONMENT` and `PIP_PREFIX` by inode against `sys.prefix`, and `UV_PYTHON`,
+  `PIP_PYTHON` and `PIP_TARGET` when the path sits inside it. One naming anything else is the
+  operator's and stays; the module docstring carries the measurements, and why `PYTHONHOME`,
+  `PYTHONPATH` and `PIP_ROOT` are left alone.
   Outside a virtual environment nothing is removed: the interpreter's `bin` is the system's.
 - **`path_preamble`** applies the same after a login shell's profile, entry by entry, keeping
   every other entry in its place (empty ones included), with each removed spelling quoted into the
