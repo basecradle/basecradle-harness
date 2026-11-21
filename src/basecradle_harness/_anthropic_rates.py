@@ -54,7 +54,7 @@ from basecradle_harness._observability import ComputedCost
 
 #: Where every number in this module was read, and when. Edit the tables from this page, and move
 #: the date with them.
-SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing (read 2026-10-31)"
+SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing (read 2026-11-21)"
 
 #: On Claude Haiku 5.5, a request whose prompt is over this many tokens pays the higher row for all
 #: of them ("for prompts over 100,000 tokens"). Every other current model is priced flat across its
@@ -96,13 +96,17 @@ class Rates:
 
 # --- the table --------------------------------------------------------------------------------
 #
-# Transcribed row by row from `SOURCE`, "Model pricing". The current generation and the one before
-# it, so an operator moving within a family is priced from the first call; retired models are left
-# out. Claude Mythos is left out too: it is limited-availability, and no fleet agent can run it.
+# Transcribed row by row from `SOURCE`, "Model pricing". Each family's current models and the recent
+# ones an operator moving within it may still run, so a move is priced from the first call; Opus
+# 4.5, Sonnet 4.5 and everything older or retired are left out. Claude Mythos is left out too: it is
+# limited-availability, and no fleet agent can run it.
 
 #: Model id → its rates. Keyed by the id Anthropic publishes; a dated snapshot of it
 #: (``claude-haiku-4-5-20251001``) is priced as that id (`_model_key`).
 RATES: Mapping[str, Rates] = {
+    "claude-fable-5-2": Rates(
+        Tier(input=8.0, write_5m=10.0, write_1h=16.0, read=0.20, output=40.0)
+    ),
     "claude-fable-5-1": Rates(
         Tier(input=10.0, write_5m=12.50, write_1h=20.0, read=0.25, output=50.0)
     ),

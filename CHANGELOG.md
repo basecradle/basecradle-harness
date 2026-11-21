@@ -7,6 +7,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.204.2] - 2026-11-21
+
+### Changed: The Anthropic price table re-read against the page, and Claude Fable 5.2 priced (issue #959)
+
+The capital's spend gate read yesterday's Claude Opus 5.5 usage at $33.21 against a bill of $29.28 and asked which rate was wrong. None is: re-read on 2026-11-21, Anthropic's pricing page states Opus 5.5 at $4 input, $5 5-minute write, $8 1-hour write, $0.20 cache hit and $20 output per million tokens, which are the table's numbers, and OpenRouter's listing of Anthropic's own endpoint states the same five. The difference is in how the gate counted the day, reported on the issue.
+
+- **`SOURCE` is dated 2026-11-21**, the day every row was checked against the page.
+- **Claude Fable 5.2 has a row**: $8 input, $10 5-minute write, $16 1-hour write, $0.20 cache hit, $40 output. Before, a Fable 5.2 call logged no `cost=` and `cost unpriced … reason=unknown_model`. The NOC's price check finds the row by itself and compares it with OpenRouter's first-party listing, which states the same five.
+- **A test pins each Opus 5.5 and Fable 5.2 rate on its own**, one million tokens of one category per case, so a wrong rate fails by name instead of inside a sum.
+
 ## [0.204.1] - 2026-11-21
 
 ### Fixed: The outage notice's own delivery held only on a timeline that already had a mark (issue #957)

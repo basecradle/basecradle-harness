@@ -53,6 +53,39 @@ def test_a_flat_model_is_priced_on_its_one_row_at_any_length():
     )
 
 
+#: One million tokens of a single category, so each case reads off one rate of the page's row.
+_ONE_CATEGORY = {
+    "input": _usage(uncached=1_000_000),
+    "write_5m": _usage(write_5m=1_000_000),
+    "write_1h": _usage(write_1h=1_000_000),
+    "read": _usage(read=1_000_000),
+    "output": _usage(output=1_000_000),
+}
+
+
+@pytest.mark.parametrize(
+    ("model", "category", "page"),
+    [
+        # Claude Opus 5.5: $4 in, $5 5m write, $8 1h write, $0.20 cache hit (0.05x), $20 out
+        # (issue #959: the capital's gate read the table 13% above the bill; the page agreed).
+        ("claude-opus-5-5", "input", 4.0),
+        ("claude-opus-5-5", "write_5m", 5.0),
+        ("claude-opus-5-5", "write_1h", 8.0),
+        ("claude-opus-5-5", "read", 0.20),
+        ("claude-opus-5-5", "output", 20.0),
+        # Claude Fable 5.2: $8 in, $10 5m write, $16 1h write, $0.20 cache hit (0.025x), $40 out.
+        ("claude-fable-5-2", "input", 8.0),
+        ("claude-fable-5-2", "write_5m", 10.0),
+        ("claude-fable-5-2", "write_1h", 16.0),
+        ("claude-fable-5-2", "read", 0.20),
+        ("claude-fable-5-2", "output", 40.0),
+    ],
+)
+def test_each_rate_is_the_page_s_own_number(model, category, page):
+    """One category at a time, so a wrong rate names itself rather than hiding in a sum."""
+    assert call_cost(model, _ONE_CATEGORY[category]) == pytest.approx(page)
+
+
 def test_us_inference_is_1_1x_and_any_other_geography_is_not_priced():
     usage = _usage(uncached=1_000_000)
     assert call_cost("claude-sonnet-5-5", usage, geo="us") == pytest.approx(2.0 * 1.1)
