@@ -100,7 +100,12 @@ from basecradle_harness import (
     _refuseless_pricing,
 )
 from basecradle_harness._assets import _describe, _is_image, image_input, model_sees_images
-from basecradle_harness._attempts import another_attempt_follows, last_attempt
+from basecradle_harness._attempts import (
+    another_attempt_follows,
+    another_try_follows,
+    last_attempt,
+    retried,
+)
 from basecradle_harness._basecradle import (
     _PROVIDER_BASE_URLS,
     DEFAULT_CONTEXT_MESSAGES,
@@ -2011,6 +2016,9 @@ class WakeAgent:
         self._begin_memory_wake()
         outcome = "error"  # only a clean return past the reconciles earns another verdict
         stopped_by: str | None = None  # the signal that stopped the wake, when one did (#798)
+        # The fault a deferred wake ended on, for its `wake end` line (issue #962): a deferred wake
+        # writes no `wake failed`, so this is the one line that says what went wrong.
+        ended_on: str | None = None
         # Every claims identity this wake takes — one per pass (#596) — so a stop can tell the claims
         # that are this wake's to settle from a rival's.
         self._wake_ids: set[str] = set()
@@ -2094,10 +2102,19 @@ class WakeAgent:
             # deferred, in the router's own word. The last attempt, and a wake no attempt follows,
             # keep `outcome=error`.
             if another_attempt_follows():
-                outcome = DEFERRED
+                outcome, ended_on = DEFERRED, _fault_text(exc)
             raise
         except WakeStopped as stop:
             outcome, stopped_by = "stopped", self._settle_stop(stop, session)
+            raise
+        except Exception as exc:
+            # Every other fault ends the process with exit `1`, caught or not, and the router runs an
+            # exit `1` again inside the same attempt while a quick try remains (issue #962,
+            # basecradle-router#533). Until then it is not yet a failure, by #957's rule: deferred,
+            # with the error on this wake's own `wake end` line. (A deleted timeline, the one fault
+            # that exits `0`, is found at construction and never reaches here.)
+            if another_try_follows():
+                outcome, ended_on = DEFERRED, _fault_text(exc)
             raise
         finally:
             # This wake is over; its claims are no longer its to keep alive (issue #532). A session
@@ -2118,6 +2135,7 @@ class WakeAgent:
                     timeline=self.timeline_uuid,
                     outcome=outcome,
                     signal=stopped_by,
+                    error=ended_on,
                     turns=engine.turns_run,
                     steps=f"{engine.steps_used}/{engine.max_steps}",
                     # Everything that reached a timeline: the harness's own notices plus
@@ -6634,6 +6652,15 @@ def main(argv: list[str] | None = None) -> int:
     return code
 
 
+def _fault_text(error: BaseException) -> str:
+    """What a deferred wake's line says it ended on: the error's text, or its type when it has none.
+
+    A bare ``ValueError()`` has no text, and an empty `error=` is omitted from the line, so a
+    deferred wake that wrote no `wake failed` would otherwise say nothing about what went wrong.
+    """
+    return str(error) or type(error).__name__
+
+
 def _wake_once(args: argparse.Namespace) -> tuple[WakeStopped | None, int]:
     """One wake: ``(the stop that ended it, or None; the exit code)``."""
     agent: WakeAgent | None = None
@@ -6672,12 +6699,22 @@ def _wake_once(args: argparse.Namespace) -> tuple[WakeStopped | None, int]:
         # written, at any level: a Failure-tier head on an attempt that has not failed is the
         # page `@origin` ruled out, and it is never re-headed as `wake deferred`, which is the
         # per-item line the NOC counts as one deferred item.
+        #
+        # **And on any other fault another quick try follows** (issue #962): the router runs an exit
+        # `1` again inside the same attempt (basecradle-router#533), so it is deferred by the same
+        # rule, and its `wake end … outcome=deferred` carries the error. A wake that never got as
+        # far as a `wake end` (its setup failed) has the error said in a WARNING instead, so the
+        # line that says what went wrong is never lost.
         outage = is_outage(error)
-        if not (outage and another_attempt_follows()):
+        if not retried(outage=outage):
             _log.error(
                 "%s %s",
                 head("wake failed", RED),
                 kv(timeline=args.timeline, error=str(error), delivery=delivery_id()),
+            )
+        elif agent is None:
+            _log.warning(
+                "The wake could not start, and the router will run it again: %s", _fault_text(error)
             )
         print(f"basecradle-harness-wake: {last_word(error)}", file=sys.stderr)
         # A temporary provider fault that outlasted every retry is the one ending a later wake may

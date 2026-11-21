@@ -40,7 +40,10 @@ from basecradle_harness import _wake as wake_module
 from basecradle_harness._attempts import (
     WAKE_ATTEMPT_ENV,
     WAKE_ATTEMPTS_ENV,
+    WAKE_TRIES_ENV,
+    WAKE_TRY_ENV,
     another_attempt_follows,
+    another_try_follows,
     last_attempt,
 )
 from basecradle_harness._cleanup import enumerate_artifacts
@@ -1042,3 +1045,214 @@ def test_a_resume_that_timed_out_on_the_turn_keeps_its_error_on_any_attempt(
     assert failed.levelno == logging.ERROR
     (end,) = _lines(caplog, "wake end ")
     assert "outcome=ok" in plain(end.getMessage())
+
+
+# --- a quick try the router runs again (issue #962) ----------------------------------------------
+
+
+@pytest.fixture
+def quick_try(monkeypatch):
+    """Set the router's try pair, as `basecradle-router#533` exports it on every wake."""
+
+    def set_try(number: int, of: int = 3) -> None:
+        monkeypatch.setenv(WAKE_TRY_ENV, str(number))
+        monkeypatch.setenv(WAKE_TRIES_ENV, str(of))
+
+    monkeypatch.delenv(WAKE_TRY_ENV, raising=False)
+    monkeypatch.delenv(WAKE_TRIES_ENV, raising=False)
+    return set_try
+
+
+def _auth_failure() -> ProviderAuthError:
+    """A fault that exits `1`: not an outage, so the router's quick try is what runs it again."""
+    return ProviderAuthError("invalid api key", status_code=401)
+
+
+def test_no_try_variables_is_no_promise_of_another(quick_try):
+    assert not another_try_follows()
+
+
+@pytest.mark.parametrize(
+    ("number", "of", "follows"),
+    [(1, 3, True), (2, 3, True), (3, 3, False), (4, 3, False), (1, 1, False)],
+)
+def test_another_try_follows_every_try_but_the_last(quick_try, number, of, follows):
+    """``1``/``1`` is a probe's pair: it never reads as having a try after it."""
+    quick_try(number, of)
+
+    assert another_try_follows() is follows
+
+
+@pytest.mark.parametrize(("number", "of"), [("one", "3"), ("0", "3"), ("", "3"), ("2", "")])
+def test_a_broken_try_pair_promises_no_other_try_and_says_so(monkeypatch, caplog, number, of):
+    """A retry is never guessed: the ending stays the failure it was, and the broken pair is named."""
+    monkeypatch.setenv(WAKE_TRY_ENV, number)
+    monkeypatch.setenv(WAKE_TRIES_ENV, of)
+    attempts_module._reported.clear()
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert not another_try_follows()
+
+    assert any("try variables" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("number", [1, 2])
+def test_an_exit_1_another_try_follows_is_deferred_with_its_error_on_wake_end(
+    platform, tmp_path, monkeypatch, quick_try, caplog, number
+):
+    """The router runs an exit `1` again inside the attempt, so it is not yet a failure (#962)."""
+    quick_try(number)
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, RaisingProvider(_auth_failure())))
+
+    assert code == 1  # the exit is the router's signal, and it does not move
+    assert _errors(caplog) == []
+    assert _lines(caplog, "wake failed") == []
+    (end,) = _lines(caplog, "wake end ")
+    line = plain(end.getMessage())
+    assert "outcome=deferred" in line
+    assert 'error="invalid api key"' in line
+
+
+@pytest.mark.parametrize("last", [True, False], ids=["last_try", "outside_the_router"])
+def test_the_last_try_and_a_wake_outside_the_router_still_fail(
+    platform, tmp_path, monkeypatch, quick_try, caplog, last
+):
+    """Nothing changes where no try follows: `outcome=error`, no `error=`, and `wake failed`."""
+    if last:
+        quick_try(3)
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, RaisingProvider(_auth_failure())))
+
+    assert code == 1
+    (end,) = _lines(caplog, "wake end ")
+    assert "outcome=error" in plain(end.getMessage())
+    assert "error=" not in plain(end.getMessage())
+    (wake_failed,) = _lines(caplog, "wake failed")
+    assert wake_failed.levelno == logging.ERROR
+
+
+def test_each_exit_asks_the_pair_the_router_answers_it_with(
+    platform, tmp_path, monkeypatch, attempt, quick_try, caplog
+):
+    """An exit `75` is never quick-retried inside an attempt, and an exit `1` never earns another
+    attempt: a try pair says nothing about an outage, and an attempt pair nothing about a fault."""
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+
+    # The last attempt, with a quick try left: the outage exits 75, and nothing runs it again.
+    attempt(4)
+    quick_try(1)
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert (
+            _wake_once(monkeypatch, _agent(tmp_path / "outage", RaisingProvider(_down())))
+            == EX_TEMPFAIL
+        )
+    (wake_failed,) = _lines(caplog, "wake failed")
+    assert wake_failed.levelno == logging.ERROR
+
+    # An early attempt, on the last try: the fault exits 1, and nothing runs it again.
+    caplog.clear()
+    attempt(1)
+    quick_try(3)
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert (
+            _wake_once(monkeypatch, _agent(tmp_path / "fault", RaisingProvider(_auth_failure())))
+            == 1
+        )
+    (wake_failed,) = _lines(caplog, "wake failed")
+    assert wake_failed.levelno == logging.ERROR
+
+
+def test_a_wake_that_could_not_start_says_why_once_at_warning(monkeypatch, quick_try, caplog):
+    """No `wake end` was written, so the error is said here, or the one line saying it is lost."""
+    quick_try(1)
+
+    def fails(cls, **_):
+        raise BaseCradleError("sign-in refused")
+
+    monkeypatch.setattr(wake_module.WakeAgent, "from_env", classmethod(fails))
+    args = argparse.Namespace(timeline=TIMELINE_UUID, message=None, event=None, asset=None)
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        stopped, code = wake_module._wake_once(args)
+
+    assert (stopped, code) == (None, 1)
+    assert _errors(caplog) == []
+    (said,) = [r for r in caplog.records if "could not start" in r.getMessage()]
+    assert said.levelno == logging.WARNING and "sign-in refused" in said.getMessage()
+
+
+def test_a_deleted_timeline_is_still_skipped_with_a_try_left(monkeypatch, quick_try, caplog):
+    """It exits `0` and is never run again, so a try left changes nothing about how it ends."""
+    quick_try(1)
+
+    def gone(cls, **_):
+        raise wake_module.StaleTimelineError(TIMELINE_UUID)
+
+    monkeypatch.setattr(wake_module.WakeAgent, "from_env", classmethod(gone))
+    args = argparse.Namespace(timeline=TIMELINE_UUID, message=None, event=None, asset=None)
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert wake_module._wake_once(args) == (None, 0)
+
+    assert len(_lines(caplog, "wake skipped")) == 1
+    assert not any("could not start" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(("number", "level"), [(1, logging.WARNING), (3, logging.ERROR)])
+def test_an_uncaught_exception_is_a_warning_while_a_try_follows(quick_try, caplog, number, level):
+    """Python exits `1` on it too, so the router's next try is coming, until the last one."""
+    from basecradle_harness import _journal
+
+    quick_try(number)
+    try:
+        raise RuntimeError("a harness defect")
+    except RuntimeError as error:
+        with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+            _journal._uncaught(RuntimeError, error, error.__traceback__)
+
+    (report,) = [r for r in caplog.records if "nothing caught" in r.getMessage()]
+    assert report.levelno == level and report.exc_info is not None
+
+
+class _Crashes:
+    """A brain that raises an exception outside the provider taxonomy: a defect, by definition."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.model = "gpt-4o"
+
+    def chat(self, messages, tools=None):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ("error", "said"),
+    [
+        (RuntimeError("a harness defect"), 'error="a harness defect"'),
+        (RuntimeError(), "error=RuntimeError"),
+    ],
+    ids=["with_text", "without_text"],
+)
+def test_a_crash_nothing_catches_is_deferred_on_its_wake_end_too(
+    platform, tmp_path, monkeypatch, quick_try, caplog, error, said
+):
+    """An exception `_wake_once` does not catch still exits `1`, so the router's next try is coming;
+    the wake's own bookend says so, and names the fault even when it carries no text."""
+    quick_try(1)
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    agent = _agent(tmp_path, CountingProvider())
+    agent.harness.engine.provider = _Crashes(error)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="basecradle_harness"),
+        pytest.raises(RuntimeError),
+    ):
+        _wake_once(monkeypatch, agent)
+
+    assert _errors(caplog) == []
+    (end,) = _lines(caplog, "wake end ")
+    line = plain(end.getMessage())
+    assert "outcome=deferred" in line and said in line

@@ -7,7 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.204.3] - 2026-11-21
+## [0.205.0] - 2026-11-21
 
 ### Fixed: An HTTP status a gRPC endpoint answered with is named as the HTTP adapters name it, so an edge's 525 is retried in place (issue #962)
 
@@ -25,6 +25,15 @@ One wake of an agent on xAI, 2026-11-21: the edge answered a model call with HTT
 - **Measured on loopback, and pinned the same way** (`tests/test_sdk_retries.py`): a raw HTTP/2 server answering a bare `:status` counted 5 requests per attempt for `429`/`502`/`503`/`504` before, and 1 after. The same test counts every HTTP adapter (`openai` on both surfaces, `openrouter`, `anthropic`, `google-genai`) against an HTTP server answering `429`, `502`, `503`, `504` and `525`: each already sent exactly one, so nothing else changes.
 - **The charter's sentence is corrected:** it said gRPC's own re-send "never re-sends a deadline"; for a gateway `504` it did.
 - **The telemetry contract is unchanged:** an attempt is now one request, which is what it always claimed.
+
+### Changed: A quick try the router runs again is not a failure (issue #962)
+
+The router runs an exit `1` again inside one attempt (its quick tries), and every one of them wrote `ERROR wake failed`, because the harness could not tell a try that would be repeated from the last one. With basecradle-router#533 the router says which try a wake is, `BASECRADLE_WAKE_TRY` of `BASECRADLE_WAKE_TRIES`.
+
+- **A fault another quick try follows is deferred**, by #957's rule: no `wake failed` at any level, and `wake end … outcome=deferred` carries the error as **`error=`**, so the one line that says what went wrong is kept. A crash nothing caught is reported at `WARNING`, traceback and all. A wake whose setup failed, and so writes no `wake end`, says its error in a `WARNING` instead. An error with no text is named by its type, so `error=` is never empty.
+- **Each exit asks the pair the router answers it with:** an outage (exit `75`) asks the attempt pair, as before; any other fault (exit `1`) asks the try pair. The exit codes do not move.
+- **The last try, and a wake without the variables (or with a broken pair), fail as before:** `outcome=error`, the ERROR lines. A retry is never guessed.
+- **Two contract changes** in `docs/telemetry.md`: `deferred` on `wake end` now also means "another quick try follows", and `wake end` gains `error`, present only on a `deferred` wake that ended on a raise. The fleet's `wake_failed` reads `outcome=error` only, so no page moves. The fleet's log extraction learns the new field before the roll, through the capital's pre-roll check (its ruling on issue #962).
 
 ### Changed: Your Home names the seventh standing folder, `~/software` (issue #964)
 
