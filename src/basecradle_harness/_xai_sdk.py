@@ -96,10 +96,16 @@ from basecradle_harness._exceptions import (
     ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderServerError,
     ProviderTimeoutError,
     ProviderToolSchemaError,
 )
-from basecradle_harness._faults import is_out_of_funds, is_too_large, refused_tool_schema
+from basecradle_harness._faults import (
+    edge_server_status,
+    is_out_of_funds,
+    is_too_large,
+    refused_tool_schema,
+)
 from basecradle_harness._messages import ImageContent, Message, ServerToolUse, ToolCall, ToolSpec
 from basecradle_harness._observability import (
     ServerToolTally,
@@ -883,8 +889,9 @@ class _grpc_error_context:
 
     The engine and tools catch `ProviderConnectionError` / `ProviderError` (and the auth /
     rate-limit subclasses), so gRPC's ``RpcError`` status codes are normalized here, once — an
-    auth failure to `ProviderAuthError`, a rate limit to `ProviderRateLimitError`, an unreachable
-    endpoint to `ProviderConnectionError`, anything else to a `ProviderError`.
+    auth failure to `ProviderAuthError`, a rate limit to `ProviderRateLimitError`, an HTTP 5xx the
+    endpoint answered with to `ProviderServerError`, an unreachable endpoint to
+    `ProviderConnectionError`, anything else to a `ProviderError`.
     """
 
     def __enter__(self) -> None:
@@ -947,6 +954,16 @@ class _grpc_error_context:
             # it is typed here (issue #589): a timeout is retried once with a larger deadline,
             # never re-sent into the same one, and it must read the same on every adapter.
             raise ProviderTimeoutError(message) from exc
+        if code in (grpc.StatusCode.UNKNOWN, grpc.StatusCode.UNAVAILABLE):
+            status = edge_server_status(detail)
+            if status is not None:
+                # The endpoint answered with an HTTP 5xx, folded by gRPC core into a code that
+                # cannot say so (issue #962): 502/503/504 into UNAVAILABLE, every other 5xx, an
+                # edge's 520-527 among them, into UNKNOWN, the number kept only in the detail. It
+                # is the server's side failing, so it is the shared 5xx class every HTTP adapter
+                # raises for the same status, and it is retried in place. Read as UNKNOWN alone, a
+                # 525 at the edge gave up on the first attempt as `provider_error`.
+                raise ProviderServerError(message, status_code=status, body=detail) from exc
         if code == grpc.StatusCode.UNAVAILABLE:
             raise ProviderConnectionError(message) from exc
         if code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.DATA_LOSS):
