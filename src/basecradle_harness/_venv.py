@@ -102,9 +102,10 @@ _PREFIX = "basecradle-harness-commands-"
 _STAMPED = re.compile(rf"^{re.escape(_PREFIX)}(?P<pid>\d+)-[^{re.escape(os.sep)}]+$")
 
 #: How long another process's commands directory must sit untouched, with its pid dead, before it
-#: is called stranded and removed. A live wake re-links into its own directory on every spawn, and
-#: its pid is alive besides; an hour is far past any doubt that two clocks or pid namespaces can
-#: raise. The same reasoning, and the same hour, as the orphan sweep's ``STRANDED_AFTER``.
+#: is called stranded and removed. A live process touches its own directory on every spawn
+#: (`commands_dir`), and its pid is alive besides; an hour is far past any doubt that two clocks or
+#: pid namespaces can raise. The same reasoning, and the same hour, as the orphan sweep's
+#: ``STRANDED_AFTER``.
 STRANDED_AFTER = 60 * 60
 
 #: Where the commands directory is made: `tempfile.gettempdir` when ``None``. A test points it at
@@ -252,7 +253,7 @@ def commands_dir() -> str | None:
     under a running wake) is reachable at the next spawn, and a directory removed under the process
     is made again.
     """
-    global _made, _warned
+    global _made
     bin_dir = interpreter_bin_dir()
     if bin_dir is None:
         return None
@@ -275,32 +276,40 @@ def commands_dir() -> str | None:
                     raise OSError(f"{made!r} cannot be a PATH entry")
                 _owned.append((os.getpid(), made))
                 _made = (made, bin_dir)
-            for name, target in links.items():
-                _link(os.path.join(made, name), target)
+            os.utime(made)  # touched on every spawn, so its age says whether a process uses it
         except OSError as error:
-            if not _warned:
-                _warned = True
-                _log.warning(
-                    "harness commands are not on the PATH of what this process spawns, "
-                    "because their directory could not be made: %s",
-                    error,
-                )
+            _warn_once(f"their directory could not be made: {error}")
             return None
+        for name, target in links.items():
+            try:
+                _link(os.path.join(made, name), target)
+            except OSError as error:  # one name lost, never the directory
+                _warn_once(f"{name} could not be linked: {error}")
     return made
+
+
+def _warn_once(reason: str) -> None:
+    """One WARNING per process that the harness's commands are not all reachable by name."""
+    global _warned
+    if not _warned:
+        _warned = True
+        _log.warning(
+            "harness commands are not all on the PATH of what this process spawns: %s", reason
+        )
 
 
 def _dropped(entries: Iterable[str]) -> set[str]:
     """The ``PATH`` entries that name this interpreter's environment ``bin``, as literal strings.
 
-    Empty outside a virtual environment (see the module). Inside one: the directory as derived and
-    as resolved, each with and without a trailing separator, plus any absolute entry of `entries`
-    that is the same directory under another spelling (a symlinked alias).
+    Empty outside a virtual environment (see the module). Inside one: the directory as derived,
+    plus every absolute entry of `entries` that is the same directory by inode (`os.path.samefile`)
+    — a trailing separator, a symlinked alias, the resolved path. A relative entry is never judged:
+    it names a different directory in every working directory a child runs in.
     """
     bin_dir = interpreter_bin_dir()
     if bin_dir is None or not _in_virtual_environment():
         return set()
-    forms = {bin_dir, os.path.realpath(bin_dir)}
-    forms |= {form.rstrip(os.sep) + os.sep for form in forms}
+    forms = {bin_dir}
     for entry in entries:
         if entry and os.path.isabs(entry) and entry not in forms:
             try:
@@ -315,7 +324,7 @@ def spawn_env(env: Mapping[str, str] | None = None, *, commands: bool = True) ->
     """A copy of `env` (default: this process's) with the harness's ``PATH`` contract applied.
 
     The interpreter's environment ``bin`` is removed from ``PATH`` in every spelling `_dropped`
-    finds, and, when `commands` is true and there is one, `commands_dir` goes first. Every other
+    finds (any absolute entry that is the same directory), and, when `commands` is true and there is one, `commands_dir` goes first. Every other
     entry keeps its place, empty ones included. Never mutates its argument.
 
     A missing ``PATH`` stays missing when there is nothing to add (the child resolves against
@@ -353,10 +362,13 @@ def path_preamble(env: Mapping[str, str] | None = None) -> str:
 
     Every dropped spelling is written into the ``case`` pattern **quoted** (`shlex.quote`), and the
     commands directory is matched through a quoted expansion, so a glob character in a path is
-    matched literally and can never turn the test into a wildcard. ``${PATH-}`` keeps a profile
-    running under ``set -u`` working, an empty ``PATH`` gains no empty entry (which a shell reads as
-    the current directory), and every variable the line uses is unset afterwards, so the model's
-    command sees the shell it would have seen anyway.
+    matched literally and can never turn the test into a wildcard. Every absolute entry is also
+    compared with the environment ``bin`` by inode (``-ef``), so a spelling the *profile* added —
+    a symlinked alias, ``venv/./bin`` — goes too, which no string computed before the profile ran
+    could name. A ``PATH`` the profile unset becomes ``os.defpath``, as `spawn_env` treats a
+    missing one; an empty ``PATH`` gains no empty entry (which a shell reads as the current
+    directory); and every variable the line uses is unset afterwards, so the model's command sees
+    the shell it would have seen anyway.
     """
     source = os.environ if env is None else env
     current = source.get(_PATH)
@@ -365,12 +377,17 @@ def path_preamble(env: Mapping[str, str] | None = None) -> str:
     patterns = (['"$__bc_c"'] if first else []) + [shlex.quote(form) for form in sorted(drop)]
     if not patterns:
         return ""
+    bin_dir = interpreter_bin_dir() if drop else None
+    same = '/*) if [ "$__bc_e" -ef "$__bc_b" ]; then __bc_k=; fi ;; ' if bin_dir is not None else ""
     assign = 'PATH="$__bc_c$__bc_p"' if first else 'PATH="${__bc_p#:}"'
+    default = shlex.quote(os.defpath.lstrip(os.pathsep))
     return (
-        f"__bc_c={shlex.quote(first or '')}; __bc_p=; __bc_r=${{PATH-}}; "
+        f"__bc_c={shlex.quote(first or '')}; __bc_b={shlex.quote(bin_dir or '')}; "
+        f"__bc_p=; __bc_r=${{PATH-{default}}}; "
         'case "$__bc_r" in "") ;; *) __bc_r="$__bc_r:"; '
-        'while [ -n "$__bc_r" ]; do __bc_e="${__bc_r%%:*}"; __bc_r="${__bc_r#*:}"; '
-        f'case "$__bc_e" in {"|".join(patterns)}) ;; *) __bc_p="$__bc_p:$__bc_e" ;; esac; '
+        'while [ -n "$__bc_r" ]; do __bc_e="${__bc_r%%:*}"; __bc_r="${__bc_r#*:}"; __bc_k=1; '
+        f'case "$__bc_e" in {"|".join(patterns)}) __bc_k= ;; {same}esac; '
+        'if [ -n "$__bc_k" ]; then __bc_p="$__bc_p:$__bc_e"; fi; '
         "done ;; esac; "
-        f"{assign}; export PATH; unset __bc_c __bc_p __bc_r __bc_e"
+        f"{assign}; export PATH; unset __bc_c __bc_b __bc_p __bc_r __bc_e __bc_k"
     )

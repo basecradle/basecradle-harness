@@ -1054,12 +1054,15 @@ from `@rowan` and `@briggs`, replaced the contract with **the harness's commands
   the directory `sys.executable` sits in, re-linked on every spawn. Removed at exit; a predecessor
   that was killed (or stopped, which skips `atexit`) is removed by the next process once its stamped
   pid is dead **and** it is an hour old. Failing to make it costs reachability, never the removal.
-- **`spawn_env`** removes every spelling of the venv `bin` (as derived, resolved, with a trailing
-  separator, or a symlinked alias on the inherited `PATH`) and puts the commands directory first.
+- **`spawn_env`** removes every spelling of the venv `bin` (any absolute entry that is the same
+  directory by inode: a trailing separator, the resolved path, a symlinked alias) and puts the
+  commands directory first.
   Outside a virtual environment nothing is removed: the interpreter's `bin` is the system's.
 - **`path_preamble`** applies the same after a login shell's profile, entry by entry, keeping
   every other entry in its place (empty ones included), with each removed spelling quoted into the
-  `case` pattern so a glob character matches literally.
+  `case` pattern so a glob character matches literally, and every absolute entry compared by inode
+  (`-ef`) too, so a spelling the profile itself added goes as well. A `PATH` the profile unset
+  becomes `os.defpath`, as `spawn_env` treats a missing one.
 
 Every subprocess the harness spawns takes it: the `shell` tool (both halves), MCP stdio servers
 (under the config's own `env`), and `journalctl` in the log-grammar probe (`commands=False`: the

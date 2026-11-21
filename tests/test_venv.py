@@ -176,7 +176,7 @@ def test_a_directory_that_cannot_be_made_is_one_warning_and_no_directory(venv, m
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
         assert commands_dir() is None
         assert commands_dir() is None
-    warnings = [r for r in caplog.records if "harness commands are not on the PATH" in r.message]
+    warnings = [r for r in caplog.records if "harness commands are not all on the PATH" in r.message]
     assert len(warnings) == 1
 
 
@@ -185,6 +185,27 @@ def test_losing_the_directory_never_costs_the_removal(venv, monkeypatch):
     monkeypatch.setattr(_venv, "_PARENT", str(venv.parent / "missing"))
     env = spawn_env({"PATH": f"{venv}{os.pathsep}/usr/bin"})
     assert env["PATH"] == "/usr/bin"
+
+
+def test_one_name_that_cannot_be_linked_costs_that_name_only(venv, caplog):
+    made = Path(commands_dir())
+    (made / "basecradle-harness-wake").unlink()
+    (made / "basecradle-harness-wake").mkdir()  # nothing can replace a directory with a link
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert commands_dir() == str(made)
+    assert os.readlink(made / "basecradle-harness-verify") == str(
+        venv / "basecradle-harness-verify"
+    )
+    assert any("basecradle-harness-wake could not be linked" in r.message for r in caplog.records)
+
+
+def test_a_live_process_touches_its_directory_on_every_spawn(venv):
+    """So its age tells the sweep whether a process uses it, not only its pid."""
+    made = commands_dir()
+    stamp = time.time() - _venv.STRANDED_AFTER * 2
+    os.utime(made, (stamp, stamp))
+    commands_dir()
+    assert time.time() - os.stat(made).st_mtime < 60
 
 
 def test_this_process_removes_its_own_directory_at_exit(venv):
@@ -245,6 +266,14 @@ def test_age_is_never_the_reason_by_itself_nor_a_dead_pid(venv):
     assert young.exists()
 
 
+def test_another_users_directory_is_never_removed(venv, monkeypatch):
+    parent = Path(_venv._PARENT)
+    theirs = _stranded(parent, _dead_pid(), age=_venv.STRANDED_AFTER * 2)
+    monkeypatch.setattr(os, "geteuid", lambda: os.stat(theirs).st_uid + 1)
+    commands_dir()
+    assert theirs.exists()
+
+
 def test_only_our_own_name_is_ever_removed(venv):
     parent = Path(_venv._PARENT)
     theirs = parent / f"basecradle-harness-commandsX-{_dead_pid()}-abc"
@@ -278,6 +307,18 @@ def test_every_spelling_of_the_environment_bin_leaves(venv, tmp_path):
     alias.symlink_to(venv)
     path = os.pathsep.join([f"{venv}{os.sep}", "/usr/bin", str(alias), str(venv)])
     assert _entries(spawn_env({"PATH": path})["PATH"]) == [commands_dir(), "/usr/bin"]
+
+
+def test_the_resolved_spelling_leaves_when_the_interpreter_is_reached_by_a_link(
+    venv, tmp_path, monkeypatch
+):
+    alias = tmp_path / "linked"
+    alias.symlink_to(venv.parent)
+    monkeypatch.setattr(sys, "executable", str(alias / "bin" / "python3"))
+    env = spawn_env({"PATH": f"{venv}{os.pathsep}/usr/bin"})
+    assert _entries(env["PATH"]) == [commands_dir(), "/usr/bin"]
+    after = _bash(f'PATH={venv}:/usr/bin\n{path_preamble({"PATH": "/usr/bin"})}\necho "$PATH"')
+    assert _entries(after) == [commands_dir(), "/usr/bin"]
 
 
 def test_a_prefix_match_is_not_a_match(venv):
@@ -397,13 +438,31 @@ def test_the_prelude_and_the_environment_agree(venv):
 
 
 def test_the_prelude_leaves_no_variable_behind_for_the_command(venv):
-    script = f'{path_preamble()}\necho "[${{__bc_c-u}}${{__bc_p-u}}${{__bc_r-u}}${{__bc_e-u}}]"'
-    assert _bash(script) == "[uuuu]"
+    names = ("__bc_c", "__bc_b", "__bc_p", "__bc_r", "__bc_e", "__bc_k")
+    script = f'{path_preamble()}\necho "[{"".join(f"${{{name}-u}}" for name in names)}]"'
+    assert _bash(script) == "[uuuuuu]"
 
 
-def test_the_prelude_works_under_set_u(venv):
+def test_a_path_the_profile_unset_becomes_the_default_search_path_under_set_u(venv):
+    """As `spawn_env` treats a missing ``PATH``: ``/bin`` and ``/usr/bin`` are not taken away."""
     after = _bash(f'set -u\nunset PATH\n{path_preamble()}\necho "$PATH"')
-    assert after == commands_dir()
+    assert _entries(after) == [commands_dir(), *os.defpath.lstrip(os.pathsep).split(os.pathsep)]
+
+
+def test_a_spelling_the_profile_adds_is_removed_too(venv, tmp_path):
+    """No string computed before the profile ran names it, so the prelude compares inodes."""
+    alias = tmp_path / "current"
+    alias.symlink_to(venv.parent)
+    dotted = f"{venv.parent}/./bin"
+    after = _bash(f'PATH={alias}/bin:{dotted}:/usr/bin\n{path_preamble()}\necho "$PATH"')
+    assert _entries(after) == [commands_dir(), "/usr/bin"]
+
+
+def test_the_inode_comparison_never_removes_another_directory(venv, tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    after = _bash(f'PATH={other}:/usr/bin\n{path_preamble()}\necho "$PATH"')
+    assert _entries(after) == [commands_dir(), str(other), "/usr/bin"]
 
 
 def test_the_prelude_adds_no_empty_entry_to_an_empty_path(venv):
