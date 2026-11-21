@@ -53,12 +53,16 @@ alone. These lead an install into the environment they name, so a child never in
 names the harness's (`_ROOT_VARIABLES`, `_INSIDE_VARIABLES`):
 
 - ``VIRTUAL_ENV`` and ``CONDA_PREFIX`` — ``uv pip install`` installs into the environment either
-  names (with neither, it refuses: *No virtual environment found*).
+  names. With neither, it looks for a ``.venv`` in the working directory and its parents, and
+  refuses when there is none (*No virtual environment found*).
 - ``UV_PYTHON`` as a path — ``uv pip install`` installs into that interpreter's environment. A
   version request (``3.12``) names no environment and is never judged.
 - ``UV_PROJECT_ENVIRONMENT`` — ``uv sync`` and ``uv run`` use it as the project's environment.
 - ``PIP_PYTHON``, ``PIP_TARGET`` and ``PIP_PREFIX`` — any ``pip``, the system's included, installs
   into that interpreter's environment, that directory, or that prefix's ``site-packages``.
+- ``PYTHONUSERBASE`` — ``pip install --user`` from an interpreter of the same minor version
+  installs into ``<it>/lib/pythonX.Y/site-packages``, which for the harness's root is the
+  harness's own ``site-packages``.
 
 And these do not, so they are left as they are:
 
@@ -68,6 +72,13 @@ And these do not, so they are left as they are:
   still installs into its own environment.
 - ``PIP_ROOT`` writes files under the directory it names, at the full path of the installing
   interpreter's own environment, so nothing in the harness's environment can import them.
+
+One way in is not a variable, and is named rather than closed: uv's own discovery. A child whose
+working directory is inside the directory that holds a ``.venv`` (a laptop harness run with
+``uv run`` from its checkout, so its environment *is* ``<checkout>/.venv``) reaches that
+environment with nothing inherited at all. Nothing in a child's environment can switch that off
+without also hiding an agent's own projects' ``.venv`` from it. A fleet server's harness
+environment is not named ``.venv`` and is read-only to the agent.
 
 The prelude (`path_preamble`) does not repeat this: it exists because a login profile reassigns
 ``PATH`` and so undoes `spawn_env`, and no profile sets these to the harness's environment unless
@@ -355,7 +366,13 @@ def _dropped(entries: Iterable[str]) -> set[str]:
 
 #: Variables whose value is an environment's root, measured to lead an install into it (see the
 #: module). Dropped when the root is this interpreter's environment.
-_ROOT_VARIABLES = ("VIRTUAL_ENV", "CONDA_PREFIX", "UV_PROJECT_ENVIRONMENT", "PIP_PREFIX")
+_ROOT_VARIABLES = (
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "UV_PROJECT_ENVIRONMENT",
+    "PIP_PREFIX",
+    "PYTHONUSERBASE",
+)
 
 #: Variables whose value is a path *inside* an environment (an interpreter, a target directory),
 #: measured to lead an install into it. Dropped when that path is in this interpreter's environment.
@@ -366,22 +383,40 @@ def _names_environment(value: str | None, root: str, *, inside: bool) -> bool:
     """Does `value` name the environment at `root` — itself, or (`inside`) a path within it?
 
     By inode (`os.path.samefile`), as `_dropped` matches the ``bin``: a trailing separator, a
-    symlinked alias and the resolved path all match. `inside` walks the path's own ancestors, so
-    an interpreter that does not resolve into the environment (a venv's ``bin/python`` is a link to
-    the base interpreter) still counts by where it sits, and a part that does not exist yet (a
-    ``PIP_TARGET`` pip would create) does not stop the walk. A relative path is never judged: it
-    names a different place in every working directory a child runs in.
+    symlinked alias and the resolved path all match. `inside` asks two questions, and either one
+    is enough:
+
+    - Does one of the path's own ancestors, as spelled, name the environment? So an interpreter
+      that does not resolve into it (a venv's ``bin/python`` is a link to the base interpreter)
+      still counts by where it sits, and a part that does not exist yet (a ``PIP_TARGET`` pip
+      would create) does not stop the walk. The walk stops at a ``..``: ``<root>/../other`` is
+      not inside ``<root>``.
+    - Does the path, resolved, sit inside the environment, resolved? So a link elsewhere that
+      leads into it (``/x/link`` → ``<root>/lib/…/site-packages``) counts by where it leads.
+
+    A relative path is never judged: it names a different place in every working directory a
+    child runs in.
     """
     if not value or not os.path.isabs(value):
         return False
     path = Path(value)
-    for candidate in (path, *path.parents) if inside else (path,):
+    candidates = [path]
+    if inside:
+        parts = path.parts
+        for end in range(len(parts) - 1, 0, -1):
+            if ".." in parts[end:]:
+                break
+            candidates.append(Path(*parts[:end]))
+    for candidate in candidates:
         try:
             if os.path.samefile(candidate, root):
                 return True
         except OSError:
             continue
-    return False
+    if not inside:
+        return False
+    real, real_root = os.path.realpath(value), os.path.realpath(root)
+    return os.path.commonpath([real, real_root]) == real_root
 
 
 def _installer_targets(env: Mapping[str, str]) -> list[str]:

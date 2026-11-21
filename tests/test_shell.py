@@ -91,11 +91,10 @@ def test_the_note_is_the_text_the_handoff_specified():
         "folder's README is its law. Your harness's own commands (`basecradle-harness-*`, and "
         "`mempalace` where it is installed) go first on your PATH, from a directory that holds "
         "nothing else, whenever the harness can make that directory — run them by name "
-        "(`mempalace status` reads your own memory palace, if that is your backend). If "
-        "`basecradle-harness-verify` is not found by name, the directory is not there this wake "
-        "and none of them is on your PATH. Your harness's own Python environment, if it has one, "
-        "is never on your PATH: `python3`, `pip` and every other command resolve to the system's "
-        "or your own."
+        "(`mempalace status` reads your own memory palace, if that is your backend). If one of "
+        "them is not found by name, the harness could not put it on your PATH for that command. "
+        "Your harness's own Python environment, if it has one, is never on your PATH: `python3`, "
+        "`pip` and every other command resolve to the system's or your own."
     )
 
 
@@ -123,13 +122,15 @@ def test_the_note_says_which_commands_are_on_its_path_and_which_environment_is_n
 
 def test_the_note_is_true_when_the_commands_directory_could_not_be_made():
     # Issue #971: when the directory cannot be made the harness's commands are not on the PATH at
-    # all, so the note conditions the claim and names the check that tells the two cases apart
-    # (`test_venv` proves the check answers both ways). A model told a false thing about its own
-    # tools acts on it.
+    # all, so the note conditions the claim, and says what a name not found means without claiming
+    # more: one link can fail while the others are made, and the directory is retried at every
+    # spawn, so it speaks of that command, never of the whole wake. A model told a false thing
+    # about its own tools acts on it.
     note = _shipped_shell_plugin().note
     assert "whenever the harness can make that directory" in note
-    assert "If `basecradle-harness-verify` is not found by name" in note
+    assert "could not put it on your PATH for that command" in note
     assert "come first on your PATH" not in note
+    assert "this wake" not in note
 
 
 # --- The policy boundary (the real, shipped tool) ----------------------------

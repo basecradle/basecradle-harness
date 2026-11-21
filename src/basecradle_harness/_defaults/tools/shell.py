@@ -26,8 +26,8 @@ PLUGIN = ToolPlugin(
         "Your harness's own commands (`basecradle-harness-*`, and `mempalace` where it is "
         "installed) go first on your PATH, from a directory that holds nothing else, whenever "
         "the harness can make that directory — run them by name (`mempalace status` reads your "
-        "own memory palace, if that is your backend). If `basecradle-harness-verify` is not "
-        "found by name, the directory is not there this wake and none of them is on your PATH. "
+        "own memory palace, if that is your backend). If one of them is not found by name, the "
+        "harness could not put it on your PATH for that command. "
         "Your harness's own Python environment, if it has one, is never on your PATH: "
         "`python3`, `pip` and every other command resolve to the system's or your own."
     ),
