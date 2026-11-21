@@ -16,6 +16,7 @@ tests pin ``workdir`` to a temp dir so they never depend on a valid ``$HOME``.
 
 import os
 import sys
+import types
 from importlib.resources import files
 from pathlib import Path
 
@@ -37,7 +38,7 @@ from basecradle_harness._basecradle import _apply_safe_policy, _profile_from_env
 from basecradle_harness._brief import render_your_home, your_home_text
 from basecradle_harness._install import plugin_opts_in, plugin_source_providers
 from basecradle_harness._shell import _ROOT_REFUSAL, _running_as_root, _with_path
-from basecradle_harness._venv import path_preamble
+from basecradle_harness._venv import commands_dir, own_commands, path_preamble
 
 
 @pytest.fixture
@@ -87,9 +88,12 @@ def test_the_note_is_the_text_the_handoff_specified():
         "Full shell as your OS user — unlocked-profile only. Runs arbitrary commands, code, and "
         "network calls with no sandbox beyond your Unix permissions. Your home directory and its "
         'seven standing folders are described under "Your Home" in your instructions; each '
-        "folder's README is its law. The command-line tools installed alongside your harness are "
-        "on your PATH — run them by name (`mempalace status` reads your own memory palace, if "
-        "that is your backend)."
+        "folder's README is its law. Your harness's own commands (`basecradle-harness-*`, and "
+        "`mempalace` where it is installed) come first on your PATH, from a directory that holds "
+        "nothing else — run them by name (`mempalace status` reads your own memory palace, if "
+        "that is your backend). The Python environment your harness runs from is not on your "
+        "PATH: `python3`, `pip` and every other command resolve to the system's or your own, "
+        "never to your harness's."
     )
 
 
@@ -105,12 +109,14 @@ def test_the_home_steer_the_note_used_to_carry_reaches_every_shell_agent():
     assert render_your_home([ShellTool()]).startswith("## Your Home\n")
 
 
-def test_the_note_says_the_agents_own_command_line_tools_are_on_its_path():
+def test_the_note_says_which_commands_are_on_its_path_and_which_environment_is_not():
     # Issue #409: putting them on PATH is worth nothing if the agent never learns they are
-    # there. A channel the model cannot see is a channel the model cannot use.
+    # there. Issue #969: the note must also be true about what left — the harness's environment,
+    # so the agent does not go looking for the harness's `pip`.
     note = _shipped_shell_plugin().note
-    assert "on your PATH" in note
+    assert "first on your PATH" in note
     assert "mempalace" in note
+    assert "not on your PATH" in note
 
 
 # --- The policy boundary (the real, shipped tool) ----------------------------
@@ -386,60 +392,125 @@ def test_binary_output_does_not_crash_the_tool(shell):
     assert "[exit code: 0]" in result
 
 
-# --- The harness's own console scripts are on PATH (issue #409) ---------------
+# --- Only the harness's own commands on PATH, first (issues #409, #969) --------
+#
+# The acceptance test the decision named, run through the real tool: a real `/bin/bash -lc`, a
+# home whose login profile puts `~/.local/bin` first (a fleet server's shape), and an inherited
+# PATH that carries the harness's environment `bin` (the shape #409's fix produced, and the shape
+# `uv run` gives this suite).
+
+_NOT_OURS = ("python", "python3", "pip", "pip3", "httpx")
 
 
-def test_a_script_beside_the_interpreter_resolves_by_bare_name(tmp_path, monkeypatch):
-    """The defect, in one test: a CLI in the agent's venv answered `command not found`.
-
-    Nothing activates the venv — the router launches a wake by absolute path — so before this
-    the agent could reach `mempalace` only by typing the private venv path it was not told.
-    """
-    bin_dir = tmp_path / "venv" / "bin"
+@pytest.fixture
+def agent(tmp_path, monkeypatch):
+    """A harness environment, a fleet-shaped home, and an inherited PATH naming that environment."""
+    root = tmp_path / "venv"
+    bin_dir = root / "bin"
     bin_dir.mkdir(parents=True)
-    script = bin_dir / "nova-cli"
-    script.write_text("#!/bin/sh\necho reached\n")
-    script.chmod(0o755)
+    for name in (*own_commands(), *_NOT_OURS):
+        script = bin_dir / name
+        script.write_text(f'#!/bin/sh\necho {name}-from-the-harness "$@"\n')
+        script.chmod(0o755)
     monkeypatch.setattr(sys, "executable", str(bin_dir / "python3"))
+    monkeypatch.setattr(sys, "prefix", str(root))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "system"))
+    home = tmp_path / "home"
+    local_bin = home / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    (home / ".bash_profile").write_text('PATH="$HOME/.local/bin:$PATH"\n')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"]))
+    return types.SimpleNamespace(
+        bin=bin_dir, local_bin=local_bin, tool=ShellTool(workdir=str(tmp_path))
+    )
 
-    result = ShellTool(workdir=str(tmp_path)).run(command="nova-cli")
-    assert "reached" in result
-    assert "[exit code: 0]" in result
+
+def _output(result: str) -> str:
+    """The command's own output, without the tool's ``[exit code: N]`` footer."""
+    return result.rsplit("[exit code:", 1)[0].strip()
+
+
+def test_python3_and_pip3_are_not_the_harnesss(agent):
+    for name in ("python3", "pip3", "pip", "python"):
+        assert str(agent.bin) not in agent.tool.run(command=f"command -v {name} || true")
+
+
+def test_mempalace_resolves_from_the_commands_directory_and_works_bare(agent):
+    assert _output(agent.tool.run(command="command -v mempalace")) == str(
+        Path(commands_dir()) / "mempalace"
+    )
+    assert _output(agent.tool.run(command="mempalace status")) == (
+        "mempalace-from-the-harness status"
+    )
+
+
+def test_every_harness_console_script_resolves_from_the_commands_directory(agent):
+    names = [name for name in own_commands() if name.startswith("basecradle-harness-")]
+    assert names
+    listing = agent.tool.run(command=" && ".join(f"command -v {name}" for name in names))
+    assert _output(listing).splitlines() == [str(Path(commands_dir()) / name) for name in names]
+
+
+def test_a_link_in_local_bin_named_after_a_harness_command_does_not_win(agent):
+    impostor = agent.local_bin / "basecradle-harness-verify"
+    impostor.write_text("#!/bin/sh\necho impostor\n")
+    impostor.chmod(0o755)
+    assert _output(agent.tool.run(command="basecradle-harness-verify")) == (
+        "basecradle-harness-verify-from-the-harness"
+    )
+
+
+def test_a_program_in_local_bin_named_like_a_dependency_script_wins(agent):
+    """The agent's own `httpx` is the agent's: a dependency's script no longer shadows it."""
+    own = agent.local_bin / "httpx"
+    own.write_text("#!/bin/sh\necho the-agents-own\n")
+    own.chmod(0o755)
+    assert _output(agent.tool.run(command="httpx")) == "the-agents-own"
+
+
+def test_the_order_is_commands_then_the_profile_then_the_system(agent):
+    entries = _output(agent.tool.run(command='echo "$PATH"')).split(os.pathsep)
+    assert entries[:2] == [commands_dir(), str(agent.local_bin)]
+    assert str(agent.bin) not in entries
+    assert "/usr/bin" in entries
+
+
+def test_a_new_venv_cannot_see_the_harnesss_packages(tmp_path, monkeypatch):
+    """The real environment this suite runs from, on the inherited PATH: `python3 -m venv` is clean.
+
+    `uv run` puts this suite's own ``.venv/bin`` first, which is exactly #409's shape. Before #969
+    the ``python3`` there was the harness's, and a venv made from it was the harness's interpreter.
+    """
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join([str(Path(sys.executable).parent), "/usr/bin", "/bin"])
+    )
+    made = tmp_path / "fresh"
+    result = ShellTool(workdir=str(tmp_path)).run(
+        command=(
+            f"python3 -m venv --without-pip {made} && "
+            f'{made}/bin/python -c "import basecradle_harness" 2>&1 | tail -1'
+        ),
+        timeout=120,
+    )
+    assert "ModuleNotFoundError" in result, result
 
 
 def test_the_harnesss_own_entry_point_resolves_by_bare_name(tmp_path, monkeypatch):
-    """The acceptance shape itself: the real entry point, from the real venv this suite runs in.
+    """The real entry point, from the real venv this suite runs in, under a stripped PATH.
 
-    ``PATH`` is stripped to the system directories first — the shape of the wake the router
-    actually launches, which activates nothing. Without that the test would pass on the
-    developer's activated shell and prove nothing.
+    The shape of the wake the router actually launches, which activates nothing. Without the
+    stripped PATH the test would pass on the developer's activated shell and prove nothing.
     """
     monkeypatch.setenv("PATH", f"/usr/bin{os.pathsep}/bin")
     wake = Path(sys.executable).with_name("basecradle-harness-wake")
     assert wake.exists(), "run the suite from the venv the package is installed into"
 
-    result = ShellTool(workdir=str(tmp_path)).run(command="command -v basecradle-harness-wake")
-    assert str(wake) in result
-
-
-def test_the_directory_is_on_the_path_the_command_sees_exactly_once(tmp_path, monkeypatch):
-    """Reachable is the contract; *where* it lands is the box's call once its profile has run.
-
-    Both halves of the fix put it there, and they agree on the match, so a profile that keeps
-    the inherited entry (macOS's `path_helper` keeps it and reorders it) costs no duplicate.
-    """
-    bin_dir = tmp_path / "venv" / "bin"
-    bin_dir.mkdir(parents=True)
-    monkeypatch.setattr(sys, "executable", str(bin_dir / "python3"))
-
-    result = ShellTool(workdir=str(tmp_path)).run(command='echo "$PATH"')
-    assert result.split("\n")[0].split(os.pathsep).count(str(bin_dir)) == 1
-
-
-def test_the_inherited_path_is_added_to_never_replaced(shell):
-    """It only ever adds: the box's own tools stay exactly as reachable as they were."""
-    result = shell.run(command='echo "$PATH"')
-    assert "/usr/bin" in result.split("\n")[0].split(os.pathsep)
+    result = ShellTool(workdir=str(tmp_path)).run(command="basecradle-harness-wake --version")
+    assert "[exit code: 0]" in result
+    assert _output(
+        ShellTool(workdir=str(tmp_path)).run(command="command -v basecradle-harness-wake")
+    ) == str(Path(commands_dir()) / "basecradle-harness-wake")
 
 
 def test_the_prelude_precedes_the_model_command():
@@ -449,7 +520,7 @@ def test_the_prelude_precedes_the_model_command():
     assert assembled.count("\n") == 1
 
 
-def test_the_command_is_untouched_when_there_is_no_directory_to_add(monkeypatch):
+def test_the_command_is_untouched_when_there_is_nothing_to_remove_or_add(monkeypatch):
     monkeypatch.setattr(sys, "executable", "")
     assert _with_path("echo hello") == "echo hello"
 

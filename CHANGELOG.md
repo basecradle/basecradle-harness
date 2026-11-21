@@ -7,6 +7,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.206.0] - 2026-11-21
+
+### Changed: Only the harness's own commands are on an agent's PATH, first; its Python and pip leave it (issue #969)
+
+**The contract changes, knowingly:** from issue #409's "the harness's environment is *reachable*, not first" to "**the harness's commands only, first**" (`@origin`, 2026-11-21, after advice from `@rowan` and `@briggs`). Measured in an agent's shell on a fleet server: `python3`, `pip` and `pip3` resolved to the harness's own environment, so a plain `pip install` installed into the harness (four agents had packages there the harness never brought); `~/.local/bin` sat ahead of it, so a link there could replace a harness command; and every dependency's script (`httpx`, `uvicorn`, `pygmentize`, …) shadowed an agent's own tools.
+
+- **The environment's `bin` is taken off the PATH** of everything the harness spawns: the `shell` tool, MCP stdio servers, and `journalctl` in the log-grammar probe. Every spelling of it goes: any absolute entry that is the same directory, a symlinked alias or one the login profile adds included. It is removed, never merely covered.
+- **A directory holding only the harness's own commands goes first**: links to this package's console scripts (`basecradle-harness-*`) and `mempalace`, read from the installed metadata, so there is no list to keep. Not `python`, `python3`, `pip`, a dependency's script, or `mempalace-mcp`/`mempalace-light-mcp` (started by absolute path).
+- **First, after the profile:** the shell's one-line prelude now runs after the login profile, so the order a command sees is the harness's commands, what the profile built (`~/.local/bin` first on a fleet server), then the system.
+- **Derived, never configured:** the links point into the directory `sys.executable` sits in, read at spawn. The directory is made per process in the temp directory (`basecradle-harness-commands-<pid>-…`, mode `0700`) and removed at exit. One a killed or stopped process left behind is removed by the next process once its pid is dead and it is an hour old. If it cannot be made, one WARNING says so and the environment still leaves the PATH.
+- **What an agent sees moves:** `command -v python3` and `pip3` name the system's, `python3 -m venv` makes an environment that cannot see the harness's packages, an agent's own `httpx` in `~/.local/bin` now wins, and a link there named after a harness command does not. An MCP server started by a harness command's name still starts; anything else installed into the agent's venv must be started by absolute path.
+- **The `shell` tool's note** now says which commands are first on the PATH and that the harness's Python environment is not on it.
+- **The same on every machine**, not only a fleet server. On an interpreter outside a virtual environment nothing is removed, since its `bin` is the system's.
+- **Ships with the NOC's half**, which makes the harness environment read-only to the agent and carries the law's new text. Not to be released alone.
+
 ## [0.205.0] - 2026-11-21
 
 ### Fixed: An HTTP status a gRPC endpoint answered with is named as the HTTP adapters name it, so an edge's 525 is retried in place (issue #962)

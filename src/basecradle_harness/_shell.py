@@ -53,13 +53,14 @@ Implementation notes
 - **POSIX** — runs the command through ``/bin/bash -lc`` (a login shell, so the profile
   is sourced, matching a human's terminal). On a host without a POSIX ``/bin/bash`` the
   tool returns a clean "couldn't start a shell" error rather than crashing.
-- **The harness's own console scripts are reachable** — the directory holding them (the
-  venv's ``bin``, derived from ``sys.executable``) is put on ``PATH``, both in the child's
-  environment and again in a one-line prelude ahead of the command, because a login shell
-  sources a profile that may assign ``PATH`` outright. Without it ``mempalace``,
-  ``basecradle-harness-verify`` and the rest resolve only by absolute path, which is the
-  private-path defect issue #409 exists to remove. See `_venv` for why it is derived from
-  the running interpreter rather than configured.
+- **Only the harness's own commands are on ``PATH``, first** (issue #969) — a directory of
+  links to its console scripts and ``mempalace``, and nothing else, goes in front, and the
+  environment the harness runs from (its ``python3``, its ``pip``, every dependency's script)
+  is taken **off**, both in the child's environment and again in a one-line prelude ahead of
+  the command, because a login shell sources a profile that may assign ``PATH`` outright. So
+  ``mempalace status`` works by bare name (issue #409) while ``pip install`` never lands in
+  the harness. See `_venv` for the decision, and why it is derived from the running
+  interpreter rather than configured.
 - **Bounded** — output is read on a background thread into a capped buffer, so a runaway
   producer (``yes``, ``cat /dev/zero``) can never balloon the harness's memory: past the
   cap the reader stops, the OS pipe fills, and the command is killed. A timed-out or
@@ -80,7 +81,7 @@ import threading
 from basecradle_harness._observability import tool_cut, tool_failed
 from basecradle_harness._policy import SHELL
 from basecradle_harness._tools import Tool
-from basecradle_harness._venv import path_preamble, with_interpreter_bin
+from basecradle_harness._venv import path_preamble, spawn_env
 
 # The default per-call timeout (seconds), and the hard ceiling a caller cannot exceed.
 # A command past its timeout is killed; the ceiling stops the model from disabling the
@@ -128,13 +129,14 @@ def _running_as_root() -> bool:
 
 
 def _with_path(command: str) -> str:
-    """The model's command, preceded by the one-line prelude that puts the venv bin on ``PATH``.
+    """The model's command, preceded by the one-line prelude that applies the ``PATH`` contract.
 
     Spliced in *ahead* of the command rather than left to the inherited environment because
     ``-lc`` sources the profile first, and a profile that assigns ``PATH`` outright would discard
-    an inherited prepend (see `_venv.path_preamble`). The prelude is one line, so a shell error
-    message's line number is the command's own plus one; nothing else about the command changes,
-    and an interpreter with no scripts directory to add contributes no line at all.
+    the inherited one and put the profile's own entries ahead (see `_venv.path_preamble`). The
+    prelude is one line, so a shell error message's line number is the command's own plus one;
+    nothing else about the command changes, and with nothing to remove or add it contributes no
+    line at all.
     """
     preamble = path_preamble()
     return f"{preamble}\n{command}" if preamble else command
@@ -260,7 +262,7 @@ class ShellTool(Tool):
             proc = subprocess.Popen(
                 ["/bin/bash", "-lc", _with_path(command)],
                 cwd=cwd,
-                env=with_interpreter_bin(os.environ),  # the harness's own scripts are reachable
+                env=spawn_env(os.environ),  # only the harness's own commands, first (issue #969)
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,  # merge stderr into stdout, preserving interleaving
                 text=True,
