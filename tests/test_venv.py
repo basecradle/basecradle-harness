@@ -176,7 +176,9 @@ def test_a_directory_that_cannot_be_made_is_one_warning_and_no_directory(venv, m
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
         assert commands_dir() is None
         assert commands_dir() is None
-    warnings = [r for r in caplog.records if "harness commands are not all on the PATH" in r.message]
+    warnings = [
+        r for r in caplog.records if "harness commands are not all on the PATH" in r.message
+    ]
     assert len(warnings) == 1
 
 
