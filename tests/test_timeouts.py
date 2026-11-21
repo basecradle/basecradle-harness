@@ -389,7 +389,7 @@ def test_the_native_xai_adapter_names_a_deadline_a_timeout(grpc_chat):
         provider.close()
 
     assert connection_reason(raised.value) == "timeout"
-    assert servicer.calls == 1  # the SDK's own gRPC retry re-sends only UNAVAILABLE, never this
+    assert servicer.calls == 1  # gRPC never re-sends a deadline; nothing re-sends one (issue #966)
 
 
 # --- the failure, reproduced and survived -------------------------------------------------------

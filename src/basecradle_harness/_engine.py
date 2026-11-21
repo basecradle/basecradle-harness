@@ -166,8 +166,9 @@ DEFAULT_RESPONSE_RETRIES = 2
 #: retry them, and #589 found the composition's worst member: the SDK re-sent a **timed-out** request
 #: with the identical budget, which is the wall this retry now refuses to walk into. So every adapter
 #: leaves retrying to this one policy, and a fault takes the same attempts on every provider. (The
-#: one SDK-level retry left is gRPC's own on the native xAI path, and it re-sends only `UNAVAILABLE`
-#: — a request that never reached a server — never a deadline.)
+#: native xAI path kept `xai_sdk`'s gRPC retry policy until issue #966, which re-sent an `UNAVAILABLE`
+#: the endpoint answered five times; `_xai_sdk.CHANNEL_OPTIONS` replaces it, and
+#: `tests/test_sdk_retries.py` counts one request per attempt on every adapter.)
 #:
 #: **The bound worth knowing is wall-clock, not attempts.** A 5xx normally returns *fast*, so its
 #: attempts cost ~1.5s of backoff and are irrelevant. The pathological shape is a **slow** 5xx — a
