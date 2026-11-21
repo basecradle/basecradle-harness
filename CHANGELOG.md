@@ -16,7 +16,7 @@ The capital's canary proof of 0.204.0 found the notice still starting a second c
 - **An unclaimed item is untried only above what the wake that gave up read**: above the newest item any wake claimed in that stream. One below it was read past and left as context, so it holds; one above it landed after that wake's read (during the last attempt's retries) and still starts the work. A stream in which no listed item is claimed has no read point, so an unclaimed peer item there still attempts the work, as before.
 - **A wake that declines the hold says why**, in one INFO line naming the item: `Timeline <uuid> has an outage notice, and <kind> item <uuid> has not been tried; attempting the waiting work.`
 - **The test reproduces the canary's sequence**: four real attempts, the last posting the notice, then the notice's delivery, on a timeline the agent answers for the first time and on one with a mark.
-- **Fleet effect:** after the NOC converges this release, the notice is followed by one held wake on every timeline, the first the agent answers included.
+- **Fleet effect:** after the NOC converges this release, the notice is followed by one held wake on a timeline the agent answers for the first time, as on one it already had a mark on. One case still attempts the work by design: a stream the giving-up wake never reached that holds an older peer item no wake claimed (it may never have been tried), which costs at worst the one extra chain, never an item.
 
 ## [0.204.0] - 2026-11-20
 

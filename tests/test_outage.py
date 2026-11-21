@@ -978,6 +978,50 @@ def test_a_peers_message_that_landed_during_the_chain_is_not_held_behind_seeded_
     assert _lines(caplog, "wake skipped ") == []
     (declined,) = [r for r in caplog.records if "has an outage notice" in r.getMessage()]
     assert f"messages item {M2} has not been tried" in declined.getMessage()
+    # `M2` was taken up with the waiting work; the seeded `M0` is still context, never claimed.
+    claims = ClaimStore(tmp_path)
+    assert claims.read(TIMELINE_UUID, M2, kind="messages").phase == "in-flight"
+    assert claims.read(TIMELINE_UUID, M0, kind="messages") is None
+
+
+#: Two peer assets, both older than the notice (`REPLY`), so only the read point can decide them.
+A_OLD = "019e7751-9a0b-7c1d-8e2f-3a4b5c6d7e8f"
+A_NEW = "019e7752-9a0b-7c1d-8e2f-3a4b5c6d7e90"
+
+
+@pytest.mark.parametrize("claimed", [True, False], ids=["read_point", "no_read_point"])
+def test_a_stream_holds_below_its_read_point_and_attempts_without_one(
+    platform, tmp_path, monkeypatch, attempt, claimed
+):
+    """The read point is per stream. A first wake's asset bootstrap acts on the newest asset only,
+    so an older one below a claimed asset was read past and holds; a stream with no claimed item
+    has no read point, so an unclaimed peer asset there may never have been reached, and the wake
+    attempts the work, as before #957."""
+    platform.get("/assets").mock(
+        return_value=httpx.Response(
+            200,
+            json=asset_page(
+                asset(uuid=A_NEW, filename="new.txt", content_type="text/plain"),
+                asset(uuid=A_OLD, filename="old.txt", content_type="text/plain"),
+            ),
+        )
+    )
+    _told(platform, tmp_path, attempt)  # gives up on the messages reconcile, before any asset
+    if claimed:
+        assert ClaimStore(tmp_path).claim(TIMELINE_UUID, A_NEW, kind="assets")
+
+    attempt(1)
+    serve_messages(platform, page(_notice_item(), message(uuid=M0, body="are you there?")))
+    brain = RaisingProvider(_down())
+    agent = _agent(tmp_path, brain)
+    if claimed:
+        assert agent.wake() == []
+        assert brain.calls == 0
+        assert ClaimStore(tmp_path).read(TIMELINE_UUID, A_OLD, kind="assets") is None
+    else:
+        with pytest.raises(ProviderServerError):
+            agent.wake()
+        assert brain.calls > 0
 
 
 def test_a_resume_that_timed_out_on_the_turn_keeps_its_error_on_any_attempt(
