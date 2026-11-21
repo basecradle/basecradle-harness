@@ -65,6 +65,7 @@ from tests.test_wake import (
     E1,
     M0,
     M1,
+    M2,
     M4,
     PNG_BYTES,
     REPLY,
@@ -896,6 +897,87 @@ def test_a_later_attempt_of_a_delivery_from_before_the_notice_holds(platform, tm
     assert _agent(tmp_path, brain).wake() == []
 
     assert brain.calls == 0
+
+
+def _chain(monkeypatch, platform, home, attempt, *items) -> None:
+    """The router's whole chain of four attempts at one delivery, each a real wake that exits 75.
+
+    `items` are the timeline (newest-first) every attempt reads. The last attempt posts the notice.
+    """
+    serve_messages(platform, page(*items))
+    for number in (1, 2, 3, 4):
+        attempt(number)
+        assert _wake_once(monkeypatch, _agent(home, RaisingProvider(_down()))) == EX_TEMPFAIL
+    assert OutageState(home).notice(TIMELINE_UUID) == REPLY
+    assert len(_notices(platform)) == 1
+
+
+@pytest.mark.parametrize("established", [False, True], ids=["first_wake_here", "marked_timeline"])
+def test_the_notices_delivery_after_a_whole_chain_holds_and_re_drives_nothing(
+    platform, tmp_path, monkeypatch, attempt, caplog, established
+):
+    """The canary's sequence on 0.204.0 (issue #957, the capital's re-wake): four attempts, the
+    last posts the notice, and the notice's delivery wakes the agent. The waiting item `M1` is one a
+    dead wake claimed; `M0` is an older peer message. On a timeline the agent is answering for the
+    first time there is no mark yet (nothing settled during the outage), so the first wake answered
+    the newest message and seeded `M0` as context, unclaimed. That `M0` read as untried, and the
+    wake re-drove `M1` into a second chain of attempts."""
+    if established:
+        MarkStore(tmp_path).set(TIMELINE_UUID, M0)  # `M0` settled before the outage began
+    peer_messages = (
+        message(uuid=M1, body="are you there?"),
+        message(uuid=M0, body="opening the timeline"),
+    )
+    _chain(monkeypatch, platform, tmp_path, attempt, *peer_messages)
+    held = ClaimStore(tmp_path).read(TIMELINE_UUID, M1, kind="messages")
+    assert held is not None and held.phase == "in-flight"
+
+    attempt(1)  # the notice's delivery is a delivery of its own
+    serve_messages(platform, page(_notice_item(), *peer_messages))
+    brain = RaisingProvider(_down())
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, brain))
+
+    assert code == 0  # no 75, so no second chain
+    assert brain.calls == 0
+    assert _errors(caplog) == []
+    assert not [r for r in caplog.records if plain(r.getMessage()).startswith("re-driving ")]
+    (skipped,) = _lines(caplog, "wake skipped ")
+    assert "reason=outage_notice" in plain(skipped.getMessage())
+    # Nothing was touched: the dead wake's claim is exactly as it left it, `M0` is still unclaimed.
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M1, kind="messages") == held
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages") is None
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == (M0 if established else None)
+    assert len(_notices(platform)) == 1
+
+
+def test_a_peers_message_that_landed_during_the_chain_is_not_held_behind_seeded_context(
+    platform, tmp_path, monkeypatch, attempt, caplog
+):
+    """`M2` landed after the last attempt read the timeline: unclaimed and above the newest item a
+    wake claimed (`M1`), so it is untried, and the wake that declines the hold says which item."""
+    peer_messages = (
+        message(uuid=M1, body="are you there?"),
+        message(uuid=M0, body="opening the timeline"),
+    )
+    _chain(monkeypatch, platform, tmp_path, attempt, *peer_messages)
+
+    attempt(1)
+    serve_messages(
+        platform,
+        page(_notice_item(), message(uuid=M2, body="hello? anyone?"), *peer_messages),
+    )
+    brain = RaisingProvider(_down())
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        code = _wake_once(monkeypatch, _agent(tmp_path, brain))
+
+    assert code == EX_TEMPFAIL  # attempted, and the outage is still on
+    assert brain.calls > 0
+    assert _lines(caplog, "wake skipped ") == []
+    (declined,) = [r for r in caplog.records if "has an outage notice" in r.getMessage()]
+    assert f"messages item {M2} has not been tried" in declined.getMessage()
 
 
 def test_a_resume_that_timed_out_on_the_turn_keeps_its_error_on_any_attempt(
