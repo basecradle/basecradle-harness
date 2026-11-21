@@ -39,6 +39,50 @@ first.** Its requirements, each with a tempting broken form:
   command sees is: the commands directory, then what the profile built (``~/.local/bin`` first on
   a fleet server), then the system.
 - **Every subprocess, not only the shell**, and on every machine, not only a fleet server.
+- **Not only the PATH** (issue #971). A harness started from an activated environment (an operator
+  on a laptop, ``uv run``) carries ``VIRTUAL_ENV`` naming that environment, and ``uv pip install``
+  installs wherever it points, so a child with no harness ``bin`` on its ``PATH`` could still
+  install into the harness. `spawn_env` drops every variable an installer reads as *where to
+  install* when it names this environment, matched by what it is (`os.path.samefile`) rather than
+  how it is spelled; one that names anything else is the operator's own and is kept.
+
+Where an installer is pointed, measured
+---------------------------------------
+Measured on 2026-11-21 (uv 0.12, pip 25) against a throwaway virtual environment, each variable set
+alone. These lead an install into the environment they name, so a child never inherits one that
+names the harness's (`_ROOT_VARIABLES`, `_INSIDE_VARIABLES`):
+
+- ``VIRTUAL_ENV`` and ``CONDA_PREFIX`` — ``uv pip install`` installs into the environment either
+  names. With neither, it looks for a ``.venv`` in the working directory and its parents, and
+  refuses when there is none (*No virtual environment found*).
+- ``UV_PYTHON`` as a path — ``uv pip install`` installs into that interpreter's environment. A
+  version request (``3.12``) names no environment and is never judged.
+- ``UV_PROJECT_ENVIRONMENT`` — ``uv sync`` and ``uv run`` use it as the project's environment.
+- ``PIP_PYTHON``, ``PIP_TARGET`` and ``PIP_PREFIX`` — any ``pip``, the system's included, installs
+  into that interpreter's environment, that directory, or that prefix's ``site-packages``.
+- ``PYTHONUSERBASE`` — ``pip install --user`` from an interpreter of the same minor version
+  installs into ``<it>/lib/pythonX.Y/site-packages``, which for the harness's root is the
+  harness's own ``site-packages``.
+
+And these do not, so they are left as they are:
+
+- ``PYTHONHOME`` naming a virtual environment stops an interpreter starting at all (a venv holds no
+  standard library: *No module named 'encodings'*), so nothing installs anywhere.
+- ``PYTHONPATH`` changes where imports are found and never where an install goes: ``pip`` under it
+  still installs into its own environment.
+- ``PIP_ROOT`` writes files under the directory it names, at the full path of the installing
+  interpreter's own environment, so nothing in the harness's environment can import them.
+
+One way in is not a variable, and is named rather than closed: uv's own discovery. A child whose
+working directory is inside the directory that holds a ``.venv`` (a laptop harness run with
+``uv run`` from its checkout, so its environment *is* ``<checkout>/.venv``) reaches that
+environment with nothing inherited at all. Nothing in a child's environment can switch that off
+without also hiding an agent's own projects' ``.venv`` from it. A fleet server's harness
+environment is not named ``.venv`` and is read-only to the agent.
+
+The prelude (`path_preamble`) does not repeat this: it exists because a login profile reassigns
+``PATH`` and so undoes `spawn_env`, and no profile sets these to the harness's environment unless
+someone wrote it to, which is not inheritance.
 
 The commands directory
 ----------------------
@@ -320,12 +364,86 @@ def _dropped(entries: Iterable[str]) -> set[str]:
     return forms
 
 
+#: Variables whose value is an environment's root, measured to lead an install into it (see the
+#: module). Dropped when the root is this interpreter's environment.
+_ROOT_VARIABLES = (
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "UV_PROJECT_ENVIRONMENT",
+    "PIP_PREFIX",
+    "PYTHONUSERBASE",
+)
+
+#: Variables whose value is a path *inside* an environment (an interpreter, a target directory),
+#: measured to lead an install into it. Dropped when that path is in this interpreter's environment.
+_INSIDE_VARIABLES = ("UV_PYTHON", "PIP_PYTHON", "PIP_TARGET")
+
+
+def _names_environment(value: str | None, root: str, *, inside: bool) -> bool:
+    """Does `value` name the environment at `root` — itself, or (`inside`) a path within it?
+
+    By inode (`os.path.samefile`), as `_dropped` matches the ``bin``: a trailing separator, a
+    symlinked alias and the resolved path all match. `inside` asks two questions, and either one
+    is enough:
+
+    - Does one of the path's own ancestors, as spelled, name the environment? So an interpreter
+      that does not resolve into it (a venv's ``bin/python`` is a link to the base interpreter)
+      still counts by where it sits, and a part that does not exist yet (a ``PIP_TARGET`` pip
+      would create) does not stop the walk. The walk stops at a ``..``: ``<root>/../other`` is
+      not inside ``<root>``.
+    - Does the path, resolved, sit inside the environment, resolved? So a link elsewhere that
+      leads into it (``/x/link`` → ``<root>/lib/…/site-packages``) counts by where it leads.
+
+    A relative path is never judged: it names a different place in every working directory a
+    child runs in.
+    """
+    if not value or not os.path.isabs(value):
+        return False
+    path = Path(value)
+    candidates = [path]
+    if inside:
+        parts = path.parts
+        for end in range(len(parts) - 1, 0, -1):
+            if ".." in parts[end:]:
+                break
+            candidates.append(Path(*parts[:end]))
+    for candidate in candidates:
+        try:
+            if os.path.samefile(candidate, root):
+                return True
+        except OSError:
+            continue
+    if not inside:
+        return False
+    real, real_root = os.path.realpath(value), os.path.realpath(root)
+    return os.path.commonpath([real, real_root]) == real_root
+
+
+def _installer_targets(env: Mapping[str, str]) -> list[str]:
+    """The variables in `env` that point an installer at this interpreter's environment.
+
+    Empty outside a virtual environment, for the same reason `_dropped` is: there is no separate
+    environment to protect, and a ``VIRTUAL_ENV`` then is the operator's own whatever it names.
+    """
+    root = sys.prefix
+    if not _in_virtual_environment() or not root or not os.path.isdir(root):
+        return []
+    return [
+        name
+        for names, inside in ((_ROOT_VARIABLES, False), (_INSIDE_VARIABLES, True))
+        for name in names
+        if _names_environment(env.get(name), root, inside=inside)
+    ]
+
+
 def spawn_env(env: Mapping[str, str] | None = None, *, commands: bool = True) -> dict[str, str]:
     """A copy of `env` (default: this process's) with the harness's ``PATH`` contract applied.
 
     The interpreter's environment ``bin`` is removed from ``PATH`` in every spelling `_dropped`
-    finds (any absolute entry that is the same directory), and, when `commands` is true and there is one, `commands_dir` goes first. Every other
-    entry keeps its place, empty ones included. Never mutates its argument.
+    finds (any absolute entry that is the same directory), and, when `commands` is true and there
+    is one, `commands_dir` goes first. Every other entry keeps its place, empty ones included.
+    Every variable that points an installer at the environment is removed too
+    (`_installer_targets`, issue #971). Never mutates its argument.
 
     A missing ``PATH`` stays missing when there is nothing to add (the child resolves against
     ``os.defpath`` as it would have), and becomes the commands directory plus ``os.defpath`` when
@@ -336,6 +454,8 @@ def spawn_env(env: Mapping[str, str] | None = None, *, commands: bool = True) ->
     environment still leaves its ``PATH``, and no directory is made for it.
     """
     result = dict(os.environ if env is None else env)
+    for name in _installer_targets(result):
+        del result[name]
     current = result.get(_PATH)
     if current is None:
         entries = os.defpath.lstrip(os.pathsep).split(os.pathsep)

@@ -22,6 +22,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The same on every machine**, not only a fleet server. On an interpreter outside a virtual environment nothing is removed, since its `bin` is the system's.
 - **Ships with the NOC's half**, which makes the harness environment read-only to the agent and carries the law's new text. Not to be released alone.
 
+### Fixed: A child does not inherit a variable that points an installer at the harness environment (issue #971)
+
+A harness started from an activated environment (an operator on a laptop, `uv run`) carries `VIRTUAL_ENV` naming that environment, and `uv pip install` installs wherever it points. So with the harness's `bin` already off the PATH, one variable still led an install into the harness.
+
+- **Each variable measured to point an installer at an environment is dropped from what the harness spawns when it names the harness's**, measured one at a time with uv 0.12 and pip 25: `VIRTUAL_ENV` and `CONDA_PREFIX` (`uv pip install`), `UV_PYTHON` given as a path (`uv pip install`), `UV_PROJECT_ENVIRONMENT` (`uv sync`, `uv run`), `PIP_PYTHON`, `PIP_TARGET` and `PIP_PREFIX` (any `pip`), and `PYTHONUSERBASE` (`pip install --user`). The environment is matched by what it is (by inode, as the `bin` is), and an interpreter or target directory counts by where it sits inside it or where it leads. A variable that names anything else is the operator's own and is kept, as is a version request such as `UV_PYTHON=3.12`.
+- **Left alone, with the evidence:** `PYTHONHOME` naming a virtual environment stops an interpreter starting at all; `PYTHONPATH` changes imports, never where an install goes; `PIP_ROOT` writes under the directory it names at the installing interpreter's own path, where nothing in the harness's environment imports it.
+- **One way in is not a variable, and is named rather than closed:** with nothing inherited, `uv` still finds a `.venv` in a child's working directory or its parents, so a laptop harness run with `uv run` from its checkout (its environment is `<checkout>/.venv`) is reachable from a child working inside that checkout. Nothing in a child's environment switches that off without hiding an agent's own projects' `.venv` too. A fleet server's harness environment is not named `.venv` and is read-only to the agent.
+- **Pinned with a real, offline `uv`**: inherited as it is, each variable makes `uv pip install --dry-run` (or `uv sync --dry-run`) target the harness environment; in the environment the harness hands a child, it does not.
+
+### Fixed: The `shell` tool's note is true when the commands directory could not be made (issue #971)
+
+The note said the harness's commands are first on the PATH. When their directory cannot be made (one WARNING is logged), a harness running from a virtual environment has none of them on the PATH at all. The note now says they go first whenever the harness can make the directory, and that a name not found means the harness could not put it on the PATH for that command. Its sentence about the harness's Python environment now holds on an interpreter outside a virtual environment too.
+
 ## [0.205.0] - 2026-11-21
 
 ### Fixed: An HTTP status a gRPC endpoint answered with is named as the HTTP adapters name it, so an edge's 525 is retried in place (issue #962)

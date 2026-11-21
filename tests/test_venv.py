@@ -13,6 +13,7 @@ assembled, not that it survives a profile.
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -489,3 +490,231 @@ def test_there_is_no_prelude_when_there_is_nothing_to_remove_or_add(monkeypatch)
     """An empty string, so a caller splices it in only when it says something."""
     monkeypatch.setattr(sys, "executable", "")
     assert path_preamble() == ""
+
+
+# --- What points an installer at the environment (issue #971) ----------------------
+
+#: The interpreter running these tests, captured before any test points `sys.executable` elsewhere.
+_REAL_PYTHON = sys.executable
+
+
+@pytest.fixture
+def real_venv(tmp_path, monkeypatch):
+    """A real virtual environment an installer accepts, made the running harness's own."""
+    root = tmp_path / "harness-venv"
+    subprocess.run([_REAL_PYTHON, "-m", "venv", "--without-pip", str(root)], check=True)
+    monkeypatch.setattr(sys, "executable", str(root / "bin" / "python3"))
+    monkeypatch.setattr(sys, "prefix", str(root))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "system"))
+    return root
+
+
+def _uv() -> str:
+    """The `uv` binary; the suite's own toolchain, so CI must have it (skipped only off CI)."""
+    uv = shutil.which("uv")
+    if uv is None:
+        if os.environ.get("CI"):
+            pytest.fail("uv is not on the PATH in CI; the installer tests cannot run")
+        pytest.skip("uv is not on the PATH")
+    return uv
+
+
+def _uv_target(args: list[str], env: dict[str, str], cwd: Path) -> str:
+    """Run a real, offline `uv` dry run under `env`; return everything it printed."""
+    done = subprocess.run(
+        [_uv(), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=cwd,
+        timeout=60,
+        check=False,
+    )
+    return done.stdout + done.stderr
+
+
+def _named(output: str, root: Path, cwd: Path) -> bool:
+    """Did `uv` say it would use (or create) the environment at `root`, in any spelling?
+
+    A relative path uv prints is resolved against the directory uv ran in, never pytest's own.
+    """
+    for line in output.splitlines():
+        if "environment at: " in line:
+            named = cwd / line.split("environment at: ", 1)[1].strip()
+            if os.path.normpath(named) == os.path.normpath(root) or (
+                os.path.exists(named) and os.path.samefile(named, root)
+            ):
+                return True
+    return False
+
+
+def _bare_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    """A minimal environment for `uv`: no inherited `UV_*`, no config file, its own cache, the
+    system's PATH, and never a download."""
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(work),
+        "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
+        "UV_NO_CONFIG": "1",
+        "UV_PYTHON_DOWNLOADS": "never",
+        **extra,
+    }
+
+
+@pytest.mark.parametrize("variable", ["VIRTUAL_ENV", "CONDA_PREFIX", "UV_PYTHON"])
+def test_a_child_cannot_uv_pip_install_into_the_harness_through_an_inherited_variable(
+    real_venv, tmp_path, variable
+):
+    """A real `uv pip install --dry-run`: inherited as is, it targets the harness; handed on, not.
+
+    The first half proves the vector is real (measured, not assumed), the second that it is closed.
+    """
+    value = str(real_venv / "bin" / "python3") if variable == "UV_PYTHON" else str(real_venv)
+    inherited = _bare_env(tmp_path, **{variable: value})
+    args = ["pip", "install", "--dry-run", "--offline", "--no-index", "six"]
+    work = tmp_path / "work"
+    assert _named(_uv_target(args, inherited, work), real_venv, work)
+    child = spawn_env(inherited)
+    assert variable not in child
+    output = _uv_target(args, child, work)
+    assert not _named(output, real_venv, work)
+    assert "No virtual environment found" in output
+
+
+def test_a_child_cannot_uv_sync_into_the_harness_through_uv_project_environment(
+    real_venv, tmp_path
+):
+    project = tmp_path / "work"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "p"\nversion = "0"\nrequires-python = ">=3.11"\ndependencies = []\n'
+    )
+    # An interpreter of the suite's own, which is not the harness's here, so uv can always resolve
+    # and the second half shows where it *would* go rather than that it could not start.
+    inherited = _bare_env(tmp_path, UV_PROJECT_ENVIRONMENT=str(real_venv), UV_PYTHON=_REAL_PYTHON)
+    args = ["sync", "--dry-run", "--offline"]
+    assert _named(_uv_target(args, inherited, project), real_venv, project)
+    child = spawn_env(inherited)
+    assert child["UV_PYTHON"] == _REAL_PYTHON
+    output = _uv_target(args, child, project)
+    assert _named(output, project / ".venv", project)
+    assert not _named(output, real_venv, project)
+
+
+def test_an_operators_own_virtual_env_is_kept_and_used(real_venv, tmp_path):
+    """A VIRTUAL_ENV that names anything else is the operator's own: handed on, and installed into."""
+    theirs = tmp_path / "theirs"
+    subprocess.run([_REAL_PYTHON, "-m", "venv", "--without-pip", str(theirs)], check=True)
+    child = spawn_env(_bare_env(tmp_path, VIRTUAL_ENV=str(theirs)))
+    assert child["VIRTUAL_ENV"] == str(theirs)
+    args = ["pip", "install", "--dry-run", "--offline", "--no-index", "six"]
+    assert _named(_uv_target(args, child, tmp_path / "work"), theirs, tmp_path / "work")
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["VIRTUAL_ENV", "CONDA_PREFIX", "UV_PROJECT_ENVIRONMENT", "PIP_PREFIX", "PYTHONUSERBASE"],
+)
+def test_every_spelling_of_the_environment_root_leaves(venv, tmp_path, variable):
+    """Matched by what it is: the root as derived, with a trailing separator, or by a link."""
+    root = venv.parent
+    alias = tmp_path / "alias"
+    alias.symlink_to(root)
+    for spelling in (str(root), f"{root}/", str(alias), f"{root}/bin/.."):
+        assert variable not in spawn_env({"PATH": "/usr/bin", variable: spelling})
+
+
+@pytest.mark.parametrize("variable", ["UV_PYTHON", "PIP_PYTHON", "PIP_TARGET"])
+def test_a_path_inside_the_environment_leaves(venv, tmp_path, variable):
+    """An interpreter or a target directory inside it — even one not made yet — names it."""
+    for inside in (venv / "python3", venv.parent / "lib" / "python3.13" / "site-packages"):
+        assert variable not in spawn_env({"PATH": "/usr/bin", variable: str(inside)})
+
+
+def test_the_environments_interpreter_counts_by_where_it_sits_not_what_it_resolves_to(
+    venv, tmp_path
+):
+    """A venv's `bin/python` is a link to the base interpreter; resolving it would escape."""
+    base = tmp_path / "base-python"
+    base.write_text("")
+    link = venv / "python-link"
+    link.symlink_to(base)
+    assert "UV_PYTHON" not in spawn_env({"PATH": "/usr/bin", "UV_PYTHON": str(link)})
+
+
+def test_a_link_elsewhere_that_leads_into_the_environment_counts_by_where_it_leads(venv, tmp_path):
+    """`pip --target /x/link` follows the link and writes into the harness's site-packages."""
+    site = venv.parent / "lib" / "site-packages"
+    site.mkdir(parents=True)
+    link = tmp_path / "link-to-site"
+    link.symlink_to(site)
+    for value in (str(link), str(link / "not-yet")):
+        assert "PIP_TARGET" not in spawn_env({"PIP_TARGET": value})
+
+
+def test_a_path_that_climbs_out_of_the_environment_is_not_inside_it(venv, tmp_path):
+    """`<root>/../other/bin/python` names another environment; its spelling only passes through."""
+    other = tmp_path / "other" / "bin"
+    other.mkdir(parents=True)
+    value = f"{venv.parent}/../other/bin/python3"
+    assert spawn_env({"UV_PYTHON": value})["UV_PYTHON"] == value
+
+
+def test_a_root_variable_naming_a_directory_inside_the_environment_is_kept(venv):
+    """`VIRTUAL_ENV` names an environment's root; a directory inside the harness's is not it."""
+    nested = str(venv.parent / "lib")
+    assert spawn_env({"VIRTUAL_ENV": nested})["VIRTUAL_ENV"] == nested
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["3.12", "cpython@3.13", "venv/bin/python", ""],
+    ids=["version", "request", "relative", "empty"],
+)
+def test_a_value_that_names_no_absolute_place_is_never_judged(venv, value):
+    for variable in ("VIRTUAL_ENV", "UV_PYTHON", "PIP_TARGET"):
+        assert spawn_env({variable: value})[variable] == value
+
+
+def test_a_prefix_of_the_environments_name_is_not_the_environment(venv, tmp_path):
+    lookalike = tmp_path / "venv-other"
+    lookalike.mkdir()
+    child = spawn_env({"VIRTUAL_ENV": str(lookalike), "PIP_TARGET": str(lookalike / "x")})
+    assert child["VIRTUAL_ENV"] == str(lookalike)
+    assert child["PIP_TARGET"] == str(lookalike / "x")
+
+
+def test_the_unmeasured_variables_are_left_alone(venv):
+    """`PYTHONHOME`, `PYTHONPATH` and `PIP_ROOT` lead no install into it (see `_venv`)."""
+    root = str(venv.parent)
+    names = {"PYTHONHOME": root, "PYTHONPATH": f"{root}/lib", "PIP_ROOT": root}
+    assert {name: spawn_env(names)[name] for name in names} == names
+
+
+def test_outside_a_virtual_environment_no_installer_variable_is_removed(venv, monkeypatch):
+    monkeypatch.setattr(sys, "base_prefix", sys.prefix)
+    assert spawn_env({"VIRTUAL_ENV": sys.prefix})["VIRTUAL_ENV"] == sys.prefix
+
+
+def test_a_child_that_runs_nothing_of_ours_loses_the_installer_variables_too(venv):
+    child = spawn_env({"VIRTUAL_ENV": str(venv.parent)}, commands=False)
+    assert "VIRTUAL_ENV" not in child
+
+
+# --- What the shell tool tells the model holds in both cases -----------------------
+
+
+def test_without_the_commands_directory_a_harness_command_is_not_found_by_name(venv, monkeypatch):
+    """What the note says of a name not found: the harness could not put it on the PATH."""
+    monkeypatch.setattr(_venv, "_PARENT", str(venv.parent / "missing"))
+    child = spawn_env({"PATH": f"{venv}:/usr/bin:/bin"})
+    found = _bash(f"{path_preamble(child)}\ncommand -v basecradle-harness-verify", env=child)
+    assert found == ""
+
+
+def test_with_the_commands_directory_a_harness_command_is_found_there(venv):
+    child = spawn_env({"PATH": f"{venv}:/usr/bin:/bin"})
+    found = _bash(f"{path_preamble(child)}\ncommand -v basecradle-harness-verify", env=child)
+    assert found == os.path.join(commands_dir(), "basecradle-harness-verify")

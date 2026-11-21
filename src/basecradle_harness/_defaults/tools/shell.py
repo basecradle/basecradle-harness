@@ -24,10 +24,11 @@ PLUGIN = ToolPlugin(
         'Your home directory and its seven standing folders are described under "Your Home" '
         "in your instructions; each folder's README is its law. "
         "Your harness's own commands (`basecradle-harness-*`, and `mempalace` where it is "
-        "installed) come first on your PATH, from a directory that holds nothing else — run "
-        "them by name (`mempalace status` reads your own memory palace, if that is your "
-        "backend). The Python environment your harness runs from is not on your PATH: "
-        "`python3`, `pip` and every other command resolve to the system's or your own, never "
-        "to your harness's."
+        "installed) go first on your PATH, from a directory that holds nothing else, whenever "
+        "the harness can make that directory — run them by name (`mempalace status` reads your "
+        "own memory palace, if that is your backend). If one of them is not found by name, the "
+        "harness could not put it on your PATH for that command. "
+        "Your harness's own Python environment, if it has one, is never on your PATH: "
+        "`python3`, `pip` and every other command resolve to the system's or your own."
     ),
 )
