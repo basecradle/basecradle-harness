@@ -7,7 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.204.3] - 2026-11-21
+## [0.205.0] - 2026-11-21
 
 ### Fixed: An HTTP status a gRPC endpoint answered with is named as the HTTP adapters name it, so an edge's 525 is retried in place (issue #962)
 
