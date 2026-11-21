@@ -22,12 +22,13 @@ directly where they live. Some signals are not, and this module holds their heur
   404 and both configuration: no endpoint for the model in a regional host's region, or endpoints
   in it that the configured provider list permits none of. The status alone cannot tell them from
   each other or from a missing model, and the reason a fallback line carries must name which.
-- `edge_server_status` — the HTTP 5xx an edge in front of a **gRPC** endpoint answered with (issue
-  #962). gRPC has no code for "the server answered HTTP 525", so its core library folds a non-200
-  HTTP/2 ``:status`` into a gRPC code (``502``/``503``/``504`` → ``UNAVAILABLE``, every other 5xx,
-  Cloudflare's ``520``–``527`` among them, → ``UNKNOWN``) and keeps the number only in the detail:
-  ``Received http2 header with status: 525``. The code alone cannot tell that from a genuine unknown
-  fault, so the number in the text decides.
+- `folded_http_status` — the HTTP status an endpoint answered a **gRPC** call with (issue #962).
+  gRPC has no code for "the server answered HTTP 525", so its core library folds a non-200 HTTP/2
+  ``:status`` into a gRPC code (``400`` → ``INTERNAL``, ``401`` → ``UNAUTHENTICATED``, ``403`` →
+  ``PERMISSION_DENIED``, ``404`` → ``UNIMPLEMENTED``, ``429``/``502``/``503``/``504`` →
+  ``UNAVAILABLE``, every other status, Cloudflare's ``520``–``527`` among them, → ``UNKNOWN``) and
+  keeps the number only in the detail: ``Received http2 header with status: 525``. The code alone
+  cannot say what the endpoint said, so the number in the text decides.
 
 Each is a sibling of `basecradle_harness._context.is_context_overflow` — a phrase match on a
 provider error string — and each **fails safe** exactly as it does: a phrasing they do not recognize
@@ -179,28 +180,26 @@ def routing_refusal(text: str) -> str | None:
     return next((reason for reason, phrase in _ROUTING_REFUSALS if phrase in folded), None)
 
 
-#: gRPC core's own sentence for an HTTP/2 response whose ``:status`` was not 200, which is the only
-#: place the HTTP status survives the fold into a gRPC code (`edge_server_status`). Anchored on the
-#: library's wording, not a vendor's: every gRPC client built on gRPC core writes it, whoever runs
-#: the edge.
+#: gRPC core's own sentence for an HTTP/2 response whose ``:status`` was not 200, the only place the
+#: HTTP status survives the fold into a gRPC code (`folded_http_status`). Anchored on the library's
+#: wording, never a vendor's: every client built on gRPC core writes it, whoever runs the endpoint.
 _HTTP2_STATUS = re.compile(r"received http2 header with status: ?(\d{3})\b", re.IGNORECASE)
 
 
-def edge_server_status(text: str) -> int | None:
-    """The HTTP 5xx a gRPC call's edge answered with, read from the error's detail (issue #962).
+def folded_http_status(text: str) -> int | None:
+    """The HTTP status gRPC core folded into a gRPC code, read back from the detail (issue #962).
 
-    Returns the status (``525``) when the text is gRPC core's account of a 5xx HTTP/2 response, and
-    ``None`` for anything else, a 4xx included. A 5xx is the server's side failing, whether the edge
-    or the origin behind it (``525`` is the edge failing its handshake with the origin): the request
-    was well-formed, and the identical request is the right retry, exactly as a 5xx is on every HTTP
-    adapter. Fails safe like its siblings: a wording it does not recognize returns ``None`` and the
-    adapter keeps the classification it had.
+    Returns the status (``525``) when the text is gRPC core's account of a non-200 HTTP/2 response,
+    else ``None``. The caller names the fault by the status, exactly as an HTTP adapter would for the
+    same status (`docs/telemetry.md` → Fault Slugs), because the code it arrived under is the
+    library's lossy guess at it. Fails safe like its siblings: a wording it does not recognize
+    returns ``None`` and the adapter keeps the classification the code gives.
     """
     found = _HTTP2_STATUS.search(text or "")
     if found is None:
         return None
     status = int(found.group(1))
-    return status if 500 <= status <= 599 else None
+    return status if 100 <= status <= 599 else None
 
 
 def is_out_of_funds(text: str) -> bool:

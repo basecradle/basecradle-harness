@@ -88,6 +88,7 @@ from typing import Any
 from basecradle_harness._caching import AUTOMATIC
 from basecradle_harness._context import is_context_overflow, request_chars
 from basecradle_harness._exceptions import (
+    ProviderAPIError,
     ProviderAuthError,
     ProviderBillingError,
     ProviderConnectionError,
@@ -101,7 +102,7 @@ from basecradle_harness._exceptions import (
     ProviderToolSchemaError,
 )
 from basecradle_harness._faults import (
-    edge_server_status,
+    folded_http_status,
     is_out_of_funds,
     is_too_large,
     refused_tool_schema,
@@ -889,9 +890,9 @@ class _grpc_error_context:
 
     The engine and tools catch `ProviderConnectionError` / `ProviderError` (and the auth /
     rate-limit subclasses), so gRPC's ``RpcError`` status codes are normalized here, once — an
-    auth failure to `ProviderAuthError`, a rate limit to `ProviderRateLimitError`, an HTTP 5xx the
-    endpoint answered with to `ProviderServerError`, an unreachable endpoint to
-    `ProviderConnectionError`, anything else to a `ProviderError`.
+    auth failure to `ProviderAuthError`, a rate limit to `ProviderRateLimitError`, an HTTP status the
+    endpoint answered with to the class an HTTP adapter raises for it (`_by_http_status`), an
+    unreachable endpoint to `ProviderConnectionError`, anything else to a `ProviderError`.
     """
 
     def __enter__(self) -> None:
@@ -924,6 +925,24 @@ class _grpc_error_context:
             # below, exactly as it did before the per-tool drop existed.
             name, reason = refused
             raise ProviderToolSchemaError(message, tool_name=name, reason=reason) from exc
+        # The codes gRPC core folds a non-200 HTTP/2 `:status` into (`grpc_http2_status_to_grpc_
+        # status`). The sentence under any other code is not the library's fold, so the code decides.
+        folded = (
+            grpc.StatusCode.INTERNAL,
+            grpc.StatusCode.UNAUTHENTICATED,
+            grpc.StatusCode.PERMISSION_DENIED,
+            grpc.StatusCode.UNIMPLEMENTED,
+            grpc.StatusCode.UNAVAILABLE,
+            grpc.StatusCode.UNKNOWN,
+        )
+        status = folded_http_status(detail) if code in folded else None
+        if status is not None:
+            # The endpoint answered with an HTTP status, which gRPC core folded into a code that
+            # cannot say what it was, keeping the number only in the detail (issue #962). Named by
+            # the status, as every HTTP adapter names the same status (`_by_http_status`): read by
+            # its code alone, an edge's 525 under UNKNOWN gave up on its first attempt as
+            # `provider_error`, and a 504 under UNAVAILABLE read `transport`.
+            raise _by_http_status(status, message, detail) from exc
         if code == grpc.StatusCode.UNAUTHENTICATED:
             raise ProviderAuthError(message, status_code=401) from exc
         if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
@@ -954,16 +973,6 @@ class _grpc_error_context:
             # it is typed here (issue #589): a timeout is retried once with a larger deadline,
             # never re-sent into the same one, and it must read the same on every adapter.
             raise ProviderTimeoutError(message) from exc
-        if code in (grpc.StatusCode.UNKNOWN, grpc.StatusCode.UNAVAILABLE):
-            status = edge_server_status(detail)
-            if status is not None:
-                # The endpoint answered with an HTTP 5xx, folded by gRPC core into a code that
-                # cannot say so (issue #962): 502/503/504 into UNAVAILABLE, every other 5xx, an
-                # edge's 520-527 among them, into UNKNOWN, the number kept only in the detail. It
-                # is the server's side failing, so it is the shared 5xx class every HTTP adapter
-                # raises for the same status, and it is retried in place. Read as UNKNOWN alone, a
-                # 525 at the edge gave up on the first attempt as `provider_error`.
-                raise ProviderServerError(message, status_code=status, body=detail) from exc
         if code == grpc.StatusCode.UNAVAILABLE:
             raise ProviderConnectionError(message) from exc
         if code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.DATA_LOSS):
@@ -979,6 +988,31 @@ class _grpc_error_context:
         # message once the config is fixed; propagating leaves it re-drivable (issue #336; CLAUDE.md →
         # Provider Capabilities, "a bad model_params.json key propagates on the first raise").
         raise ProviderError(message) from exc
+
+
+def _by_http_status(status: int, message: str, detail: str) -> ProviderError:
+    """The provider error an HTTP adapter raises for `status`, for a status gRPC folded (#962).
+
+    Row for row the Fault Slugs table (`docs/telemetry.md`): ``401``/``403`` auth, ``402`` billing,
+    ``413`` too large, ``429`` rate-limited, ``504`` the vendor's own deadline (a timeout on every
+    vendor, issue #759), any other ``5xx`` the server's side, anything else the plain API error,
+    which names a ``404`` ``config:model_not_found`` and propagates like a generic ``400``. The
+    phrase checks that read the detail first (a context overflow, a refused tool schema) have
+    already run, so a ``400`` or ``413`` that says more is named for what it says.
+    """
+    if status in (401, 403):
+        return ProviderAuthError(message, status_code=status, body=detail)
+    if status == 402:
+        return ProviderBillingError(message, status_code=status, body=detail)
+    if status == 413:
+        return ProviderPayloadTooLargeError(message, status_code=status, body=detail)
+    if status == 429:
+        return ProviderRateLimitError(message, status_code=status, body=detail)
+    if status == 504:
+        return ProviderTimeoutError(message, status_code=status, body=detail, vendor_deadline=True)
+    if status >= 500:
+        return ProviderServerError(message, status_code=status, body=detail)
+    return ProviderAPIError(message, status_code=status, body=detail)
 
 
 def _enum_name(enum: Any, value: Any, prefix: str) -> str:

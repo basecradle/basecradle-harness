@@ -38,7 +38,7 @@ from basecradle_harness import (
     XaiSdkProvider,
 )
 from basecradle_harness._engine import _TRANSIENT
-from basecradle_harness._retry import connection_reason
+from basecradle_harness._retry import connection_reason, fault_slug
 from basecradle_harness._xai_sdk import CONVERSATION_METADATA_KEY
 from tests.conftest import mail_tool, tool_lines
 
@@ -499,8 +499,8 @@ def test_the_edge_525_that_gave_up_on_its_first_attempt_is_a_retried_5xx():
     ("code", "status"),
     [
         *((grpc.StatusCode.UNKNOWN, s) for s in (500, 501, 505, *range(520, 528))),
-        # gRPC core folds these three into UNAVAILABLE; they are the server's 5xx all the same.
-        *((grpc.StatusCode.UNAVAILABLE, s) for s in (502, 503, 504)),
+        # gRPC core folds these two into UNAVAILABLE; they are the server's 5xx all the same.
+        *((grpc.StatusCode.UNAVAILABLE, s) for s in (502, 503)),
     ],
 )
 def test_every_edge_5xx_is_the_server_class_whatever_code_grpc_folded_it_into(code, status):
@@ -514,23 +514,67 @@ def test_every_edge_5xx_is_the_server_class_whatever_code_grpc_folded_it_into(co
 
 
 @pytest.mark.parametrize(
+    ("code", "status", "slug"),
+    [
+        # Every row of `docs/telemetry.md` -> Fault Slugs, under the code gRPC core folds it into.
+        (grpc.StatusCode.UNAUTHENTICATED, 401, "config:auth"),
+        (grpc.StatusCode.PERMISSION_DENIED, 403, "config:auth"),
+        (grpc.StatusCode.UNKNOWN, 402, "config:billing"),
+        (grpc.StatusCode.UNIMPLEMENTED, 404, "config:model_not_found"),
+        (grpc.StatusCode.UNKNOWN, 413, "payload_too_large"),
+        (grpc.StatusCode.UNAVAILABLE, 429, "rate_limited"),
+        (grpc.StatusCode.UNAVAILABLE, 504, "timeout"),
+        (grpc.StatusCode.UNKNOWN, 525, "server_error"),
+        (grpc.StatusCode.INTERNAL, 400, "api_error"),
+        (grpc.StatusCode.UNKNOWN, 418, "api_error"),
+    ],
+)
+def test_a_folded_http_status_is_named_as_every_http_adapter_names_it(code, status, slug):
+    """A fault known by its HTTP status is named by the Fault Slugs table on every producer (#786).
+
+    gRPC keeps the status only in its detail, so before issue #962 the code named it instead: a
+    504 read ``transport`` (where the table says ``timeout``), a 429 ``transport`` (``rate_limited``),
+    a 400 under INTERNAL ``invalid_response`` and was retried (``api_error``, which propagates).
+    """
+    with pytest.raises(ProviderError) as raised:
+        _raising_detail(code, f"Received http2 header with status: {status}").chat(
+            [Message.user("hi")]
+        )
+
+    assert fault_slug(raised.value) == slug
+    assert raised.value.status_code == status
+
+
+def test_a_folded_504_is_the_vendors_own_deadline():
+    """A 504 is a timeout on every vendor, retried once with more time, and the deadline is not
+    the harness's own, so its budget is never named on the line (issues #759, #589)."""
+    with pytest.raises(ProviderTimeoutError) as raised:
+        _raising_detail(grpc.StatusCode.UNAVAILABLE, "Received http2 header with status: 504").chat(
+            [Message.user("hi")]
+        )
+
+    assert raised.value.vendor_deadline is True
+    assert connection_reason(raised.value) == "timeout"
+
+
+@pytest.mark.parametrize(
     ("code", "detail", "expected"),
     [
         # No HTTP status in the detail: a genuine unknown fault stays the plain, propagating error.
         (grpc.StatusCode.UNKNOWN, "Stream removed", ProviderError),
-        # A 4xx the edge answered with is not the server's fault, so it is not made transient.
-        (grpc.StatusCode.UNKNOWN, "Received http2 header with status: 418", ProviderError),
         # UNAVAILABLE with no status is gRPC's could-not-reach, which stays a transport failure.
         (
             grpc.StatusCode.UNAVAILABLE,
             "failed to connect to all addresses",
             ProviderConnectionError,
         ),
-        # A status in the text under any other code is not gRPC core's fold, so the code decides.
+        # INTERNAL with no status is a broken payload, retried as it was (issue #259).
+        (grpc.StatusCode.INTERNAL, "Failed parsing HTTP/2", ProviderResponseError),
+        # A status-shaped sentence under a code gRPC core never folds into is not its fold.
         (grpc.StatusCode.INVALID_ARGUMENT, _EDGE_525, ProviderError),
     ],
 )
-def test_only_a_5xx_under_the_codes_grpc_folds_it_into_is_read_as_one(code, detail, expected):
+def test_without_a_folded_status_the_code_decides_as_before(code, detail, expected):
     with pytest.raises(ProviderError) as raised:
         _raising_detail(code, detail).chat([Message.user("hi")])
 
