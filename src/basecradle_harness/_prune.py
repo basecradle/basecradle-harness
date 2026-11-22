@@ -471,7 +471,8 @@ BAND_LABELS = (
 )
 
 #: Why a candidate is in no group, judged in this order, so each is counted once.
-#: A near-copy of another ungrouped candidate: its repeated set is smaller than `FLOOR`.
+#: A near-copy of another ungrouped candidate: what is left of its repeated set, once the groups
+#: took their members, is smaller than `FLOOR`.
 SMALL_SET = "small_set"
 #: A near-copy of a group's member only, never of the group's anchor: a chain is not a template.
 NEAR_MEMBER = "near_member"
@@ -501,13 +502,15 @@ class Diagnosis:
     anchors: int = 0
     #: The ungrouped candidates by why (`SMALL_SET`, `NEAR_MEMBER`, `DISTINCT`).
     why: Counter = field(default_factory=Counter)
+    #: The ungrouped candidates that had `FLOOR` − 1 near-copies or more before the groups took
+    #: some of them: the floor kept them out only because an earlier group claimed their twins.
+    taken: int = 0
     #: The ungrouped candidates by the band (`BAND_LABELS`) of their best overlap with any group's
-    #: anchor, the instruction and the reply each on its own. Empty when there is no group.
+    #: anchor, the instruction and the reply each on its own. Empty when there is no group. No
+    #: ungrouped candidate is a near-copy of an anchor on both halves (it would have joined that
+    #: group), so the top band of one half counts the candidates that half alone would have grouped.
     instruction: Counter = field(default_factory=Counter)
     reply: Counter = field(default_factory=Counter)
-    #: The ungrouped candidates that are a near-copy of some anchor on one half and not the other.
-    instruction_only: int = 0
-    reply_only: int = 0
 
     @property
     def ungrouped(self) -> int:
@@ -565,15 +568,13 @@ def diagnose(
             diagnosis.why[NEAR_MEMBER] += 1
         else:
             diagnosis.why[DISTINCT] += 1
+        diagnosis.taken += len(neighbours[i]) >= FLOOR - 1
         if not anchors:
             continue
         instruction = [jaccard(exchange.instruction_words, a.instruction_words) for a in anchors]
         reply = [jaccard(exchange.reply_words, a.reply_words) for a in anchors]
         diagnosis.instruction[_band(max(instruction))] += 1
         diagnosis.reply[_band(max(reply))] += 1
-        pairs = list(zip(instruction, reply, strict=True))
-        diagnosis.instruction_only += any(x >= NEAR_COPY > y for x, y in pairs)
-        diagnosis.reply_only += any(y >= NEAR_COPY > x for x, y in pairs)
     diagnosis.months = dict(sorted(months.items()))
     return diagnosis
 
@@ -1450,9 +1451,12 @@ def _print_diagnosis(diagnosis: Diagnosis) -> None:
     why = diagnosis.why
     print(
         f"ungrouped: {diagnosis.ungrouped}  "
-        f"in a repeated set under the floor of {FLOOR}: {why[SMALL_SET]}  "
+        f"in what was left of a repeated set, under the floor of {FLOOR}: {why[SMALL_SET]}  "
         f"near-copy of a group member, not its anchor: {why[NEAR_MEMBER]}  "
         f"near-copy of no candidate: {why[DISTINCT]}"
+    )
+    print(
+        f"  had {FLOOR - 1} near-copies or more before earlier groups took some: {diagnosis.taken}"
     )
     if not diagnosis.anchors:
         print("  best overlap with a group's anchor: no group, so no anchor")
@@ -1460,10 +1464,6 @@ def _print_diagnosis(diagnosis: Diagnosis) -> None:
     for half, bands in (("instruction", diagnosis.instruction), ("reply", diagnosis.reply)):
         counts = ", ".join(f"{label} {bands[label]}" for label in BAND_LABELS)
         print(f"  best {half} overlap with a group's anchor: {counts}")
-    print(
-        f"  near-copy of an anchor on one half only: instruction {diagnosis.instruction_only}, "
-        f"reply {diagnosis.reply_only}"
-    )
 
 
 def build_parser() -> argparse.ArgumentParser:

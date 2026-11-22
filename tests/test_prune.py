@@ -996,7 +996,7 @@ def test_the_practice_store_is_counted_by_month_and_its_ungrouped_by_why(store):
     # The five carry the check-in's reply; their instruction is what keeps them out of the group.
     assert diagnosis.instruction == {"0.7 to 0.8": 5, "below 0.5": 14}
     assert diagnosis.reply == {"0.8 or more": 5, "below 0.5": 14}
-    assert (diagnosis.instruction_only, diagnosis.reply_only) == (0, 5)
+    assert diagnosis.taken == 0
 
 
 def test_a_near_copy_of_a_member_but_not_of_its_anchor_is_counted_as_such(store):
@@ -1023,7 +1023,6 @@ def test_a_near_copy_of_a_member_but_not_of_its_anchor_is_counted_as_such(store)
     assert diagnosis.why == {_prune.NEAR_MEMBER: 1}
     assert diagnosis.instruction == {"0.8 or more": 1}
     assert diagnosis.reply == {"0.5 to 0.7": 1}
-    assert (diagnosis.instruction_only, diagnosis.reply_only) == (1, 0)
 
 
 def test_with_no_group_the_repeated_set_is_under_the_floor_and_nothing_is_measured(
@@ -1037,7 +1036,8 @@ def test_with_no_group_the_repeated_set_is_under_the_floor_and_nothing_is_measur
     assert diagnosis.anchors == 0 and not diagnosis.instruction and not diagnosis.reply
     assert _main(store, monkeypatch) == 0
     out = capsys.readouterr().out
-    assert "ungrouped: 5  in a repeated set under the floor of 6: 5" in out
+    assert "ungrouped: 5  in what was left of a repeated set, under the floor of 6: 5" in out
+    assert "  had 5 near-copies or more before earlier groups took some: 0" in out
     assert "no group, so no anchor" in out
 
 
@@ -1063,16 +1063,46 @@ def test_the_output_carries_the_months_each_group_span_and_the_bands(store, monk
         "  best instruction overlap with a group's anchor: below 0.5 14, 0.5 to 0.7 0, "
         "0.7 to 0.8 0, 0.8 or more 0"
     ) in out
-    assert "  near-copy of an anchor on one half only: instruction 0, reply 0" in out
 
 
-def test_the_diagnosis_never_moves_the_plan(store, monkeypatch):
-    """Counting is not deciding: the plan and its hash are the same with the diagnosis gone."""
-    _check_ins(store, 8)
+def test_the_neighbours_the_diagnosis_shares_group_exactly_as_computed_ones(store):
+    """`offer` hands `groups` the neighbours it computed for `diagnose`: the groups are the same."""
+    _check_ins(store, 12)
+    for i in range(8):
+        when = START + timedelta(days=3, hours=i)
+        store.file(f"{current_line(700 + i, when)}\nWater the balcony plants.", "Watered them.")
     _later(store)
-    with_it = store.offer()
-    monkeypatch.setattr(_prune, "diagnose", lambda *_: _prune.Diagnosis(months={}))
-    assert store.offer().hash == with_it.hash
+    candidates = store.offer().survey.candidates
+
+    def shape(found):
+        return [(g.id, [m.name for m in g.members], g.exceptions) for g in found]
+
+    assert shape(_prune.groups(candidates)) == shape(
+        _prune.groups(candidates, _prune._neighbours(candidates))
+    )
+
+
+def test_exceptions_are_counted_in_their_month_and_an_all_exception_group_keeps_no_latest(store):
+    """A group whose every member carries a word of its own: six exceptions, no copy, no latest."""
+    chore = "Water the balcony plants and check the soil and the drip line before noon"
+    for i, word in enumerate(["amber", "birch", "cedar", "delta", "ember", "fjord"]):
+        when = START + timedelta(days=31, hours=i)  # August
+        store.file(f"{current_line(700 + i, when)}\n{chore} {word}.", "Watered them.")
+    names = _check_ins(store, 10)
+    user, reply = hourly(10, START + timedelta(hours=10))
+    store.file(user, f"{reply} Disk alarm.")  # July: an exception in the check-ins' group
+
+    offer = store.offer()
+
+    assert len(offer.groups) == 2
+    (chores,) = [g for g in offer.groups if g.members[0].due.month == 8]
+    assert chores.latest is None and chores.copies == []
+    assert offer.diagnosis.months == {
+        "2026-07": _prune.Month(
+            candidates=11, members=11, copies=len(names) - 1, latest=1, exceptions=1
+        ),
+        "2026-08": _prune.Month(candidates=6, members=6, exceptions=6),
+    }
 
 
 @pytest.mark.parametrize(
@@ -1104,3 +1134,26 @@ def test_the_best_overlap_is_the_best_over_every_anchor(store):
     assert diagnosis.anchors == 2
     assert diagnosis.instruction == {"0.7 to 0.8": 1}
     assert diagnosis.reply == {"0.8 or more": 1}
+
+
+def test_a_candidate_whose_twins_an_earlier_group_claimed_is_counted_as_taken(store):
+    """Five near-copies before grouping, none left after: the floor did not keep it out alone."""
+    vocabulary = [f"word{k}" for k in range(12)]
+    replies = (
+        [vocabulary[0:10]] * 3  # the anchor's template
+        + [vocabulary[0:9] + ["other"]] * 2  # near the template only: they make it the anchor
+        + [vocabulary[1:11]] * 5  # shifted by one: near the template, so they join its group
+        + [vocabulary[2:12]]  # shifted by two: near the five shifted ones, never the template
+    )
+    for i, reply in enumerate(replies):
+        store.file(
+            f"{current_line(i, START + timedelta(hours=i))}\nRun the drift probe.", " ".join(reply)
+        )
+
+    offer = store.offer()
+    (group,) = offer.groups
+    (outside,) = [e for e in offer.survey.candidates if e not in group.members]
+
+    assert sum(_prune.near(outside, member) for member in group.members) == 5
+    assert offer.diagnosis.why == {_prune.NEAR_MEMBER: 1}
+    assert offer.diagnosis.taken == 1

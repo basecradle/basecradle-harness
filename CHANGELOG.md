@@ -15,7 +15,7 @@ The first dry run on the store that was counted grouped 223 of its 447 candidate
 
 - **Each group's span:** the first and last month its members were due.
 - **By due month (UTC):** the candidates, the group members, the copies a yes removes, the latest copies kept, the exceptions kept, and the ungrouped.
-- **Why the ungrouped stayed out**, each counted once, in this order: in a repeated set under the floor of six; a near-copy of a group's member but not of its anchor; a near-copy of no other candidate. Then each one's best overlap with any group's anchor, banded (below 0.5, 0.5 to 0.7, 0.7 to 0.8, 0.8 or more), for the instruction and the reply separately, and how many are a near-copy of an anchor on one half only.
+- **Why the ungrouped stayed out**, each counted once, in this order: what was left of its repeated set, once the groups took their members, is under the floor of six; a near-copy of a group's member but not of its anchor; a near-copy of no other candidate. Separately, how many had five near-copies or more before the groups took some, so a floor that kept a candidate out only because an earlier group claimed its twins is not read as the floor alone. Then each one's best overlap with any group's anchor, banded (below 0.5, 0.5 to 0.7, 0.7 to 0.8, 0.8 or more), for the instruction and the reply separately. None is a near-copy of an anchor on both halves, so a top band counts the ones that half alone would have grouped.
 - **Nothing about the rule changes.** The plan, its hash and what an apply removes never read these counts, and `RULE` stays 1, so the plan the counted store was given is still the plan it is given.
 
 ## [0.207.0] - 2026-11-22
