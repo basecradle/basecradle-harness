@@ -96,6 +96,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -399,16 +400,18 @@ def _neighbours(exchanges: list[Exchange]) -> list[set[int]]:
     return neighbours
 
 
-def groups(exchanges: list[Exchange]) -> list[Group]:
+def groups(exchanges: list[Exchange], neighbours: list[set[int]] | None = None) -> list[Group]:
     """The candidates' groups: anchored templates of at least `FLOOR` members, residue held back.
 
     Deterministic. The anchor of each next group is the unassigned candidate with the most
     unassigned near-copies (ties: the earliest due, then the file name), and the group is the
     anchor with those near-copies. It stops when no unassigned candidate has `FLOOR` − 1 of them.
     A member is a near-copy of its anchor, never merely of another member: a chain of neighbours
-    is not a template.
+    is not a template. ``neighbours`` is `_neighbours` of these exchanges, when the caller already
+    has it.
     """
-    neighbours = _neighbours(exchanges)
+    if neighbours is None:
+        neighbours = _neighbours(exchanges)
     unassigned = set(range(len(exchanges)))
     found: list[Group] = []
     while unassigned:
@@ -449,6 +452,131 @@ def _residue(members: list[Exchange]) -> dict[str, list[str]]:
             if rare:
                 exceptions.setdefault(member.name, []).extend(rare)
     return {name: sorted(set(rare)) for name, rare in exceptions.items()}
+
+
+# --- the diagnosis ------------------------------------------------------------------------------
+#
+# Counts that show how the rule met a store, so the rule can be judged on real data before any
+# threshold moves (issue #973: the first dry run on the counted store grouped about half its
+# candidates, and the numbers come before any change). Nothing here decides anything: the plan, its
+# hash and what an apply removes never read it, and it carries counts only, never drawer text.
+
+#: The upper edges of the bands an ungrouped candidate's best overlap with a group's anchor is
+#: counted in, for each half. The last band, at or above `NEAR_COPY`, is a near-copy's.
+BANDS = (0.5, 0.7, NEAR_COPY)
+BAND_LABELS = (
+    f"below {BANDS[0]}",
+    *(f"{low} to {high}" for low, high in pairwise(BANDS)),
+    f"{BANDS[-1]} or more",
+)
+
+#: Why a candidate is in no group, judged in this order, so each is counted once.
+#: A near-copy of another ungrouped candidate: what is left of its repeated set, once the groups
+#: took their members, is smaller than `FLOOR`.
+SMALL_SET = "small_set"
+#: A near-copy of a group's member only, never of the group's anchor: a chain is not a template.
+NEAR_MEMBER = "near_member"
+#: A near-copy of no other candidate.
+DISTINCT = "distinct"
+
+
+@dataclass
+class Month:
+    """One calendar month's candidates (by due time, UTC), and where each of them went."""
+
+    candidates: int = 0
+    members: int = 0
+    copies: int = 0
+    latest: int = 0
+    exceptions: int = 0
+    ungrouped: int = 0
+
+
+@dataclass
+class Diagnosis:
+    """How the rule met a store: the months, and why the ungrouped candidates did not group."""
+
+    #: ``YYYY-MM -> Month``, oldest first.
+    months: dict[str, Month]
+    #: How many group anchors the ungrouped were measured against: one per group.
+    anchors: int = 0
+    #: The ungrouped candidates by why (`SMALL_SET`, `NEAR_MEMBER`, `DISTINCT`).
+    why: Counter = field(default_factory=Counter)
+    #: The ungrouped candidates that had `FLOOR` − 1 near-copies or more before the groups took
+    #: some of them: the floor kept them out only because an earlier group claimed their twins.
+    taken: int = 0
+    #: The ungrouped candidates by the band (`BAND_LABELS`) of their best overlap with any group's
+    #: anchor, the instruction and the reply each on its own. Empty when there is no group. No
+    #: ungrouped candidate is a near-copy of an anchor on both halves (it would have joined that
+    #: group), so the top band of one half counts the candidates that half alone would have grouped.
+    instruction: Counter = field(default_factory=Counter)
+    reply: Counter = field(default_factory=Counter)
+
+    @property
+    def ungrouped(self) -> int:
+        return sum(self.why.values())
+
+
+def _month(stamp: datetime) -> str:
+    return stamp.strftime("%Y-%m")
+
+
+def _band(overlap: float) -> str:
+    for edge, label in zip(BANDS, BAND_LABELS, strict=False):
+        if overlap < edge:
+            return label
+    return BAND_LABELS[-1]
+
+
+def diagnose(
+    exchanges: list[Exchange], found_groups: list[Group], neighbours: list[set[int]]
+) -> Diagnosis:
+    """Count, by month, where the candidates went; and why the ones in no group are in none.
+
+    ``neighbours`` is `_neighbours` of ``exchanges``, the same pairs `groups` grouped by.
+    """
+    index = {exchange.name: i for i, exchange in enumerate(exchanges)}
+    months: dict[str, Month] = {}
+
+    def row(exchange: Exchange) -> Month:
+        return months.setdefault(_month(exchange.due), Month())
+
+    for exchange in exchanges:
+        row(exchange).candidates += 1
+    grouped: set[int] = set()
+    for group in found_groups:
+        copies = {copy.name for copy in group.copies}
+        for member in group.members:
+            grouped.add(index[member.name])
+            month = row(member)
+            month.members += 1
+            if member.name in group.exceptions:
+                month.exceptions += 1
+            elif member.name in copies:
+                month.copies += 1
+            else:
+                month.latest += 1
+    anchors = [group.anchor for group in found_groups]
+    diagnosis = Diagnosis(months={}, anchors=len(anchors))
+    for i, exchange in enumerate(exchanges):
+        if i in grouped:
+            continue
+        row(exchange).ungrouped += 1
+        if neighbours[i] - grouped:
+            diagnosis.why[SMALL_SET] += 1
+        elif neighbours[i]:
+            diagnosis.why[NEAR_MEMBER] += 1
+        else:
+            diagnosis.why[DISTINCT] += 1
+        diagnosis.taken += len(neighbours[i]) >= FLOOR - 1
+        if not anchors:
+            continue
+        instruction = [jaccard(exchange.instruction_words, a.instruction_words) for a in anchors]
+        reply = [jaccard(exchange.reply_words, a.reply_words) for a in anchors]
+        diagnosis.instruction[_band(max(instruction))] += 1
+        diagnosis.reply[_band(max(reply))] += 1
+    diagnosis.months = dict(sorted(months.items()))
+    return diagnosis
 
 
 # --- the store ----------------------------------------------------------------------------------
@@ -869,12 +997,14 @@ class Offer:
     hash: str
     report: Path
     backups: list[str]
+    diagnosis: Diagnosis
 
 
 def offer(collection, palace: Path, state: Path) -> Offer:
     """Survey the store, group the candidates, and write the report and its plan. No store write."""
     found = survey(collection, palace)
-    found_groups = groups(found.candidates)
+    neighbours = _neighbours(found.candidates)
+    found_groups = groups(found.candidates, neighbours)
     plan = plan_of(found, found_groups)
     digest = plan_hash(plan)
     _private_dir(state)
@@ -886,7 +1016,8 @@ def offer(collection, palace: Path, state: Path) -> Offer:
     )
     record = {"hash": digest, "plan": plan}
     _write_private(state / PLAN, json.dumps(record, indent=2, ensure_ascii=False).encode("utf-8"))
-    return Offer(found, found_groups, plan, digest, report, backups)
+    diagnosis = diagnose(found.candidates, found_groups, neighbours)
+    return Offer(found, found_groups, plan, digest, report, backups, diagnosis)
 
 
 # --- the apply ----------------------------------------------------------------------------------
@@ -1295,8 +1426,10 @@ def _print_offer(result: Offer) -> None:
     for group in result.groups:
         print(
             f"  group {group.id}: members {len(group.members)}, copies {len(group.copies)}, "
-            f"latest {1 if group.latest else 0}, exceptions {len(group.exceptions)}"
+            f"latest {1 if group.latest else 0}, exceptions {len(group.exceptions)}, "
+            f"due {_month(group.members[0].due)} to {_month(group.members[-1].due)}"
         )
+    _print_diagnosis(result.diagnosis)
     print(f"plan: {result.hash}")
     print(f"report: {result.report}")
     print(f"backups kept: {len(result.backups)}")
@@ -1304,6 +1437,33 @@ def _print_offer(result: Offer) -> None:
     for name in result.backups:
         print(f"  backup {name}: {backup_age(name, now)}")
     print("Nothing was removed.")
+
+
+def _print_diagnosis(diagnosis: Diagnosis) -> None:
+    """The candidates by due month, and why the ungrouped ones are in no group. Counts only."""
+    print("by due month (UTC):")
+    for name, month in diagnosis.months.items():
+        print(
+            f"  {name}: candidates {month.candidates}, members {month.members}, "
+            f"copies {month.copies}, latest {month.latest}, exceptions {month.exceptions}, "
+            f"ungrouped {month.ungrouped}"
+        )
+    why = diagnosis.why
+    print(
+        f"ungrouped: {diagnosis.ungrouped}  "
+        f"in what was left of a repeated set, under the floor of {FLOOR}: {why[SMALL_SET]}  "
+        f"near-copy of a group member, not its anchor: {why[NEAR_MEMBER]}  "
+        f"near-copy of no candidate: {why[DISTINCT]}"
+    )
+    print(
+        f"  had {FLOOR - 1} near-copies or more before earlier groups took some: {diagnosis.taken}"
+    )
+    if not diagnosis.anchors:
+        print("  best overlap with a group's anchor: no group, so no anchor")
+        return
+    for half, bands in (("instruction", diagnosis.instruction), ("reply", diagnosis.reply)):
+        counts = ", ".join(f"{label} {bands[label]}" for label in BAND_LABELS)
+        print(f"  best {half} overlap with a group's anchor: {counts}")
 
 
 def build_parser() -> argparse.ArgumentParser:

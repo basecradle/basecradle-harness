@@ -107,6 +107,10 @@ def test_a_real_store_is_offered_its_check_ins_and_never_mines_the_report(palace
     assert len(group.members) == 18
     later = {name for _, name in before.values()} - {m.name for m in group.members}
     assert len(later) == len(LATER)
+    months = offer.diagnosis.months
+    assert (months["2026-07"].candidates, months["2026-07"].members) == (18, 18)
+    assert (months["2026-08"].candidates, months["2026-08"].ungrouped) == (len(LATER), len(LATER))
+    assert offer.diagnosis.why == {_prune.DISTINCT: len(LATER)}
 
     # A mine of the palace after the dry run, as `mempalace mine` would run it, and one more
     # observe: neither files the report or the plan.

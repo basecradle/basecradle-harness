@@ -7,6 +7,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.208.0] - 2026-11-22
+
+### Added: `basecradle-harness-prune-palace` shows by month where its candidates went, and why the ungrouped stayed out (issue #973)
+
+The first dry run on the store that was counted grouped 223 of its 447 candidates, where the practice store had grouped 411 of 430, and its output carried no dates. So the gate (*the bulk of the one month of hourly check-ins, and none of the later tasks*) could not be read from it, and nothing said what kept the other half out. The dry run now prints counts that answer both questions, and still prints no drawer text.
+
+- **Each group's span:** the first and last month its members were due.
+- **By due month (UTC):** the candidates, the group members, the copies a yes removes, the latest copies kept, the exceptions kept, and the ungrouped.
+- **Why the ungrouped stayed out**, each counted once, in this order: what was left of its repeated set, once the groups took their members, is under the floor of six; a near-copy of a group's member but not of its anchor; a near-copy of no other candidate. Separately, how many had five near-copies or more before the groups took some, so a floor that kept a candidate out only because an earlier group claimed its twins is not read as the floor alone. Then each one's best overlap with any group's anchor, banded (below 0.5, 0.5 to 0.7, 0.7 to 0.8, 0.8 or more), for the instruction and the reply separately. None is a near-copy of an anchor on both halves, so a top band counts the ones that half alone would have grouped.
+- **Nothing about the rule changes.** The plan, its hash and what an apply removes never read these counts, and `RULE` stays 1, so the plan the counted store was given is still the plan it is given.
+
 ## [0.207.0] - 2026-11-22
 
 ### Added: `basecradle-harness-prune-palace`, which offers an agent the removal of its routine task check-ins, group by group, only on its yes (issue #973)
