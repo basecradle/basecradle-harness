@@ -142,6 +142,10 @@ basecradle-harness-log-grammar = "basecradle_harness._log_grammar:main"
 # the mining boundary was enforced (issue #438). Dry run by default; the dry run is also the
 # discovery pass for scaffolding classes the catalog does not yet name.
 basecradle-harness-scrub-palace = "basecradle_harness._scrub:main"
+# Offer an agent the removal of routine task check-ins from its own palace, group by group, and
+# carry out only the groups it says yes to (issue #973). A dry run changes nothing in the store; an
+# apply needs the plan hash of the report the agent read, and backs up everything it removes first.
+basecradle-harness-prune-palace = "basecradle_harness._prune:main"
 # Prove a MemPalace palace opens from a given HARNESS_HOME and returns drawers filed before a
 # home-directory move (issue #606). No platform call, no model call, read-only by default; the
 # off-by-default --practice-observe mode writes one exchange, for a practice copy only.

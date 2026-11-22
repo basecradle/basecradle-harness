@@ -253,6 +253,7 @@ def test_every_basic_config_goes_through_the_scrubbing_handler():
     assert {name for name, _ in sites} == {
         "_basecradle.py",
         "_scrub.py",
+        "_prune.py",
         "_palace_check.py",
         "_observability.py",
     }

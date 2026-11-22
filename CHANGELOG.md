@@ -7,6 +7,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.207.0] - 2026-11-22
+
+### Added: `basecradle-harness-prune-palace`, which offers an agent the removal of its routine task check-ins, group by group, only on its yes (issue #973)
+
+Routine task check-ins are near-copies of each other, so when recall finds one close to a conversation it finds its twins too, and they take places a distinctive memory did not get. On the one store that was counted, 416 of 431 task-started exchanges came from one month of hourly check-ins, and 42 drawers were unreachable because their own twins outranked them. By the founder decision of 2026-11-20, these are removed **only as an offer to the agent, one store at a time**, and nothing goes without its explicit yes. This tool is that offer. It is not the scrub, and the scrub is unchanged.
+
+- **What it selects:** an exchange whose first incoming line *is* the harness's own task-activation line (today's wording, read from the harness's own renderer, or the wording before 0.155.0), with no other item after it, grouped with its near-copies. A near-copy has both its instruction and its reply at 0.8 or more by symmetric Jaccard on distinct words, after uuids, timestamps, dates and numbers are made placeholders. A group is an anchor and its near-copies, never a chain, at least six members, and a member carrying a word fewer than five of the others carry is an exception that is kept.
+- **The offer changes nothing in the store.** It writes a report for the agent (why, what a yes does, and per group the size, the dates, one real example, the file it keeps and its exceptions) and the plan, both mode `0600` and outside the palace. It prints only counts, ids and the plan hash.
+- **A yes** names the plan hash and the groups. It removes each group's copies, keeps the latest one (`--remove-latest` removes that one too), and keeps every exception. It refuses when the hash is not the last plan's, when a group is not in it, or when no backup can be written. It never re-plans: a file that changed since the report is skipped and reported.
+- **Whole exchange files, with every drawer filed from them.** A drawer with no source file, or a file holding a drawer that is not from it, is left alone.
+- **A backup first:** the files byte for byte and the drawers with their embeddings, read back before the first delete. A backup is kept until the agent says it can go (`--discard-backup`), and every offer lists each one with its age.
+- **`--restore <name>`** puts back exactly what of a backup is absent: drawers with their embeddings, files with their bytes and mtime. It leaves what is present untouched and reports it, is safe to run twice, and keeps the backup.
+- **As the agent, one store per run:** a run as root, or by anyone but the palace's owner, is refused.
+- Two new journal heads, `palace prune` (`mode=dry-run|apply|restore|discard`) and `palace prune failed`, are defined in `docs/telemetry.md`.
+
 ## [0.206.0] - 2026-11-21
 
 ### Changed: Only the harness's own commands are on an agent's PATH, first; its Python and pip leave it (issue #969)

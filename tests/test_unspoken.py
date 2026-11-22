@@ -521,7 +521,41 @@ def _model_facing_strings():
         # Issue #853: what the model reads about the OpenRouter balance tool, rewritten there.
         "openrouter_account_balance description": OpenRouterAccountBalanceTool.description,
         "openrouter_account_balance note": _shipped_note("openrouter_account_balance.py"),
+        # Issue #973: the report an agent reads before it says yes to pruning its own memory.
+        "prune report": _prune_report(),
     }
+
+
+def _prune_report() -> str:
+    """`basecradle-harness-prune-palace`'s report for one fabricated group, an exception and a backup."""
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from basecradle_harness import _prune
+
+    def member(n: int) -> _prune.Exchange:
+        return _prune.Exchange(
+            name=f"m{n}.md",
+            path=Path(f"/home/nova/mempalace/conversations/m{n}.md"),
+            sha256="0" * 64,
+            due=datetime(2026, 7, 1, n, tzinfo=UTC),
+            instruction="Check the status board.",
+            reply="Checked. Nothing new.",
+            instruction_words=frozenset({"check"}),
+            reply_words=frozenset({"checked"}),
+        )
+
+    members = [member(n) for n in range(6)]
+    group = _prune.Group(id="g-0123456789", anchor=members[0], members=members)
+    group.exceptions = {"m5.md": ["alarm"]}
+    survey = _prune.Survey(palace=Path("/home/nova/mempalace"))
+    return _prune.render_report(
+        survey,
+        [group],
+        "f" * 64,
+        ["20260701T000000000000Z-ffffffffffff"],
+        Path("/home/nova/palace-prune"),
+    )
 
 
 #: The **supervisor frame**: an operator with agency, who reads, fixes, watches, or is owed a
