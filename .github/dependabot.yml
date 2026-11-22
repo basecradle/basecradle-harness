@@ -1,4 +1,18 @@
 version: 2
+# The fleet's Dependabot policy (@origin, 2026-11-16, tried on one repository for a week and
+# approved for every repository on 2026-11-22; issue #994):
+#
+#   * A new version is proposed only once it is seven days old (`cooldown`), so a release pulled
+#     or found compromised in its first week never arrives here as a version-update pull request.
+#     A security update is never delayed: Dependabot's security updates ignore the cooldown, and
+#     the daily osv-scanner scan of uv.lock (issue #816), which reads no cooldown, catches what
+#     Dependabot misses.
+#   * An update to an action, or to a package in the `publish-path` group below, is read by the
+#     capital and not auto-merged: green CI is no verdict on a tool CI never exercises.
+#
+# This file is half of it. The routing half lives in the shared auto-merge workflow
+# (basecradle/.github, called by .github/workflows/dependabot-auto-merge.yml), which sends every
+# github-actions update and every update in a group named `publish-path` to the capital.
 updates:
 # `uv`, not `pip`, and the reason is `uv.lock`. This repo resolves through uv end to end
 # (`uv sync`, a committed lockfile, `astral-sh/setup-uv` in CI), so a `pip`-ecosystem bump
@@ -8,6 +22,8 @@ updates:
   directory: "/"
   schedule:
     interval: weekly
+  cooldown:
+    default-days: 7
   open-pull-requests-limit: 10
   ignore:
   # MemPalace 3.12 removed the content-hash dedup a moved home's recognition rests on
@@ -15,8 +31,33 @@ updates:
   # cap when the harness supports it (issue #989).
   - dependency-name: mempalace
     versions: [">=3.12.0"]
+  # The publish path: the `build` dependency group in pyproject.toml and everything it pulls
+  # into uv.lock, the packages that make the published bytes (issue #916). Exact names, one per
+  # package: tests/test_dependabot.py walks the lock from the `build` group and fails while this
+  # list differs from what it finds, so a toolchain change that moves the closure moves this
+  # list in the same diff. uv is proposed like any other and is not ignored: the build installs
+  # it by the lock's own hashes, and CI's setup-uv checks a uv its built-in table does not yet
+  # hold against the manifest checksum it fetches, so nothing here refuses a new uv and its bump
+  # never parks red waiting for a setup-uv release.
+  groups:
+    publish-path:
+      patterns:
+      - hatchling
+      - packaging
+      - pathspec
+      - pluggy
+      - tomlkit
+      - trove-classifiers
+      - uv
 - package-ecosystem: github-actions
   directory: "/"
   schedule:
     interval: weekly
+  cooldown:
+    default-days: 7
   open-pull-requests-limit: 10
+  # A week's action bumps arrive as one pull request.
+  groups:
+    github-actions:
+      patterns:
+      - "*"
