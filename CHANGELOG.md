@@ -16,6 +16,7 @@ Python runs a signal handler only on the main thread, and only between bytecodes
 - **The stop is relayed to the main thread.** `basecradle-harness-wake` points the process's signal wakeup descriptor at a small thread that never takes `SIGTERM` itself. It wakes the main thread with a no-op `SIGWINCH` until the stop has been raised there. An ordinary stop is acted on before the relay looks, and it sends nothing.
 - **The relay never sends a stop.** Its wake only interrupts the blocked read, and Python then runs whatever handlers are already pending, so a stop is raised only if one really arrived. The handler stays one-shot, by a flag as well as by ignoring later `SIGTERM`s.
 - **A forked child (`os.fork`, `multiprocessing`, `preexec_fn`) drops the relay's pipe**, so its own signals stay its own.
+- **The end of a wake is held whole.** Restoring the wake's output descriptors and draining their readers used to hold a stop off with the main thread's signal mask, which a stop delivered to any other thread went straight past. The stop itself is now held for that block and raised once it ends.
 
 ### Fixed: the `mempalace` extra no longer installs MemPalace 3.12, which the harness does not support yet (issue #988)
 

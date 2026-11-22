@@ -536,8 +536,8 @@ def test_the_relay_never_stops_a_wake_by_itself(tmp_path):
     """A SIGTERM byte on the relay's pipe that is not this process's stop stops nothing (#990).
 
     A forked child's C handler writes to the same pipe, so the relay cannot take the byte as proof of
-    a stop. It wakes the main thread with a no-op signal, never SIGTERM: the main thread runs its
-    tripped handlers, none is a stop, the relay sees the wake was answered and goes quiet. A relay
+    a stop. It wakes the main thread with a no-op signal, never SIGTERM, so the main thread runs only
+    the handlers already tripped — none, here — and after `RELAY_FOR` the relay goes quiet. A relay
     that re-sent SIGTERM stopped the wake here.
     """
     child = _child(
@@ -548,6 +548,7 @@ def test_the_relay_never_stops_a_wake_by_itself(tmp_path):
         wakes = []
         _on_wake = _stop._on_wake
         _stop._on_wake = lambda signum, frame: (wakes.append(signum), _on_wake(signum, frame))
+        _stop.RELAY_FOR = 0.4
         _stop.install()
         os.write(_stop._wakeup, bytes([signal.SIGTERM]))  # a stop's byte, and no stop
         try:
@@ -566,8 +567,50 @@ def test_the_relay_never_stops_a_wake_by_itself(tmp_path):
     assert child.returncode == 0, err
     word, quiet, later = out.split()
     assert word == "SURVIVED"
-    assert int(quiet) >= 1  # it did wake the main thread, which is how it learned there was no stop
-    assert int(later) == int(quiet)  # and then went quiet
+    assert int(quiet) >= 1  # it did wake the main thread
+    assert int(later) == int(quiet)  # and went quiet once its time was up
+
+
+def test_a_stop_held_by_a_block_is_raised_once_the_block_is_done(tmp_path):
+    """`holding` keeps a stop out of the block it guards, whichever thread took the signal (#990).
+
+    `owned_streams` restores descriptors 1 and 2 and drains their readers under it. It used to
+    block SIGTERM in the main thread's mask, which held nothing: the kernel handed the stop to a
+    thread with SIGTERM unblocked, and Python ran the handler on the main thread anyway — and the
+    relay's wake would now cut into the drain. Here a thread with SIGTERM unblocked takes the stop
+    while the main thread is in the block; the block runs to its end, and the stop is raised once.
+    """
+    child = _child(
+        """
+        import signal, threading, time
+        from basecradle_harness import _stop
+
+        def take_the_stop():
+            time.sleep(0.1)
+            signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+
+        _stop.install()
+        started = time.monotonic()
+        try:
+            with _stop.holding():
+                threading.Thread(target=take_the_stop, daemon=True).start()
+                time.sleep(0.6)  # the relay wakes this sleep; the stop must still wait
+                print("BLOCK DONE", round(time.monotonic() - started, 1), flush=True)
+            print("UNREACHABLE", flush=True)
+        except _stop.WakeStopped:
+            print("STOPPED", flush=True)
+        try:
+            time.sleep(0.3)  # a second raise would land here
+        except _stop.WakeStopped:
+            print("STOPPED AGAIN", flush=True)
+        """,
+        tmp_path,
+    )
+    out, err = child.communicate(timeout=30)
+
+    assert child.returncode == 0, err
+    assert out.split("\n")[:2] == ["BLOCK DONE 0.6", "STOPPED"], out
+    assert "STOPPED AGAIN" not in out and "UNREACHABLE" not in out
 
 
 def test_a_real_wake_sigtermed_mid_tool_logs_stopped_and_dies_by_the_signal(tmp_path):
