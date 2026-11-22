@@ -549,7 +549,13 @@ def _prune_report() -> str:
     group = _prune.Group(id="g-0123456789", anchor=members[0], members=members)
     group.exceptions = {"m5.md": ["alarm"]}
     survey = _prune.Survey(palace=Path("/home/nova/mempalace"))
-    return _prune.render_report(survey, [group], "f" * 64, ["20260701T000000000000Z-ffffffffffff"])
+    return _prune.render_report(
+        survey,
+        [group],
+        "f" * 64,
+        ["20260701T000000000000Z-ffffffffffff"],
+        Path("/home/nova/palace-prune"),
+    )
 
 
 #: The **supervisor frame**: an operator with agency, who reads, fixes, watches, or is owed a

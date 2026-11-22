@@ -84,11 +84,13 @@ in the same half is an *exception*, reported with its group and never removed wi
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import sys
 from collections import Counter
@@ -97,7 +99,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from basecradle_harness._mempalace import _CONVERSATIONS_WING, _QUOTE, _REGISTRY_ROOM
+from basecradle_harness._mempalace import _CONVERSATIONS_WING, _QUOTE, _REGISTRY_ROOM, _import
 from basecradle_harness._observability import GREEN, RED, YELLOW, head, kv, last_word, log_handler
 from basecradle_harness._scrub import _file_of, open_palace, resolve_palace
 from basecradle_harness._version import __version__
@@ -138,6 +140,10 @@ EXAMPLE_CAP = 2000
 #: How many unusual words, and how many exceptions, a group's row names before it counts the rest.
 _WORDS_SHOWN = 12
 _EXCEPTIONS_SHOWN = 10
+
+#: How many already-present files a restore names before it counts the rest: a second run of a
+#: whole backup would otherwise print every file it holds.
+_SKIPS_SHOWN = 20
 
 #: Paging, for the scrub's reasons (`_scrub._PAGE`, `_scrub._DELETE_BATCH`).
 _PAGE = 1000
@@ -454,6 +460,7 @@ NOT_REGULAR = "not_a_regular_file"
 OUTSIDE = "outside_conversations"
 FOREIGN = "foreign_drawer"
 UNREADABLE = "unreadable"
+NOT_CANDIDATE = "not_a_candidate"
 
 
 @dataclass
@@ -541,7 +548,9 @@ def survey(collection, palace: Path) -> Survey:
             found.unfiled += 1
             continue
         try:
-            text = path.read_text(encoding="utf-8")
+            # Bytes, decoded by hand: `read_text` translates ``\r\n``, so the hash it gave would
+            # never match the bytes `_ready` hashes at the apply.
+            text = path.read_bytes().decode("utf-8")
         except (OSError, UnicodeDecodeError):
             found.unread += 1
             continue
@@ -600,6 +609,25 @@ class Refused(ValueError):
     """A run this tool will not carry out. It changed nothing."""
 
 
+class Interrupted(RuntimeError):
+    """An apply that failed after its first delete. Its message names the backup that holds all."""
+
+
+@contextlib.contextmanager
+def mine_lock(path: Path):
+    """MemPalace's per-file lock on an exchange file, under every name a writer locks it by.
+
+    The observe locks ``<palace>/conversations/<name>`` as it was given; the miner locks the path
+    under the *resolved* directory. Where those differ both are taken, always in the same order.
+    """
+    take = _import("palace").mine_lock
+    names = sorted({str(path), str(path.parent.resolve() / path.name)})
+    with contextlib.ExitStack() as stack:
+        for name in names:
+            stack.enter_context(take(name))
+        yield
+
+
 def resolve_state(explicit: str | None, palace: Path) -> Path:
     """The tool's state directory, refused anywhere inside the palace or any conversations dir.
 
@@ -631,15 +659,24 @@ def _write_private(path: Path, data: bytes) -> None:
     temp = path.with_name(f".{path.name}{_PARTIAL}")
     descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        os.replace(temp, path)
     except BaseException:
         temp.unlink(missing_ok=True)
         raise
-    os.replace(temp, path)
+
+
+def _fsync_dir(path: Path) -> None:
+    """Make a rename inside ``path`` durable: a backup whose name is lost to a power cut is gone."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _backups(state: Path) -> list[str]:
@@ -651,7 +688,11 @@ def _backups(state: Path) -> list[str]:
 
 
 def _sweep_partials(state: Path) -> None:
-    """Remove this tool's own half-written backups and files: by its own name, in its own dir."""
+    """Remove this tool's own half-written backups: by its own name, in its own dir.
+
+    A half-written report or plan needs no sweep: it is a fixed-name temp (`_write_private`) that
+    the next run's write of the same file takes over and replaces.
+    """
     root = state / BACKUPS
     if root.is_dir():
         for path in root.iterdir():
@@ -722,8 +763,15 @@ def _when(stamp: datetime) -> str:
     return stamp.strftime("%Y-%m-%d %H:%M UTC")
 
 
-def render_report(found: Survey, found_groups: list[Group], digest: str, backups: list[str]) -> str:
-    """The report the agent reads before it says yes: every group, one real example, the keeps."""
+def render_report(
+    found: Survey, found_groups: list[Group], digest: str, backups: list[str], state: Path
+) -> str:
+    """The report the agent reads before it says yes: every group, one real example, the keeps.
+
+    Every command it quotes names this store and this state directory, so it is the command that
+    works, whichever ``--palace`` and ``--state-dir`` this run was given.
+    """
+    where = f"--palace {shlex.quote(str(found.palace))} --state-dir {shlex.quote(str(state))}"
     lines = [
         REPORT_TITLE,
         "",
@@ -745,7 +793,7 @@ def render_report(found: Survey, found_groups: list[Group], digest: str, backups
             "",
             "A yes names this plan and each group it covers. The command that carries it out:",
             "",
-            _fence(f"{PROG} --apply --plan {digest} --groups <group id>[,<group id>…]"),
+            _fence(f"{PROG} {where} --apply --plan {digest} --groups <group id>[,<group id>…]"),
             "",
             "Add `--remove-latest <group id>` for a group whose latest copy should go too.",
             "",
@@ -797,11 +845,11 @@ def render_report(found: Survey, found_groups: list[Group], digest: str, backups
                 "memory, which is safe to run twice:"
             ),
             "",
-            _fence(f"{PROG} --restore <name>"),
+            _fence(f"{PROG} {where} --restore <name>"),
             "",
             "The command that removes one:",
             "",
-            _fence(f"{PROG} --discard-backup <name>"),
+            _fence(f"{PROG} {where} --discard-backup <name>"),
         ]
     else:
         lines.append("None.")
@@ -833,7 +881,9 @@ def offer(collection, palace: Path, state: Path) -> Offer:
     _sweep_partials(state)
     backups = _backups(state)
     report = state / REPORT
-    _write_private(report, render_report(found, found_groups, digest, backups).encode("utf-8"))
+    _write_private(
+        report, render_report(found, found_groups, digest, backups, state).encode("utf-8")
+    )
     record = {"hash": digest, "plan": plan}
     _write_private(state / PLAN, json.dumps(record, indent=2, ensure_ascii=False).encode("utf-8"))
     return Offer(found, found_groups, plan, digest, report, backups)
@@ -915,8 +965,14 @@ def _ready(entry: dict, conversations: Path, by_file: dict) -> tuple[Path, list,
         return UNREADABLE
     if hashlib.sha256(data).hexdigest() != entry["sha256"]:
         return CHANGED
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return UNREADABLE
+    if isinstance(candidate(path.name, path, text), str):
+        return NOT_CANDIDATE  # a plan naming a file the rule never selects is not carried out
     drawers = by_file.get(str(conversations / path.name), [])
-    if not _pieces_of(data.decode("utf-8"), drawers):
+    if not _pieces_of(text, drawers):
         return FOREIGN
     return path, drawers, data
 
@@ -963,12 +1019,13 @@ def _write_backup(collection, palace: Path, state: Path, digest: str, ready: lis
                 indent=2,
             ).encode(),
         )
-        _verify_backup(partial, manifest, len(ids))
+        _verify_backup(partial, manifest, [records[i] for i in ids])
         os.replace(partial, root / name)
+        _fsync_dir(root)
     except Refused:
         shutil.rmtree(partial, ignore_errors=True)
         raise
-    except (OSError, ValueError) as error:
+    except Exception as error:  # any failure at all: no verified backup, so nothing is removed
         shutil.rmtree(partial, ignore_errors=True)
         raise Refused(f"no backup could be written, so nothing was removed: {error}") from error
     return name
@@ -995,14 +1052,15 @@ def _records(collection, ids: list[str]) -> dict[str, dict]:
     return records
 
 
-def _verify_backup(partial: Path, manifest: list[dict], drawers: int) -> None:
-    """Read the backup back: every file's bytes hash as planned, and every drawer is in it."""
+def _verify_backup(partial: Path, manifest: list[dict], records: list[dict]) -> None:
+    """Read the backup back: every file's bytes hash as planned, every drawer reads as it was."""
     for entry in manifest:
         copy = partial / "files" / Path(entry["path"]).name
         if hashlib.sha256(copy.read_bytes()).hexdigest() != entry["sha256"]:
             raise Refused(f"the backup of {copy.name} did not read back as written")
-    written = [line for line in (partial / "drawers.jsonl").read_text().splitlines() if line]
-    if len(written) != drawers or len({json.loads(line)["id"] for line in written}) != drawers:
+    lines = (partial / "drawers.jsonl").read_text(encoding="utf-8").splitlines()
+    written = [json.loads(line) for line in lines if line]
+    if [{k: v for k, v in row.items() if k != "file"} for row in written] != records:
         raise Refused("the backup's drawers did not read back as written")
 
 
@@ -1013,6 +1071,7 @@ def apply(
     digest: str,
     named: list[str],
     remove_latest: list[str],
+    lock=None,
 ) -> Applied:
     """Carry out a yes against the plan the agent read. Never re-plans.
 
@@ -1022,7 +1081,13 @@ def apply(
     file with no drawers, which still matches its entry, so the next apply of the same plan finishes
     it (and a mine before then files it again, which is the store as it was). The other order would
     leave drawers with no file, which no later apply can match.
+
+    **Each file's two deletes are taken under MemPalace's own per-file lock** (`mine_lock`), the one
+    its miner takes before it decides whether a file is filed. Without it, a ``mempalace mine``
+    between the two would see a file with no drawers, file it again, and the unlink would then
+    leave those new drawers with no file.
     """
+    lock = lock or mine_lock
     plan = load_plan(state, digest, palace)
     targets = _targets(plan, named, remove_latest)
     conversations = palace / _CONVERSATIONS_WING
@@ -1040,13 +1105,21 @@ def apply(
     _private_dir(state)
     _sweep_partials(state)
     result.backup = _write_backup(collection, palace, state, digest, ready)
-    for path, drawers, _ in ready:
-        ids = [drawer_id for drawer_id, _ in drawers]
-        for start in range(0, len(ids), _DELETE_BATCH):
-            collection.delete(ids=ids[start : start + _DELETE_BATCH])
-        result.drawers += len(ids)
-        path.unlink(missing_ok=True)
-        result.removed.append(path.name)
+    try:
+        for path, drawers, _ in ready:
+            ids = [drawer_id for drawer_id, _ in drawers]
+            with lock(path):
+                for start in range(0, len(ids), _DELETE_BATCH):
+                    collection.delete(ids=ids[start : start + _DELETE_BATCH])
+                result.drawers += len(ids)
+                path.unlink(missing_ok=True)
+            result.removed.append(path.name)
+    except Exception as error:
+        raise Interrupted(
+            f"removed {len(result.removed)} of {len(ready)} file(s) before "
+            f"{type(error).__name__}: {error}. The backup {result.backup} holds every one of them; "
+            "run the same apply again to finish, or --restore to put them back"
+        ) from error
     return result
 
 
@@ -1091,7 +1164,7 @@ def _backup_dir(state: Path, name: str) -> Path:
     return target
 
 
-def restore(collection, palace: Path, state: Path, name: str) -> Restored:
+def restore(collection, palace: Path, state: Path, name: str, lock=None) -> Restored:
     """Put back exactly the files and drawers of a backup that are absent from the store.
 
     What is already present is left untouched and reported, so a second run changes nothing. The
@@ -1127,23 +1200,32 @@ def restore(collection, palace: Path, state: Path, name: str) -> Restored:
     for start in range(0, len(ids), _PAGE):
         present |= set(collection.get(ids=ids[start : start + _PAGE], include=[]).get("ids") or [])
     conversations = palace / _CONVERSATIONS_WING
+    if not conversations.is_dir():
+        raise Refused(f"the palace has no conversations directory ({conversations})")
+    lock = lock or mine_lock
     result = Restored()
     for file, (entry, data) in files.items():
-        absent = []
-        for row in by_file.get(file, []):
-            if row["id"] in present:
-                result.skipped_drawers.append(row["id"])
-            else:
-                absent.append(row)
-        _put_back(collection, absent)
-        result.drawers += len(absent)
-        target = conversations / file
-        if target.exists() or target.is_symlink():
-            result.skipped_files.append(file)
-            continue
-        _create(target, data, entry.get("mtime_ns"))
-        result.files.append(file)
+        with lock(conversations / file):
+            _restore_file(collection, conversations, file, entry, data, by_file, present, result)
     return result
+
+
+def _restore_file(collection, conversations, file, entry, data, by_file, present, result):
+    """One file of a restore: its absent drawers first, then the file if it is absent."""
+    absent = []
+    for row in by_file.get(file, []):
+        if row["id"] in present:
+            result.skipped_drawers.append(row["id"])
+        else:
+            absent.append(row)
+    _put_back(collection, absent)
+    result.drawers += len(absent)
+    target = conversations / file
+    if target.exists() or target.is_symlink():
+        result.skipped_files.append(file)
+        return
+    _create(target, data, entry.get("mtime_ns"))
+    result.files.append(file)
 
 
 def _put_back(collection, rows: list[dict]) -> None:
@@ -1319,8 +1401,11 @@ def main(argv: list[str] | None = None) -> int:
             restored = restore(collection, palace, state, args.restore)
             print(f"palace: {palace}")
             print(f"restored: {len(restored.files)} file(s), {restored.drawers} drawer(s)")
-            for item in restored.skipped_files:
+            for item in restored.skipped_files[:_SKIPS_SHOWN]:
                 print(f"skipped: {item} ({PRESENT})")
+            if len(restored.skipped_files) > _SKIPS_SHOWN:
+                more = len(restored.skipped_files) - _SKIPS_SHOWN
+                print(f"skipped: {more} more file(s) ({PRESENT})")
             if restored.skipped_drawers:
                 print(f"skipped: {len(restored.skipped_drawers)} drawer(s) ({PRESENT})")
             _log.info(
@@ -1387,7 +1472,7 @@ def main(argv: list[str] | None = None) -> int:
                 backups=len(result.backups),
             ),
         )
-    except (ValueError, ImportError, OSError) as error:
+    except (ValueError, ImportError, OSError, Interrupted) as error:
         _log.error(
             "%s %s",
             head("palace prune failed", RED),

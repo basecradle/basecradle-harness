@@ -12,6 +12,7 @@ later tasks that all differ from each other, plus the traps the rule must not fa
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -133,6 +134,13 @@ class Store:
         self.state = root / "home" / _prune.STATE_DIR
         self.collection = FakeCollection()
         self.count = 0
+        #: Every file a run locked, in order: MemPalace's `mine_lock` stands in for the real one.
+        self.locked: list[str] = []
+
+    @contextlib.contextmanager
+    def lock(self, path):
+        self.locked.append(Path(path).name)
+        yield
 
     def file(self, user: str, reply: str, *, drawer: bool = True) -> str:
         """Write one exchange as the observe does, and file it as one drawer."""
@@ -154,14 +162,20 @@ class Store:
 
     def apply(self, digest, groups, remove_latest=()):
         return _prune.apply(
-            self.collection, self.palace, self.state, digest, list(groups), list(remove_latest)
+            self.collection,
+            self.palace,
+            self.state,
+            digest,
+            list(groups),
+            list(remove_latest),
+            lock=self.lock,
         )
 
     def names(self) -> set[str]:
         return {p.name for p in self.conversations.iterdir()}
 
     def restore(self, name):
-        return _prune.restore(self.collection, self.palace, self.state, name)
+        return _prune.restore(self.collection, self.palace, self.state, name, lock=self.lock)
 
     def snapshot(self):
         files = {
@@ -730,6 +744,7 @@ def test_the_state_directory_defaults_into_the_agent_home(store, monkeypatch):
 
 def _main(store, monkeypatch, *argv):
     monkeypatch.setattr(_prune, "open_palace", lambda _palace: store.collection)
+    monkeypatch.setattr(_prune, "mine_lock", store.lock)
     return _prune.main(["--palace", str(store.palace), "--state-dir", str(store.state), *argv])
 
 
@@ -810,3 +825,140 @@ def test_there_is_one_store_per_run():
     actions = [a for a in _prune.build_parser()._actions if a.option_strings]
     assert all(a.nargs in (None, 0) for a in actions)
     assert all(type(a).__name__ not in {"_AppendAction", "_ExtendAction"} for a in actions)
+
+
+# --- the review's hardening ---------------------------------------------------------------------
+
+
+def test_each_file_is_removed_and_restored_under_its_lock(store):
+    _check_ins(store, 8)
+    offer = store.offer()
+    applied = store.apply(offer.hash, [offer.groups[0].id])
+    assert store.locked == applied.removed
+    store.locked.clear()
+    restored = store.restore(applied.backup)
+    assert store.locked == restored.files
+
+
+def test_mine_lock_takes_both_names_a_writer_locks_a_file_by(tmp_path, monkeypatch):
+    taken = []
+
+    @contextlib.contextmanager
+    def take(name):
+        taken.append(name)
+        yield
+
+    monkeypatch.setattr(_prune, "_import", lambda _name: SimpleNamespace(mine_lock=take))
+    real = tmp_path / "real"
+    (real / "conversations").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(real)
+    path = tmp_path / "link" / "conversations" / "x.md"
+    with _prune.mine_lock(path):
+        pass
+    assert taken == sorted({str(path), str(real.resolve() / "conversations" / "x.md")})
+    assert len(taken) == 2
+
+
+def test_an_apply_that_fails_after_its_first_delete_names_the_backup(store, monkeypatch):
+    _check_ins(store, 8)
+    offer = store.offer()
+    real_delete = store.collection.delete
+    calls = []
+
+    def flaky(*, ids=None, where=None):
+        calls.append(ids)
+        if len(calls) == 3:
+            raise RuntimeError("database is locked")
+        real_delete(ids=ids)
+
+    monkeypatch.setattr(store.collection, "delete", flaky)
+    with pytest.raises(_prune.Interrupted, match="removed 2 of 7") as caught:
+        store.apply(offer.hash, [offer.groups[0].id])
+    (backup,) = _prune._backups(store.state)
+    assert backup in str(caught.value)
+
+    monkeypatch.setattr(store.collection, "delete", real_delete)
+    finished = store.apply(offer.hash, [offer.groups[0].id])  # the same plan finishes it
+    assert len(finished.removed) == 5 and sorted(n for n, _ in finished.skipped) == sorted(
+        n for n, why in finished.skipped if why == _prune.GONE
+    )
+
+
+def test_a_reply_with_a_carriage_return_still_matches_its_plan(store):
+    names = _check_ins(store, 7)
+    user, reply = hourly(7, START + timedelta(hours=7))
+    crlf = store.file(user, reply.replace("; ", ";\r\n"))  # the same words, a CRLF between
+    offer = store.offer()
+    (group,) = offer.groups
+    assert crlf in {m.name for m in group.members}
+
+    result = store.apply(offer.hash, [group.id], remove_latest=[group.id])
+
+    assert result.skipped == []
+    assert not (set(names) | {crlf}) & store.names()
+
+
+def test_a_plan_naming_a_file_the_rule_never_selects_is_not_carried_out(store):
+    _check_ins(store, 8)
+    talk = store.file("[2026-08-02T10:00:00.000Z] john: John lives in Dallas.", "Noted.")
+    offer = store.offer()
+    path = store.conversations / talk
+    record = json.loads((store.state / _prune.PLAN).read_text())
+    record["plan"]["groups"][0]["remove"].append(
+        {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    )
+    record["hash"] = _prune.plan_hash(record["plan"])  # a forged plan, consistent with itself
+    (store.state / _prune.PLAN).write_text(json.dumps(record))
+
+    result = store.apply(record["hash"], [offer.groups[0].id])
+
+    assert (talk, _prune.NOT_CANDIDATE) in result.skipped
+    assert path.exists()
+
+
+def test_the_report_commands_name_this_store_and_state_directory(store):
+    _check_ins(store, 8)
+    offer = store.offer()
+    text = (store.state / _prune.REPORT).read_text()
+    where = f"--palace {store.palace} --state-dir {store.state}"
+    assert f"{_prune.PROG} {where} --apply --plan {offer.hash}" in text
+
+
+def test_a_half_written_report_or_plan_is_removed_by_the_next_run(store):
+    _check_ins(store, 6)
+    store.offer()
+    for name in (_prune.REPORT, _prune.PLAN):
+        (store.state / f".{name}.partial").write_text("half")
+    store.offer()
+    assert not list(store.state.glob(".*.partial"))
+
+
+def test_a_backup_that_does_not_read_back_as_its_drawers_refuses_the_apply(store, monkeypatch):
+    _check_ins(store, 8)
+    offer = store.offer()
+    before = store.snapshot()
+    real = _prune._records
+
+    def drifted(collection, ids):
+        records = real(collection, ids)
+        first = next(iter(records))
+        records[first] = dict(records[first], document="not what was stored")
+        return records
+
+    monkeypatch.setattr(_prune, "_records", drifted)
+    monkeypatch.setattr(_prune, "_write_private", _write_then_corrupt(_prune._write_private))
+    with pytest.raises(_prune.Refused):
+        store.apply(offer.hash, [offer.groups[0].id])
+    assert store.snapshot() == before
+    assert _prune._backups(store.state) == []
+
+
+def _write_then_corrupt(write):
+    """Write the drawers file with one document changed, as a disk that did not keep it would."""
+
+    def corrupted(path, data):
+        if path.name == "drawers.jsonl":
+            data = data.replace(b"not what was stored", b"changed on disk")
+        write(path, data)
+
+    return corrupted
