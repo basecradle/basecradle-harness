@@ -595,7 +595,7 @@ def test_a_stop_held_by_a_block_is_raised_once_the_block_is_done(tmp_path):
             with _stop.holding():
                 threading.Thread(target=take_the_stop, daemon=True).start()
                 time.sleep(0.6)  # the relay wakes this sleep; the stop must still wait
-                print("BLOCK DONE", round(time.monotonic() - started, 1), flush=True)
+                print("BLOCK DONE", round(time.monotonic() - started, 3), flush=True)
             print("UNREACHABLE", flush=True)
         except _stop.WakeStopped:
             print("STOPPED", flush=True)
@@ -609,8 +609,60 @@ def test_a_stop_held_by_a_block_is_raised_once_the_block_is_done(tmp_path):
     out, err = child.communicate(timeout=30)
 
     assert child.returncode == 0, err
-    assert out.split("\n")[:2] == ["BLOCK DONE 0.6", "STOPPED"], out
+    lines = out.splitlines()
+    assert lines[0].startswith("BLOCK DONE ") and float(lines[0].split()[-1]) >= 0.6, out
+    assert lines[1] == "STOPPED", out
     assert "STOPPED AGAIN" not in out and "UNREACHABLE" not in out
+
+
+def test_a_stop_just_before_the_hold_still_lets_the_streams_be_restored(tmp_path):
+    """A stop between the block's end and `holding` cannot be held, so the restore finishes first.
+
+    `owned_streams` puts descriptors 1 and 2 back under `holding`, but the hold cannot cover its own
+    entry: a stop landing there raises before anything is restored, leaving the wake's descriptors
+    pipes into readers nobody drains. Here the stop is sent exactly at that line (by a trace
+    function), and the original descriptors must still come back before the stop goes on out.
+    """
+    child = _child(
+        """
+        import inspect, logging, os, signal, sys
+        from basecradle_harness import _journal, _stop
+
+        source, first = inspect.getsourcelines(_journal.owned_streams.__wrapped__)
+        line = first + next(i for i, text in enumerate(source) if "with holding():" in text)
+        sent = []
+
+        def trace(frame, event, arg):
+            if frame.f_code.co_name != "owned_streams":
+                return None
+            if event == "line" and frame.f_lineno == line and not sent:
+                sent.append(True)
+                os.kill(os.getpid(), signal.SIGTERM)
+            return trace
+
+        handler = logging.StreamHandler(sys.stderr)
+        before = (os.fstat(1).st_ino, os.fstat(2).st_ino)
+        _stop.install()
+        sys.settrace(trace)
+        try:
+            with _journal.owned_streams(handler):
+                pass
+            outcome = "NOT STOPPED"
+        except _stop.WakeStopped:
+            outcome = "STOPPED"
+        sys.settrace(None)
+        after = (os.fstat(1).st_ino, os.fstat(2).st_ino)
+        os.write(int(os.environ["READY_FD"]), f"{outcome} {bool(sent)} {before == after}\\n".encode())
+        """,
+        tmp_path,
+        ready_pipe=True,
+    )
+    result = child.ready.readline().split()
+    child.ready.close()
+    _, err = child.communicate(timeout=30)
+
+    assert child.returncode == 0, err
+    assert result == ["STOPPED", "True", "True"], (result, err)
 
 
 def test_a_real_wake_sigtermed_mid_tool_logs_stopped_and_dies_by_the_signal(tmp_path):

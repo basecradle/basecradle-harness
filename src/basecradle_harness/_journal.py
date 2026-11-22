@@ -65,7 +65,7 @@ from typing import Any
 
 from basecradle_harness._attempts import another_try_follows
 from basecradle_harness._observability import Rendered, _full_value
-from basecradle_harness._stop import holding
+from basecradle_harness._stop import WakeStopped, holding
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -133,15 +133,33 @@ def owned_streams(handler: logging.StreamHandler) -> Iterator[None]:
         # Held by the stop itself (`_stop.holding`), never by this thread's signal mask: a mask
         # leaves the stop to whichever thread has SIGTERM unblocked, whose trip Python then runs
         # here anyway, and the stop's relay would wake this thread out of the drain (issue #990).
-        with holding():
-            for stream in (sys.stdout, sys.stderr):
-                _flush(stream)
-            for fd, original in saved:
-                os.dup2(original, fd)
-                os.close(original)
-            deadline = time.monotonic() + DRAIN_SECONDS
-            for reader in readers:
-                reader.join(max(0.0, deadline - time.monotonic()))
+        try:
+            with holding():
+                _restore(saved, readers)
+        except WakeStopped:
+            # One that landed before the hold took effect (between the block's end and `holding`)
+            # raised before anything was restored. Once a stop is taken every later SIGTERM is a
+            # no-op, so the restore is finished undisturbed, and the stop goes on out.
+            _restore(saved, readers)
+            raise
+
+
+def _restore(saved: list[tuple[int, int]], readers: list[threading.Thread]) -> None:
+    """Flush into the pipes, put back the original descriptors, and let the readers drain.
+
+    Idempotent, so a stop that cut in before it began can have it run again: a descriptor is taken
+    off `saved` once it is back, and joining a reader that has ended returns at once.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        _flush(stream)
+    while saved:
+        fd, original = saved[0]
+        os.dup2(original, fd)
+        os.close(original)
+        saved.pop(0)
+    deadline = time.monotonic() + DRAIN_SECONDS
+    for reader in readers:
+        reader.join(max(0.0, deadline - time.monotonic()))
 
 
 def _is_descriptor(stream: Any, fd: int) -> bool:

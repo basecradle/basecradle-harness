@@ -31,7 +31,8 @@ timeout, which the router's SIGKILL two seconds later turns into a crash. CI cau
 stop in ten landing as a model call began. So `install` also arms a **relay**: CPython writes the
 signal's number to a wakeup descriptor (`signal.set_wakeup_fd`) from its C-level handler, before any
 Python runs, and a thread that never takes SIGTERM itself reads it and wakes the main thread
-(`signal.pthread_kill` with a no-op `WAKE_SIGNAL`, never SIGTERM) until the stop has been raised. The
+(`signal.pthread_kill` with a no-op `WAKE_SIGNAL`, never SIGTERM) until the stop is taken, for at
+most `RELAY_FOR`. The
 wake interrupts the blocked syscall, Python runs every tripped handler, and the stop's is among them
 only if a stop really arrived, so the relay can never stop a wake by itself. In the ordinary case the
 handler has run before the relay's first look, and it sends nothing.
