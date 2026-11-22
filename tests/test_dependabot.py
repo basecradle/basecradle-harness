@@ -101,10 +101,16 @@ def group_patterns(text: str, ecosystem: str, group: str) -> list[str]:
         f"the {ecosystem} entry's {narrowing} can drop packages from Dependabot's updates, and "
         f"this reader cannot tell whether it does"
     )
-    groups = [i for i, line in enumerate(lines) if line == "  groups:"]
-    assert len(groups) == 1 and lines[groups[0] + 1 : groups[0] + 2] == [f"    {group}:"], (
-        f"the {ecosystem} entry's `groups:` must open with one `{group}` group, ahead of any other"
-    )
+    # Any spelling of the key counts, so a second `groups:` or `{group}:` (most YAML readers keep
+    # the last of two duplicate keys) is seen even with a comment or a space after it.
+    groups = [i for i, line in enumerate(lines) if re.match(r"  groups\s*:", line)]
+    named = [line for line in lines if re.match(rf"\s*['\"]?{re.escape(group)}['\"]?\s*:", line)]
+    assert (
+        len(groups) == 1
+        and lines[groups[0]] == "  groups:"
+        and lines[groups[0] + 1 : groups[0] + 2] == [f"    {group}:"]
+        and len(named) == 1
+    ), f"the {ecosystem} entry's `groups:` must open with one `{group}` group, ahead of any other"
 
     body: list[str] = []
     for line in lines[groups[0] + 2 :]:
@@ -126,7 +132,9 @@ def ignored_names(text: str, ecosystem: str) -> list[str]:
     """The package names an ecosystem's ``ignore`` list names, read line by line.
 
     Each item is ``- dependency-name: <name>``, optionally followed by its ``versions`` or
-    ``update-types``; any other shape fails, since this reader could not say what it drops.
+    ``update-types``; any other shape fails, since this reader could not say what it drops. So
+    does a name that is not one exact package name: Dependabot reads a wildcard (``hatch*``,
+    ``"*"``) as a pattern, and a quoted name would compare unequal to the one it ignores.
     """
     lines = entry_lines(text, ecosystem)
     starts = [i for i, line in enumerate(lines) if line == "  ignore:"]
@@ -140,7 +148,9 @@ def ignored_names(text: str, ecosystem: str) -> list[str]:
             break
         if line.startswith("  - "):
             match = re.fullmatch(r"  - dependency-name: (\S+)", line)
-            assert match, f"the {ecosystem} `ignore` holds an item it cannot vouch for: {line!r}"
+            assert match and EXACT_NAME.match(match.group(1)), (
+                f"the {ecosystem} `ignore` holds an item it cannot vouch for: {line!r}"
+            )
             names.append(match.group(1))
         else:
             assert re.match(r"    (versions|update-types): ", line), (
@@ -175,10 +185,17 @@ def check_publish_path_matches_the_lock(dependabot_text: str, lock_text: str) ->
 def check_the_cooldown_and_actions_group(dependabot_text: str) -> None:
     for ecosystem in ECOSYSTEMS:
         lines = entry_lines(dependabot_text, ecosystem)
-        at = [i for i, line in enumerate(lines) if line == "  cooldown:"]
-        assert len(at) == 1 and lines[at[0] + 1 : at[0] + 2] == ["    default-days: 7"], (
-            f"the {ecosystem} entry must wait seven days for a new version (`cooldown: "
-            f"default-days: 7`), the fleet's policy (issue #994)"
+        at = [i for i, line in enumerate(lines) if re.match(r"  cooldown\s*:", line)]
+        body = []
+        for line in lines[at[0] + 1 :] if len(at) == 1 else []:
+            if not line.startswith("    "):
+                break
+            body.append(line)
+        # The block holds the one key and nothing else: an `exclude`, an `include` or a
+        # `semver-*-days` beside it would shorten or lift the wait for some updates.
+        assert len(at) == 1 and lines[at[0]] == "  cooldown:" and body == ["    default-days: 7"], (
+            f"the {ecosystem} entry must wait seven days for every new version (`cooldown:` "
+            f"holding `default-days: 7` alone), the fleet's policy (issue #994)"
         )
     assert group_patterns(dependabot_text, "github-actions", "github-actions") == ['"*"'], (
         'the github-actions entry must group every action (`"*"`) into one pull request'
@@ -359,4 +376,65 @@ class TestTheReaders:
     def test_refuses_an_actions_group_narrower_than_every_action(self):
         text = _dependabot("backend", "helper").replace('      - "*"\n', "      - actions/*\n")
         with pytest.raises(AssertionError, match="group every action"):
+            check_the_cooldown_and_actions_group(text)
+
+    @pytest.mark.parametrize(
+        "later",
+        [
+            "  groups: # a second block\n    other:\n      patterns:\n      - x\n",
+            "  groups :\n    other:\n      patterns:\n      - x\n",
+        ],
+    )
+    def test_refuses_a_second_groups_key_in_any_spelling(self, later):
+        text = _dependabot("backend", "helper").replace(
+            "  open-pull-requests-limit: 10\n", later + "  open-pull-requests-limit: 10\n", 1
+        )
+        with pytest.raises(AssertionError, match="ahead of any other"):
+            group_patterns(text, "uv", GROUP)
+
+    @pytest.mark.parametrize("key", [GROUP, f'"{GROUP}"', f"{GROUP} "])
+    def test_refuses_a_second_group_of_the_same_name(self, key):
+        text = _dependabot("backend", "helper").replace(
+            "  open-pull-requests-limit: 10\n",
+            f"    {key}:\n      patterns:\n      - backend\n  open-pull-requests-limit: 10\n",
+            1,
+        )
+        with pytest.raises(AssertionError, match="ahead of any other"):
+            group_patterns(text, "uv", GROUP)
+
+    @pytest.mark.parametrize(
+        "name", ['"helper"', "'helper'", "help*", '"*"', "Helper"]
+    )  # fmt: skip
+    def test_refuses_an_ignored_name_that_is_not_one_exact_package(self, name):
+        ignore = (
+            f"  ignore:\n  - dependency-name: {name}\n"
+            "    update-types: [version-update:semver-major]\n"
+        )
+        with pytest.raises(AssertionError, match="cannot vouch for"):
+            check_publish_path_matches_the_lock(
+                _dependabot("backend", "helper", uv_extra=ignore), LOCK_TEXT
+            )
+
+    @pytest.mark.parametrize(
+        "beside",
+        [
+            '    exclude: ["*"]\n',
+            "    include: [backend]\n",
+            "    semver-major-days: 0\n",
+        ],
+    )
+    def test_refuses_a_cooldown_key_beside_the_seven_days(self, beside):
+        text = _dependabot("backend", "helper").replace(
+            "    default-days: 7\n", "    default-days: 7\n" + beside, 1
+        )
+        with pytest.raises(AssertionError, match="seven days"):
+            check_the_cooldown_and_actions_group(text)
+
+    def test_refuses_a_second_cooldown_key(self):
+        text = _dependabot("backend", "helper").replace(
+            "  open-pull-requests-limit: 10\n",
+            "  cooldown: # again\n    default-days: 0\n  open-pull-requests-limit: 10\n",
+            1,
+        )
+        with pytest.raises(AssertionError, match="seven days"):
             check_the_cooldown_and_actions_group(text)
