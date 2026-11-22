@@ -22,18 +22,33 @@ from pathlib import Path
 LOCK = Path(__file__).resolve().parent.parent / "uv.lock"
 
 
-def requirement(lock: dict, name: str) -> str:
-    """``name==<locked version>`` with every hash the lock holds for it, or a ValueError."""
+def _hashes(package: dict) -> list[str]:
+    files = [*package.get("wheels", []), *([package["sdist"]] if "sdist" in package else [])]
+    return [file["hash"] for file in files]
+
+
+def locked_package(lock: dict, name: str) -> dict:
+    """The lock's one PyPI entry for ``name``, every file of it sha256-pinned, or a ValueError.
+
+    One rule for every reader that must know which entry is meant: the uv bootstrap below, and
+    the walk ``tests/test_dependabot.py`` makes of the build toolchain.
+    """
     packages = [package for package in lock.get("package", []) if package.get("name") == name]
     if len(packages) != 1:
         raise ValueError(f"uv.lock holds {len(packages)} `{name}` packages, not one")
     (package,) = packages
     if package.get("source") != {"registry": "https://pypi.org/simple"}:
         raise ValueError(f"uv.lock's `{name}` is not from PyPI: {package.get('source')}")
-    files = [*package.get("wheels", []), *([package["sdist"]] if "sdist" in package else [])]
-    hashes = [file["hash"] for file in files]
+    hashes = _hashes(package)
     if not hashes or not all(value.startswith("sha256:") for value in hashes):
         raise ValueError(f"uv.lock's `{name}` carries no sha256 for every file")
+    return package
+
+
+def requirement(lock: dict, name: str) -> str:
+    """``name==<locked version>`` with every hash the lock holds for it, or a ValueError."""
+    package = locked_package(lock, name)
+    hashes = _hashes(package)
     return " ".join([f"{name}=={package['version']}", *(f"--hash={value}" for value in hashes)])
 
 
