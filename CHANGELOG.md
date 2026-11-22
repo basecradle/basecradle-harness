@@ -7,6 +7,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.209.0] - 2026-11-22
+
+### Fixed: the `mempalace` extra no longer installs MemPalace 3.12, which the harness does not support yet (issue #988)
+
+The extra declared `mempalace>=3.9.0`, so a fresh install resolved MemPalace 3.12.0, released this week. 3.12 removed the cross-file content-hash dedup ([MemPalace#2800](https://github.com/MemPalace/mempalace/pull/2800)) that the harness relies on to recognise a moved home: on 3.12, a `mempalace mine` of `conversations/` after a home move or rename files every exchange a second time, and the palace check can no longer forecast or relocate that mine. Twenty real-palace tests fail on it. The observe itself still files every exchange on 3.12, so an agent that has it does not lose memories; it gains duplicates on its next move.
+
+- **The extra is `mempalace>=3.9.0,<3.12`.** The CI floor job reads the floor from the same spec.
+- **Dependabot ignores MemPalace 3.12 and later** until the support lands. Both holds are lifted together in [issue #989](https://github.com/basecradle/basecradle-harness/issues/989).
+
 ## [0.208.0] - 2026-11-22
 
 ### Added: `basecradle-harness-prune-palace` shows by month where its candidates went, and why the ungrouped stayed out (issue #973)

@@ -9,6 +9,12 @@ updates:
   schedule:
     interval: weekly
   open-pull-requests-limit: 10
+  ignore:
+  # MemPalace 3.12 removed the content-hash dedup a moved home's recognition rests on
+  # (MemPalace#2800, issue #988), and `pyproject.toml` caps the extra below it. Lifted with the
+  # cap when the harness supports it (issue #989).
+  - dependency-name: mempalace
+    versions: [">=3.12.0"]
 - package-ecosystem: github-actions
   directory: "/"
   schedule:
