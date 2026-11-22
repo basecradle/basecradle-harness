@@ -681,3 +681,102 @@ def test_a_real_wake_sigtermed_inside_the_model_call_logs_stopped_and_dies_by_th
     assert any("wake stopped" in line and "reason=signal" in line for line in lines)
     claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
     assert claim is not None and claim.phase == "abandoned"
+
+
+def test_a_stop_taken_while_the_main_thread_is_already_blocked_in_a_read_still_stops_it(
+    tmp_path,
+):
+    """A SIGTERM whose handler has not run when the main thread blocks is still acted on (#990).
+
+    Python runs a signal's handler only on the main thread, and only between bytecodes or when a
+    blocking syscall returns `EINTR`. So a stop the main thread took on its way *toward* a read, or
+    one the kernel handed to another thread, leaves the handler pending — its flag tripped — behind
+    a read that may not return until the model answers. On CI that was a stop landing as a model
+    call began, about one time in ten (issue #990); in production a router that SIGKILLs two seconds
+    later turns that stop into a crash.
+
+    This builds the same state deterministically: the main thread is already blocked in the real
+    SDK's socket read when another thread takes the SIGTERM (`pthread_kill` to itself), so the main
+    thread is never interrupted by the delivery. Without the relay in `_stop` it waits for the
+    endpoint's 60 s sleep; with it, the stop is acted on at once.
+    """
+    child = _child(
+        """
+        import os, signal, socket, sys, threading, time
+        from pathlib import Path
+
+        import httpx, respx
+
+        from basecradle_harness import MessagesTool
+        from basecradle_harness import _wake
+        from basecradle_harness._openai import OpenAIProvider
+        from tests import test_wake as w
+
+        home = Path(sys.argv[1])
+        endpoint = socket.socket()
+        endpoint.bind(("127.0.0.1", 0))
+        endpoint.listen()
+
+        def accept_and_never_answer():
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            connection, _ = endpoint.accept()
+            request = connection.recv(65536)
+            if request.startswith(b"POST /v1/responses"):
+                threading.Thread(target=take_the_stop, daemon=True).start()
+            time.sleep(60)
+
+        def take_the_stop():
+            # Long enough for the main thread to be blocked in the read (the issue's 0.3 s control
+            # arm never hung), then the stop is delivered here, never to the main thread.
+            time.sleep(0.3)
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})  # born with the server's mask
+            signal.pthread_kill(threading.get_ident(), signal.SIGTERM)
+            os.write(int(os.environ["READY_FD"]), b"READY\\n")
+
+        threading.Thread(target=accept_and_never_answer, daemon=True).start()
+        brain = OpenAIProvider(
+            "gpt-4o",
+            api_key="sk-proj-FAKEfakeFAKEfake0123456789abcdef",
+            base_url=f"http://127.0.0.1:{endpoint.getsockname()[1]}/v1",
+        )
+        with respx.mock(base_url=w.BC_URL, assert_all_called=False) as router:
+            router.route(host="127.0.0.1").pass_through()
+            router.get("/users/dashboard").mock(return_value=httpx.Response(200, json=w.dashboard()))
+            router.get(f"/timelines/{w.TIMELINE_UUID}").mock(
+                return_value=httpx.Response(200, json=w.timeline())
+            )
+            for path, body in (
+                ("/assets", w.asset_page()),
+                ("/webhook_events", w.event_page()),
+                ("/tasks", w.task_page()),
+            ):
+                router.get(path).mock(return_value=httpx.Response(200, json=body))
+            w.serve_messages(router, w.page(w.message(uuid=w.M0, body="Look into the owls?")))
+            agent, _ = w.build_wake(home, brain, tools=[MessagesTool()])
+            _wake.WakeAgent.from_env = classmethod(lambda cls, **kwargs: agent)
+            sys.exit(_wake.main(["--timeline", w.TIMELINE_UUID]))
+        """,
+        tmp_path,
+        ready_pipe=True,
+    )
+    try:
+        _await_ready(child)
+        # Well inside the router's own two seconds, and far short of the endpoint's 60 s sleep: a
+        # stop that waited for the read would fail here rather than pass late.
+        _, err = child.communicate(timeout=10)
+    finally:
+        child.kill()
+
+    _assert_stopped_inside_the_model_call(child, err, tmp_path)
+
+
+def _assert_stopped_inside_the_model_call(child: subprocess.Popen, err: str, home: Path) -> None:
+    assert child.returncode == -signal.SIGTERM, err
+    lines = err.splitlines()
+    assert any(line.startswith("INFO context attribution") for line in lines), err
+    assert not any(line.startswith("INFO llm ") or " outcome=ok" in line for line in lines), err
+    end = next(line for line in lines if "wake end" in line)
+    assert "outcome=stopped" in end and "signal=TERM" in end
+    assert any("wake stopped" in line and "reason=signal" in line for line in lines)
+    claim = ClaimStore(home).read(TIMELINE_UUID, M0, kind="messages")
+    assert claim is not None and claim.phase == "abandoned"
