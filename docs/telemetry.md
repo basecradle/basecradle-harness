@@ -196,11 +196,11 @@ The harness's members (`_observability._VERDICT_VALUES` for the `outcome=` pairs
 
 | Tier | Heads | `outcome=` Values |
 |---|---|---|
-| Success | `wake start`, `wake continuing`, `wake billing_recovered`, `Wake breaker RESET`, `palace scrub` (an apply that found nothing to remove) | `ok` |
+| Success | `wake start`, `wake continuing`, `wake billing_recovered`, `Wake breaker RESET`, `palace scrub` (an apply that found nothing to remove), `palace prune` (a dry run that offered no group, an apply or a restore that skipped nothing, a discard) | `ok` |
 | Bookend | `wake end` | — |
-| Warning | `wake skipped`, `wake deferred`, `wake truncated_turn`, `wake stalled`, `wake billing_blocked`, `degraded`, `Wake breaker TRIPPED`, `palace scrub` (a dry run) | `degraded`, `retrying`, `refused`, `fallback`, `deferred` |
+| Warning | `wake skipped`, `wake deferred`, `wake truncated_turn`, `wake stalled`, `wake billing_blocked`, `degraded`, `Wake breaker TRIPPED`, `palace scrub` (a dry run), `palace prune` (a dry run that offers a group, an apply or a restore that skipped something) | `degraded`, `retrying`, `refused`, `fallback`, `deferred` |
 | Operator's Choice | `wake stopped` | `stopped` |
-| Failure | `wake failed`, `wake reported_failure`, `post failed`, `cleanup failed`, `cleanup blocked`, `palace scrub failed`, `palace scrub` (an apply that removed what the harness mined) | `error`, `failed` |
+| Failure | `wake failed`, `wake reported_failure`, `post failed`, `cleanup failed`, `cleanup blocked`, `palace scrub failed`, `palace prune failed`, `palace scrub` (an apply that removed what the harness mined) | `error`, `failed` |
 
 The Operator's Choice tier's members across the fleet today: `outcome=stopped` (the router's `stage=wake` line, and the harness's `wake end`), `event=wake_stopped` (the router), and the harness's `wake stopped`. The router's members of the other tiers are its own `logfmt.PALETTE`, pinned by its `tests/test_logfmt.py`; its Warning tier includes `outcome=deferred`, a wake that exited `75` and is scheduled to be tried again (basecradle-router#527, the router's half of harness issue #951). The harness's `wake end` says the same word for the same ending (issue #957): a wake that gives up on an outage while another attempt follows ends `outcome=deferred`, and so, since issue #962, does a wake whose exit `1` another of the router's quick tries follows (its `try=`, which the router logs as `event=wake_retry`, not as a deferral); only the last attempt or try, or a wake nothing follows, ends `outcome=error`. `tests/test_telemetry_contract.py` holds the harness to this section: the SGR of every tier, and the `outcome=` vocabulary in both directions.
 
@@ -957,6 +957,40 @@ These are written by the console scripts, not by a wake.
 | `op` | `unlink`. | `_scrub`. | Never. |
 | `path` | The path. | `_scrub`. | Never. |
 | `error` | Common. | `_scrub`. | Never. |
+
+### `palace prune`
+
+Written by `basecradle-harness-prune-palace` (issue #973), one line per run. Counts, ids and the plan hash only: never drawer text.
+
+| Field | Meaning | Filled By | Absent When |
+|---|---|---|---|
+| `palace` | The palace path. | `_prune`. | Never. |
+| `mode` | `dry-run`, `apply`, `restore` or `discard`. | `_prune`. | Never. |
+| `drawers` | Drawers in the palace, registry rows excluded. | `_prune`. | `mode` is not `dry-run`. |
+| `exchanges` | Exchange files with drawers, read. | `_prune`. | `mode` is not `dry-run`. |
+| `candidates` | Exchanges that pass the rule's first two clauses. | `_prune`. | `mode` is not `dry-run`. |
+| `groups` | Groups offered. | `_prune`. | `mode` is not `dry-run`. |
+| `members` | Exchanges in those groups. | `_prune`. | `mode` is not `dry-run`. |
+| `copies` | Exchanges a default yes to every group would remove. | `_prune`. | `mode` is not `dry-run`. |
+| `exceptions` | Members held back as exceptions. | `_prune`. | `mode` is not `dry-run`. |
+| `plan` | The plan hash. | `_prune`. | `mode` is `restore` or `discard`. |
+| `backups` | Backups kept from earlier applies. | `_prune`. | `mode` is not `dry-run`. |
+| `accepted` | The group ids the agent accepted, which the apply carried out. | `_prune`. | `mode` is not `apply`. |
+| `files_removed` | Exchange files removed. | `_prune`. | `mode` is not `apply`. |
+| `drawers_deleted` | Drawers deleted with them. | `_prune`. | `mode` is not `apply`. |
+| `skipped` | On an apply, planned files skipped because they no longer match the plan; on a restore, files and drawers left because they are already in the store. | `_prune`. | `mode` is `dry-run` or `discard`. |
+| `files_restored` | Exchange files a restore put back. | `_prune`. | `mode` is not `restore`. |
+| `drawers_restored` | Drawers a restore put back. | `_prune`. | `mode` is not `restore`. |
+| `backup` | The backup's name: the one the apply wrote, or the one restored or discarded. | `_prune`. | `mode=dry-run`, or an apply that removed nothing. |
+
+### `palace prune failed`
+
+A refusal or an error; the run changed nothing in the store.
+
+| Field | Meaning | Filled By | Absent When |
+|---|---|---|---|
+| `palace` | The palace path. | `_prune`. | It could not be resolved. |
+| `error` | Common. | `_prune`. | Never. |
 
 ## Prose Lines
 
