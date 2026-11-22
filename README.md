@@ -2448,6 +2448,23 @@ An **app-only Bearer** variant — `{ "url": "https://api.x.com/mcp", "headers":
 
 `mcp/` ships **empty**: a fresh install talks to no external server. Adding one is a deliberate step *out* of the safe-by-default zone — see below.
 
+## Price a call yourself — the public prices file
+
+Anthropic, OpenAI and Google on Vertex return tokens and no dollars, so the harness prices their calls (`cost_basis=computed`) from its own transcription of each vendor's price page. That transcription is **public data**: every release carries it as one JSON file, `basecradle_harness/data/prices.json`, holding every rate, its source page and the day it was read, plus every rule for choosing a row (thresholds, tiers, geography, the model-key rule). Read it without importing the harness, whose modules are private:
+
+```python
+import importlib.util
+import json
+from pathlib import Path
+
+# Finds the installed package without running any of it.
+spec = importlib.util.find_spec("basecradle_harness")
+path = Path(spec.submodule_search_locations[0], "data", "prices.json")
+prices = json.loads(path.read_text(encoding="utf-8"))
+```
+
+The file is the harness's own source, so it holds exactly the prices that release logs. Its format, its fields and the stability promise (a field is added, never renamed or repurposed, without a `format_version` change) are in [`docs/prices.md`](docs/prices.md) ([#997](https://github.com/basecradle/basecradle-harness/issues/997)).
+
 ## Add your own provider
 
 A provider is **any object with a `chat(messages, tools=None) -> Message` method**. There is nothing to inherit; implement that one method and you have a new brain.

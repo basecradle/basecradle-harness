@@ -17,7 +17,9 @@ The three rules that hold `_google_rates` honest hold this table too:
   ``None`` and the line carries no ``cost=``. A wrong number is worse than a missing one, because the
   dashboard sums it.
 - **Every number is transcribed, never derived** — row by row from `SOURCE`, as it stood on the date
-  there. When the page moves, the table is edited from the page in a reviewed PR, with the new date.
+  there. The numbers live in the package's public prices file (``data/prices.json``, read through
+  `basecradle_harness._prices`, issue #997), never here: when the page moves, the file's ``openai``
+  section is edited from the page in a reviewed PR, with the new date.
 - **Which row applies is decided by the call's own facts**: the model id, the prompt size (above
   `LONG_CONTEXT_THRESHOLD` the long-context row prices **every** token of the call), the cache split
   the usage block reports (a cache *write* is its own rate on GPT-5.6 and later), and the service tier
@@ -51,36 +53,42 @@ What is priced, and what is not
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from basecradle_harness import _prices
 from basecradle_harness._observability import ComputedCost
 
-#: Where every number in this module was read, and when. Edit the tables from this page, and move
-#: the date with them.
-SOURCE = "https://developers.openai.com/api/docs/pricing (Standard tier, read 2026-10-07)"
+_DATA = _prices.vendor("openai")
+
+#: Where every number in this module was read, and when. Edit the file's tables from this page, and
+#: move the date with them.
+SOURCE = _prices.source(_DATA)
 
 #: Above this many input tokens a call is priced on the long-context row — all of its tokens
 #: ("Short context: ≤272K input tokens. Long context: >272K input tokens.").
-LONG_CONTEXT_THRESHOLD = 272_000
+LONG_CONTEXT_THRESHOLD: int = _DATA["long_prompt"]["threshold"]
+
+#: Whether a model with no long-context row is priced on its short row above the threshold: no —
+#: the page leaves that row blank, and a blank is not a price.
+_SHORT_ROW_WITHOUT_LONG = _prices.short_row_without_long(_DATA)
 
 #: The one host these rates are OpenAI's list price on. Regional-processing (data residency) and
 #: FedRAMP endpoints are "charged a 10% uplift", and a proxy's price is its own business.
-PRICED_HOST = "api.openai.com"
+PRICED_HOST: str = _DATA["priced_host"]
 
 #: What a response's ``service_tier`` says when it ran on the Standard tier.
-_STANDARD_SERVED = frozenset({"default"})
-#: What a request's ``service_tier`` is when it asked for nothing in particular, so a response that
-#: names no tier is read as standard (``auto`` is "the service tier configured in the Project
-#: settings", which is ``default`` unless an operator changed it — and a response served on another
-#: tier says so).
-_STANDARD_ASKED = frozenset({"", "auto", "default"})
+_STANDARD_SERVED = frozenset(_DATA["standard_service_tiers_served"])
+#: What a request's ``service_tier`` is when it asked for nothing in particular (the empty name is
+#: an unset field), so a response that names no tier is read as standard (``auto`` is "the service
+#: tier configured in the Project settings", which is ``default`` unless an operator changed it —
+#: and a response served on another tier says so).
+_STANDARD_ASKED = frozenset(_DATA["standard_service_tiers_asked"])
 
 #: OpenAI's charge per web search call: "$10.00 / 1k calls" (Web search, all models).
-WEB_SEARCH_PER_CALL = 10.00 / 1_000
+WEB_SEARCH_PER_CALL: float = _DATA["web_search_usd_per_1000"] / 1_000
 
 
 @dataclass(frozen=True)
@@ -110,55 +118,17 @@ class Rates:
 
 # --- the table --------------------------------------------------------------------------------
 #
-# Transcribed row by row from `SOURCE`, "Standard pricing data". Every OpenAI model the fleet runs
-# or has run is here (gpt-6-sol today; gpt-5.6-terra and gpt-5.4-mini before it — basecradle-noc
-# fleet/inventory.json history), with the rest of the GPT-6 and GPT-5.6 families beside them so an
-# operator moving within a family is priced from the first call. The ``-pro`` models are left out:
-# the page states them no cached-input rate, and an agent's every call reads cache.
+# Transcribed row by row from `SOURCE`, "Standard pricing data", into the prices file's ``openai``
+# section, whose ``note`` says which models are carried and why.
 
 #: Model id → its Standard rates. Keyed by the alias OpenAI publishes; a dated snapshot of it
 #: (``gpt-6-sol-2026-08-14``) is priced as its alias (`_model_key`).
 RATES: Mapping[str, Rates] = {
-    "gpt-6-astra": Rates(
-        short=Tier(input=10.00, cached=1.00, cache_write=12.50, output=50.00),
-        long=Tier(input=20.00, cached=2.00, cache_write=25.00, output=75.00),
-    ),
-    "gpt-6.1-sol": Rates(
-        short=Tier(input=2.00, cached=0.10, cache_write=2.50, output=10.00),
-        long=Tier(input=4.00, cached=0.20, cache_write=5.00, output=15.00),
-    ),
-    "gpt-6-sol": Rates(
-        short=Tier(input=2.00, cached=0.20, cache_write=2.50, output=10.00),
-        long=Tier(input=4.00, cached=0.40, cache_write=5.00, output=15.00),
-    ),
-    "gpt-6-luna": Rates(
-        short=Tier(input=0.10, cached=0.01, cache_write=0.125, output=0.50),
-        long=Tier(input=0.20, cached=0.02, cache_write=0.25, output=0.75),
-    ),
-    # The page: "GPT-5.6 Sol's promotional pricing is available at least through November 21, 2026."
-    # No end date is stated, so none is encoded; the NOC's list-price check is what notices a move.
-    "gpt-5.6-sol": Rates(
-        short=Tier(input=4.00, cached=0.40, cache_write=5.00, output=20.00),
-        long=Tier(input=8.00, cached=0.80, cache_write=10.00, output=30.00),
-    ),
-    "gpt-5.6-terra": Rates(
-        short=Tier(input=2.00, cached=0.20, cache_write=2.50, output=12.00),
-        long=Tier(input=4.00, cached=0.40, cache_write=5.00, output=18.00),
-    ),
-    "gpt-5.6-luna": Rates(
-        short=Tier(input=0.20, cached=0.02, cache_write=0.25, output=1.20),
-        long=Tier(input=0.40, cached=0.04, cache_write=0.50, output=1.80),
-    ),
-    "gpt-5.5": Rates(
-        short=Tier(input=5.00, cached=0.50, output=30.00),
-        long=Tier(input=10.00, cached=1.00, output=45.00),
-    ),
-    "gpt-5.4": Rates(
-        short=Tier(input=2.50, cached=0.25, output=15.00),
-        long=Tier(input=5.00, cached=0.50, output=22.50),
-    ),
-    "gpt-5.4-mini": Rates(short=Tier(input=0.75, cached=0.075, output=4.50), long=None),
-    "gpt-5.4-nano": Rates(short=Tier(input=0.20, cached=0.02, output=1.25), long=None),
+    model: Rates(
+        short=_prices.row(Tier, rows["short"]),
+        long=None if rows["long"] is None else _prices.row(Tier, rows["long"]),
+    )
+    for model, rows in _DATA["models"].items()
 }
 
 
@@ -179,12 +149,7 @@ class ImageRates:
 #: The image models the harness calls (`_images.GENERATE_MODEL` / `EDIT_MODEL`) and their family,
 #: from the page's "Image generation models", Standard.
 IMAGE_RATES: Mapping[str, ImageRates] = {
-    "gpt-image-2.5-flare": ImageRates(image_input=8.00, text_input=5.00, image_output=30.00),
-    "gpt-image-2.5-sunburst": ImageRates(image_input=8.00, text_input=5.00, image_output=30.00),
-    "gpt-image-2": ImageRates(image_input=8.00, text_input=5.00, image_output=30.00),
-    "gpt-image-1.5": ImageRates(
-        image_input=8.00, text_input=5.00, image_output=32.00, text_output=10.00
-    ),
+    model: _prices.row(ImageRates, row) for model, row in _DATA["image_models"].items()
 }
 
 
@@ -200,12 +165,10 @@ class TranscriptionRates:
 #: From the page's "Transcription models". ``gpt-transcribe`` is the harness's default
 #: (`_audio.DEFAULT_MODEL`) and is priced per minute only. The token-billed models carry the one
 #: input rate the page states for them (no separate audio-input row as of the date in `SOURCE`);
-#: if the page splits audio from text again, the table grows a column, never a guessed ratio.
+#: if the page splits audio from text again, the file grows a field, never a guessed ratio.
 TRANSCRIPTION_RATES: Mapping[str, TranscriptionRates] = {
-    "gpt-transcribe": TranscriptionRates(per_minute=0.0045),
-    "gpt-4o-transcribe": TranscriptionRates(per_minute=0.006, input=2.50, output=10.00),
-    "gpt-4o-mini-transcribe": TranscriptionRates(per_minute=0.003, input=1.25, output=5.00),
-    "whisper-1": TranscriptionRates(per_minute=0.006),
+    model: _prices.row(TranscriptionRates, row)
+    for model, row in _DATA["transcription_models"].items()
 }
 
 
@@ -267,9 +230,10 @@ def call_cost(
     rates = RATES.get(_model_key(model))
     if rates is None:
         return None
-    tier = rates.long if usage.input > LONG_CONTEXT_THRESHOLD else rates.short
-    if tier is None:
+    over = usage.input > LONG_CONTEXT_THRESHOLD
+    if over and rates.long is None and not _SHORT_ROW_WITHOUT_LONG:
         return None
+    tier = rates.long if over and rates.long is not None else rates.short
     cached = min(usage.cached, usage.input)
     written = min(usage.cache_write, usage.input - cached)
     write_rate = tier.input if tier.cache_write is None else tier.cache_write
@@ -393,12 +357,9 @@ def priced_host(base_url: str | None) -> bool:
     return (urlsplit(base_url).hostname or "").lower() == PRICED_HOST
 
 
-#: A dated snapshot suffix (``-2026-08-14``), priced as the alias it pins.
-_SNAPSHOT = re.compile(r"-\d{4}-\d{2}-\d{2}$")
-
-
-def _model_key(model: str) -> str:
-    return _SNAPSHOT.sub("", model.strip().lower())
+#: The file's model-key rule: a dated snapshot suffix (``-2026-08-14``) is priced as the alias it
+#: pins.
+_model_key = _prices.model_key(_DATA)
 
 
 def _standard(served: Any, asked: Any) -> bool:

@@ -7,6 +7,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.210.0] - 2026-11-22
+
+### Added: the vendor price tables are a public data file in the package (issue #997)
+
+Another product priced an account by installing this package and importing its private rate modules. Reaching into a product's private code is the defect, so the harness now publishes its price data instead: the tables stay here, where their tests are, and every release carries them as data anyone may read without importing a harness module.
+
+- **One file holds every transcribed number: `basecradle_harness/data/prices.json`.** It covers the Anthropic, OpenAI and Google tables: every rate, each table's source page and the day it was read, the Google periods' effective dates, and the per-1,000 search and grounding fees as the pages state them. It also holds every rule a reader needs to choose a row: thresholds, the no-long-row rule, standard tier and traffic names, inference-geography multipliers, the priced host, the Global location, the billing timezone and the model-key rule. Its `note` fields carry the remarks the tables used to keep in comments, such as which models are left out and the one Google cell left unstated.
+- **The rate modules build their tables from the file** (`_prices.py`), so a number lives in one place. Their arithmetic stays code, and every table, constant and `SOURCE` line they expose is the same value as before. No price changed, and no `cost=` the harness logs changed. A row with a missing or unknown field, a rule the code does not know, or a file of another format or version fails loudly at import, as a missing module would.
+- **The format is documented, and it is a stable promise:** [`docs/prices.md`](docs/prices.md) describes the path, every field, how each vendor's row is applied, and what a reader still has to bring. A field is added, never renamed or repurposed, without a `format_version` change. A test fails the build on any field the page does not document.
+- **CI proves the wheel carries the file.** The build job runs `scripts/check_wheel_data.py` on the wheel the release's own build action produces, and it fails unless the wheel's `prices.json` is byte-identical to the source tree's.
+
 ## [0.209.0] - 2026-11-22
 
 ### Fixed: a stop that lands just before the wake blocks on the model is acted on at once, not when the call returns (issue #990)

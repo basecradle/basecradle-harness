@@ -12,7 +12,9 @@ The three rules that hold `_google_rates` and `_openai_rates` honest hold this t
   each returns ``None`` and the line carries no ``cost=``. A wrong number is worse than a missing
   one, because the dashboard sums it.
 - **Every number is transcribed, never derived** — row by row from `SOURCE`, as it stood on the date
-  there. When the page moves, the table is edited from the page in a reviewed PR, with the new date.
+  there. The numbers live in the package's public prices file (``data/prices.json``, read through
+  `basecradle_harness._prices`, issue #997), never here: when the page moves, the file's
+  ``anthropic`` section is edited from the page in a reviewed PR, with the new date.
 - **Which row applies is decided by the call's own facts**: the model id, the prompt length (on
   Claude Haiku 5.5, a prompt over `HAIKU_LONG_PROMPT_THRESHOLD` prices **every** token of the call
   on the higher row — "a request's prompt length counts all of its input tokens, including cache
@@ -44,34 +46,44 @@ What is priced, and what is not
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from basecradle_harness import _prices
 from basecradle_harness._observability import ComputedCost
 
-#: Where every number in this module was read, and when. Edit the tables from this page, and move
-#: the date with them.
-SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing (read 2026-11-21)"
+_DATA = _prices.vendor("anthropic")
+
+#: Where every number in this module was read, and when. Edit the file's tables from this page, and
+#: move the date with them.
+SOURCE = _prices.source(_DATA)
 
 #: On Claude Haiku 5.5, a request whose prompt is over this many tokens pays the higher row for all
 #: of them ("for prompts over 100,000 tokens"). Every other current model is priced flat across its
 #: whole context window ("A 900k-token request is billed at the same per-token rate as a 9k-token
-#: request").
-HAIKU_LONG_PROMPT_THRESHOLD = 100_000
+#: request"), which is why a model with no long row is priced on its one row at any length.
+HAIKU_LONG_PROMPT_THRESHOLD: int = _DATA["long_prompt"]["threshold"]
 
 #: "$10 USD per 1,000 searches" (Web search tool).
-WEB_SEARCH_PER_SEARCH = 10.00 / 1_000
+WEB_SEARCH_PER_SEARCH: float = _DATA["web_search_usd_per_1000"] / 1_000
 
-#: "Specifying US-only inference through the `inference_geo` parameter incurs a 1.1x multiplier on
-#: all token pricing categories … Global routing (the default) uses standard pricing."
-US_INFERENCE_MULTIPLIER = 1.1
+#: The ``inference_geo`` values a request may carry and the multiplier the page states for each
+#: ("Specifying US-only inference through the `inference_geo` parameter incurs a 1.1x multiplier on
+#: all token pricing categories … Global routing (the default) uses standard pricing"). The empty
+#: name is an unset field, which is global routing. A value the page prices nowhere is not priced.
+_GEO_MULTIPLIERS: Mapping[str, float] = dict(_DATA["inference_geo_multipliers"])
 
-#: The ``inference_geo`` values a request may carry and the multiplier the page states for each.
-#: Unset is global routing. A value the page prices nowhere is not priced.
-_GEO_MULTIPLIERS = {"": 1.0, "global": 1.0, "us": US_INFERENCE_MULTIPLIER}
+US_INFERENCE_MULTIPLIER = _GEO_MULTIPLIERS["us"]
+
+#: The service tiers and speeds the table prices; anything else is another row of the page, or none.
+_STANDARD_TIERS = frozenset(_DATA["standard_service_tiers"])
+_STANDARD_SPEEDS = frozenset(_DATA["standard_speeds"])
+
+#: Whether a model with no long row is priced on its one row over the threshold: yes on this page,
+#: whose every model but Haiku 5.5 is priced flat.
+_SHORT_ROW_WITHOUT_LONG = _prices.short_row_without_long(_DATA)
 
 
 @dataclass(frozen=True)
@@ -96,38 +108,17 @@ class Rates:
 
 # --- the table --------------------------------------------------------------------------------
 #
-# Transcribed row by row from `SOURCE`, "Model pricing". Each family's current models and the recent
-# ones an operator moving within it may still run, so a move is priced from the first call; Opus
-# 4.5, Sonnet 4.5 and everything older or retired are left out. Claude Mythos is left out too: it is
-# limited-availability, and no fleet agent can run it.
+# Transcribed row by row from `SOURCE`, "Model pricing", into the prices file's ``anthropic`` section,
+# whose ``note`` says which models are carried and why.
 
 #: Model id → its rates. Keyed by the id Anthropic publishes; a dated snapshot of it
 #: (``claude-haiku-4-5-20251001``) is priced as that id (`_model_key`).
 RATES: Mapping[str, Rates] = {
-    "claude-fable-5-2": Rates(
-        Tier(input=8.0, write_5m=10.0, write_1h=16.0, read=0.20, output=40.0)
-    ),
-    "claude-fable-5-1": Rates(
-        Tier(input=10.0, write_5m=12.50, write_1h=20.0, read=0.25, output=50.0)
-    ),
-    "claude-fable-5": Rates(Tier(input=10.0, write_5m=12.50, write_1h=20.0, read=1.0, output=50.0)),
-    "claude-opus-5-5": Rates(Tier(input=4.0, write_5m=5.0, write_1h=8.0, read=0.20, output=20.0)),
-    "claude-opus-5": Rates(Tier(input=5.0, write_5m=6.25, write_1h=10.0, read=0.50, output=25.0)),
-    "claude-opus-4-8": Rates(Tier(input=5.0, write_5m=6.25, write_1h=10.0, read=0.50, output=25.0)),
-    "claude-opus-4-7": Rates(Tier(input=5.0, write_5m=6.25, write_1h=10.0, read=0.50, output=25.0)),
-    "claude-opus-4-6": Rates(Tier(input=5.0, write_5m=6.25, write_1h=10.0, read=0.50, output=25.0)),
-    "claude-sonnet-5-5": Rates(
-        Tier(input=2.0, write_5m=2.50, write_1h=4.0, read=0.10, output=10.0)
-    ),
-    "claude-sonnet-5": Rates(Tier(input=2.0, write_5m=2.50, write_1h=4.0, read=0.20, output=10.0)),
-    "claude-sonnet-4-6": Rates(
-        Tier(input=3.0, write_5m=3.75, write_1h=6.0, read=0.30, output=15.0)
-    ),
-    "claude-haiku-5-5": Rates(
-        short=Tier(input=0.10, write_5m=0.125, write_1h=0.20, read=0.01, output=0.50),
-        long=Tier(input=0.50, write_5m=0.625, write_1h=1.0, read=0.05, output=2.50),
-    ),
-    "claude-haiku-4-5": Rates(Tier(input=1.0, write_5m=1.25, write_1h=2.0, read=0.10, output=5.0)),
+    model: Rates(
+        short=_prices.row(Tier, rows["short"]),
+        long=None if rows["long"] is None else _prices.row(Tier, rows["long"]),
+    )
+    for model, rows in _DATA["models"].items()
 }
 
 
@@ -196,22 +187,17 @@ def call_cost(
     multiplier = _GEO_MULTIPLIERS.get(_name(geo))
     if (
         multiplier is None
-        or _name(tier) not in ("", "standard")
-        or _name(speed)
-        not in (
-            "",
-            "standard",
-        )
+        or _name(tier) not in _STANDARD_TIERS
+        or _name(speed) not in _STANDARD_SPEEDS
     ):
         return None
     rates = RATES.get(_model_key(model))
     if rates is None:
         return None
-    row = (
-        rates.long
-        if rates.long is not None and usage.prompt > HAIKU_LONG_PROMPT_THRESHOLD
-        else (rates.short)
-    )
+    over = usage.prompt > HAIKU_LONG_PROMPT_THRESHOLD
+    if over and rates.long is None and not _SHORT_ROW_WITHOUT_LONG:
+        return None
+    row = rates.long if over and rates.long is not None else rates.short
     total = (
         usage.uncached * row.input
         + usage.write_5m * row.write_5m
@@ -245,7 +231,7 @@ def server_tool_requests(usage: Any, name: str) -> int:
 
 #: The one host these rates are the list price on. A proxy or gateway reached through
 #: ``AI_BASE_URL`` sets its own price, so a call there is unpriced (issue #759), as on OpenAI.
-PRICED_HOST = "api.anthropic.com"
+PRICED_HOST: str = _DATA["priced_host"]
 
 
 def priced_host(base_url: str | None) -> bool:
@@ -260,12 +246,8 @@ def known(model: str) -> bool:
     return _model_key(model) in RATES
 
 
-#: A dated snapshot suffix (``-20251001``), priced as the id it pins.
-_SNAPSHOT = re.compile(r"-\d{8}$")
-
-
-def _model_key(model: str) -> str:
-    return _SNAPSHOT.sub("", model.strip().lower())
+#: The file's model-key rule: a dated snapshot suffix (``-20251001``) is priced as the id it pins.
+_model_key = _prices.model_key(_DATA)
 
 
 def _name(value: Any) -> str:
