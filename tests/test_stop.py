@@ -532,6 +532,44 @@ def test_the_entrypoint_dies_by_sigterm_and_ignores_a_second_one(tmp_path):
     assert out.strip() == "BOOKKEEPING DONE"
 
 
+def test_the_relay_never_stops_a_wake_by_itself(tmp_path):
+    """A SIGTERM byte on the relay's pipe that is not this process's stop stops nothing (#990).
+
+    A forked child's C handler writes to the same pipe, so the relay cannot take the byte as proof of
+    a stop. It wakes the main thread with a no-op signal, never SIGTERM: the main thread runs its
+    tripped handlers, none is a stop, the relay sees the wake was answered and goes quiet. A relay
+    that re-sent SIGTERM stopped the wake here.
+    """
+    child = _child(
+        """
+        import os, signal, time
+        from basecradle_harness import _stop
+
+        wakes = []
+        _on_wake = _stop._on_wake
+        _stop._on_wake = lambda signum, frame: (wakes.append(signum), _on_wake(signum, frame))
+        _stop.install()
+        os.write(_stop._wakeup, bytes([signal.SIGTERM]))  # a stop's byte, and no stop
+        try:
+            time.sleep(1.0)
+            quiet = len(wakes)
+            time.sleep(0.5)
+        except _stop.WakeStopped:
+            print("STOPPED", flush=True)
+        else:
+            print("SURVIVED", quiet, len(wakes), flush=True)
+        """,
+        tmp_path,
+    )
+    out, err = child.communicate(timeout=30)
+
+    assert child.returncode == 0, err
+    word, quiet, later = out.split()
+    assert word == "SURVIVED"
+    assert int(quiet) >= 1  # it did wake the main thread, which is how it learned there was no stop
+    assert int(later) == int(quiet)  # and then went quiet
+
+
 def test_a_real_wake_sigtermed_mid_tool_logs_stopped_and_dies_by_the_signal(tmp_path):
     """End to end, in a real process: `main()`, a real wake, a tool the SIGTERM lands in.
 

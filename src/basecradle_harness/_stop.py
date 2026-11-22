@@ -30,10 +30,11 @@ so the handler waits behind the read for as long as the read takes: a model call
 timeout, which the router's SIGKILL two seconds later turns into a crash. CI caught it about one
 stop in ten landing as a model call began. So `install` also arms a **relay**: CPython writes the
 signal's number to a wakeup descriptor (`signal.set_wakeup_fd`) from its C-level handler, before any
-Python runs, and a thread that never takes SIGTERM itself reads it and re-signals the main thread
-(`signal.pthread_kill`) until the handler has run. A re-signal lands on the blocked main thread,
-interrupts its syscall, and the handler runs. In the ordinary case the handler has run before the
-relay's first look, and it sends nothing.
+Python runs, and a thread that never takes SIGTERM itself reads it and wakes the main thread
+(`signal.pthread_kill` with a no-op `WAKE_SIGNAL`, never SIGTERM) until the stop has been raised. The
+wake interrupts the blocked syscall, Python runs every tripped handler, and the stop's is among them
+only if a stop really arrived, so the relay can never stop a wake by itself. In the ordinary case the
+handler has run before the relay's first look, and it sends nothing.
 
 A `SIGKILL` runs none of this, and that is the point of the distinction: a crash stays a crash, and
 its turn is resumed exactly as before. Only SIGTERM is trapped — SIGINT is Python's own
@@ -72,16 +73,26 @@ class WakeStopped(BaseException):
         return signal.Signals(self.signum).name.removeprefix("SIG")
 
 
-#: How long the relay lets the handler run on its own before it re-signals the main thread, and the
-#: longest it waits between re-signals after that. The first is far above the microseconds an
-#: unblocked main thread takes to run the handler, so an ordinary stop is never re-signalled; the
-#: second keeps a stop the main thread keeps missing well inside the router's two seconds.
+#: The signal the relay wakes the main thread with. **Never SIGTERM**: re-sending the stop would let
+#: the relay *manufacture* one from a byte that was not this process's (a forked child's C handler
+#: writes to the same pipe), and could land inside `_on_term` before it sets `SIG_IGN`. Waking with a
+#: no-op signal instead interrupts the blocked syscall, and Python then runs every handler whose flag
+#: is tripped — SIGTERM's among them only if a stop has really arrived. SIGWINCH is harmless when
+#: anything else sends it (a terminal resize) and nothing in the fleet sends it on purpose.
+WAKE_SIGNAL = signal.SIGWINCH
+#: How long the relay lets the handler run on its own before it wakes the main thread, and the
+#: longest it waits between wakes after that. The first is far above the microseconds an unblocked
+#: main thread takes to run the handler, so an ordinary stop is never relayed; the second keeps a
+#: stop the main thread keeps missing well inside the router's two seconds.
 RELAY_FIRST = 0.02
 RELAY_MOST = 0.1
 
 #: Whether `_on_term` has raised this process's stop — set by it, read by the relay, and reset by
-#: `install`. A flag as well as `SIG_IGN`, so a re-signal can never raise a second `WakeStopped`.
+#: `install`. A flag as well as `SIG_IGN`, so a stop is raised once whatever else re-enters it.
 _stopped = False
+#: Whether the main thread has run `_on_wake` since the relay last woke it: the relay's evidence
+#: that the main thread ran its tripped handlers and no stop was among them.
+_woken = False
 #: The write end of the relay's wakeup pipe, once `install` has armed it; `None` before that, and in
 #: a forked child, which has no relay thread to read it.
 _wakeup: int | None = None
@@ -97,19 +108,27 @@ def _on_term(signum: int, frame: FrameType | None) -> None:
     raise WakeStopped(signum)
 
 
+def _on_wake(signum: int, frame: FrameType | None) -> None:
+    """The relay's wake: do nothing but say it ran, so the relay can tell a stop from no stop."""
+    global _woken
+    _woken = True
+
+
 def install() -> None:
     """Trap SIGTERM for this process, so a stop unwinds the wake instead of killing it.
 
-    Call it from the main thread, as the entrypoint does: `signal.set_wakeup_fd` refuses any other.
-    The wakeup descriptor is process-wide, so this claims it; the entrypoint owns its process's
-    signals, and nothing the wake runs sets one of its own (asyncio does, only in a loop that calls
+    Call it from the main thread, as the entrypoint does: `signal.signal` refuses any other, and it
+    is called first, so a misplaced call raises before a relay is aimed at the wrong thread. The
+    wakeup descriptor is process-wide, so this claims it; the entrypoint owns its process's signals,
+    and nothing the wake runs sets one of its own (asyncio does, only in a loop that calls
     `add_signal_handler`, which the wake never does).
     """
     global _stopped
     _stopped = False
-    # The relay first: its start holds SIGTERM back from this thread for a moment, and a stop held
-    # there must meet the default disposition (the wake has not begun), never a handler that would
-    # raise out of `install` itself.
+    signal.signal(WAKE_SIGNAL, _on_wake)
+    # The relay before the SIGTERM handler: its start holds SIGTERM back from this thread for a
+    # moment, and a stop held there must meet the default disposition (the wake has not begun),
+    # never a handler that would raise out of `install` itself.
     _arm_relay()
     signal.signal(signal.SIGTERM, _on_term)
 
@@ -137,12 +156,14 @@ def _arm_relay() -> None:
 
 
 def _relay(read_end: int, main: int) -> None:
-    """Re-signal `main` after each SIGTERM until `_on_term` has run there (see the module).
+    """After each SIGTERM, wake `main` until its stop has been raised there (see the module).
 
-    It stops re-signalling the moment the stop is raised, or the moment SIGTERM is no longer ours to
-    relay (`_on_term` set `SIG_IGN`, `die` set `SIG_DFL`, or a caller installed a handler of its own),
-    so it can never stop a wake that `install` did not arm, and never signal a process that is dying.
+    It stops waking the main thread the moment the stop is raised; the moment the main thread has run
+    its handlers without raising one (the byte was not a stop of this process's); or the moment
+    SIGTERM is no longer ours to relay (`_on_term` set `SIG_IGN`, `die` set `SIG_DFL`, a caller
+    installed a handler of its own). It sends only `WAKE_SIGNAL`, so it can never stop a wake itself.
     """
+    global _woken
     while True:
         try:
             received = os.read(read_end, 512)
@@ -151,24 +172,30 @@ def _relay(read_end: int, main: int) -> None:
         if not received:
             return
         if signal.SIGTERM not in received:
-            continue  # another trapped signal (SIGINT's `KeyboardInterrupt`) is not ours to relay
+            continue  # its own wake, or SIGINT's `KeyboardInterrupt`: not a stop to relay
+        _woken = False
         wait = RELAY_FIRST
-        while not _stopped and signal.getsignal(signal.SIGTERM) is _on_term:
+        while True:
             time.sleep(wait)
-            if _stopped or signal.getsignal(signal.SIGTERM) is not _on_term:
+            # `_stopped` before `_woken`: the main thread runs tripped handlers in signal order, so
+            # SIGTERM's (15) has run before `_on_wake` (SIGWINCH, 28) whenever a stop was pending.
+            if _stopped or signal.getsignal(signal.SIGTERM) is not _on_term or _woken:
                 break
             try:
-                signal.pthread_kill(main, signal.SIGTERM)
+                signal.pthread_kill(main, WAKE_SIGNAL)
             except (OSError, ValueError):  # the main thread has gone: nothing left to stop
                 return
             wait = min(wait * 2, RELAY_MOST)
 
 
 def _forget_relay_in_child() -> None:
-    """A forked child has no relay thread: the parent's pipe must never carry the child's stop.
+    """A forked child has no relay thread, so it must stop writing to the parent's pipe.
 
-    Without this, a SIGTERM to the child alone would write to the pipe the parent's relay reads, and
-    the parent would stop a wake nobody stopped.
+    Its C handler would otherwise write the child's own signals there, and wake the parent's relay
+    for a stop that is not the parent's (the relay finds no stop and goes quiet, but the child's
+    signals are not the parent's business). Runs for `os.fork`, `multiprocessing` and `preexec_fn`;
+    `subprocess`'s own fork-then-exec runs no Python in the child, and its signals are its own after
+    the exec.
     """
     global _wakeup
     if _wakeup is not None:

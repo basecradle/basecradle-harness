@@ -13,9 +13,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Python runs a signal handler only on the main thread, and only between bytecodes or when a blocking syscall returns `EINTR`. A `SIGTERM` the main thread took on its way into the model call's socket read, or one delivered to another thread, interrupted nothing, so the stop waited behind the read for up to the call's fitted timeout, and the router's `SIGKILL` two seconds later turned the stop into a crash. CI caught it about one stop in ten that landed as a model call began.
 
-- **The stop is relayed to the main thread.** `basecradle-harness-wake` points the process's signal wakeup descriptor at a small thread that never takes `SIGTERM` itself; it re-signals the main thread until the stop has been raised there. An ordinary stop is acted on before the relay looks, and it sends nothing.
-- **Still exactly one stop.** The handler is one-shot by a flag as well as by ignoring later `SIGTERM`s, so a re-signal never raises a second stop inside the first one's bookkeeping.
-- **A forked child drops the relay**, so a `SIGTERM` sent to a child alone can never stop the wake.
+- **The stop is relayed to the main thread.** `basecradle-harness-wake` points the process's signal wakeup descriptor at a small thread that never takes `SIGTERM` itself. It wakes the main thread with a no-op `SIGWINCH` until the stop has been raised there. An ordinary stop is acted on before the relay looks, and it sends nothing.
+- **The relay never sends a stop.** Its wake only interrupts the blocked read, and Python then runs whatever handlers are already pending, so a stop is raised only if one really arrived. The handler stays one-shot, by a flag as well as by ignoring later `SIGTERM`s.
+- **A forked child (`os.fork`, `multiprocessing`, `preexec_fn`) drops the relay's pipe**, so its own signals stay its own.
 
 ### Fixed: the `mempalace` extra no longer installs MemPalace 3.12, which the harness does not support yet (issue #988)
 
