@@ -132,7 +132,7 @@ jobs:
           with open("pyproject.toml", "rb") as handle:
               extra = tomllib.load(handle)["project"]["optional-dependencies"]["mempalace"]
           (spec,) = [item for item in extra if item.startswith("mempalace")]
-          print(re.fullmatch(r"mempalace>=([0-9][0-9.]*)", spec).group(1))
+          print(re.fullmatch(r"mempalace>=([0-9][0-9.]*)(?:,<[0-9][0-9.]*)?", spec).group(1))
           EOF
           )
           uv pip install "mempalace==$floor"

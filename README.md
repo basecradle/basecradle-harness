@@ -107,7 +107,7 @@ Memory is a **provider**, so the whole backend swaps without touching the engine
 | `HARNESS_MEMORY_PROVIDER` | The backend it binds |
 |---|---|
 | *(unset)* or `sqlite` | The default `SqliteMemoryProvider` — the `MemoryTool` over one private SQLite file. Host-local, no extra to install |
-| `mempalace` | The [MemPalace](https://github.com/mempalace/mempalace) adapter: local-first semantic memory (ChromaDB + a SQLite knowledge graph, no API key). Needs the extra — `pip install 'basecradle-harness[mempalace]'` |
+| `mempalace` | The [MemPalace](https://github.com/mempalace/mempalace) adapter: local-first semantic memory (ChromaDB + a SQLite knowledge graph, no API key). Needs the extra — `pip install 'basecradle-harness[mempalace]'`, which installs MemPalace 3.9 to 3.11 (3.12 is not supported yet, [issue #989](https://github.com/basecradle/basecradle-harness/issues/989)) |
 | `module:Class` | Any `MemoryProvider` subclass of your own, imported and instantiated with no arguments |
 
 The MemPalace adapter is the reference implementation of the *middleware* style: `observe` files each exchange into the palace, and `context` retrieves the top-K relevant chunks for the incoming turn and injects them at Turn 0 — memory grows and recalls **automatically**, so the agent never has to remember to call a tool. Retrieval is agent-scoped, not timeline-scoped: a fact learned on one timeline is recalled on another. One palace per agent, under its home, private to its OS user.
