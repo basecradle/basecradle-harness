@@ -7,31 +7,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.212.0] - 2026-11-23
-
-### Added: a moved home is recognised on MemPalace 3.12, which recognises a file by its path alone (issue #989)
-
-MemPalace 3.12 removed cross-file content-hash dedup on purpose ([MemPalace#2800](https://github.com/MemPalace/mempalace/pull/2800)): a mine now decides a file is filed only by the drawers recorded at its exact path. A home move or rename leaves every drawer recorded under the old path, so on 3.12 a `mempalace mine` of `conversations/` after a move filed every exchange a second time, and the palace check could neither forecast that nor prevent it. The design is `@briggs`'s rule, decided by `@origin` on the issue: the recognition is the harness's own, so it makes the check the mine already does come out true before the mine runs, and never takes a position inside the mine.
-
-- **`--relocate-source-file` records every provable file at its new path on 3.12, the observe's included.** Each file still proves itself first: its old path gone, the same file name here, and the content hash the harness stamped matching the file today. If the proof fails nothing is written for it, and the reason is printed. No drawer is deleted and no id changes. A current file is then skipped by the mine, and a stale file MemPalace's miner filed is re-filed in place, upstream's own migration. An off-wing file filed whole in a wing of its own (the hand-named file a practice move filed twice) is recorded the same way. On 3.11 the mode is unchanged.
-- **A moved observe drawer stays provably the observe's.** Every drawer the observe files now carries `id_source_file`, the path its id was derived from. The relocation writes it, as the old path, on a drawer filed before it existed, and never rewrites it, and the check that decides a drawer is the observe's reads it. A current drawer also takes the file's `source_mtime` today when the move changed it (a copy does, a rename does not), so the mine skips it.
-- **An observe file that is not one current filing is left alone and named**: relocated stale, a mine would cut it again through MemPalace's chunker instead of filing it twice.
-- **The forecast line says what both kinds of MemPalace do**: `next observe (dry run): <r> files -> recognised, <n> files -> mined as new drawers`, the first count read off MemPalace's own count of the files it skipped as already filed. Until now it read `<r> files -> registry sentinel`, the row only a pre-3.12 mine writes. This line is the NOC's rename gate's, which follows by its own handoff. A forecast that would file nothing now reads as `0 files -> mined as new drawers` rather than as unknown, and one that cannot be read whole stays unknown: the files MemPalace says it processed must be exactly the files it names, so a per-file line in a wording the check does not read is never a "0 new". The count of chunk-0 drawers without a `content_hash` is relabelled, because 3.12's own miner stamps none either.
-- **The reason a file is mined as new is read off its drawers on 3.12**, never off the content-hash map 3.12 no longer has: filed only at another location (with the step that records it here), normalize-stale, version-stale, filed short, or changed since it was filed.
-- **`--register-off-wing` registers nothing on 3.12, and says so**, with its usual summary line: the row it writes is one a mine writes only for content it recognises.
-
-### Added: the palace check counts files MemPalace reads as unfiled by their `normalize_version` (issue #989)
-
-MemPalace 3.12 also raised `NORMALIZE_VERSION` from 2 to 3, so every drawer filed before it is unfiled to a mine, the observe's included, moved or not. Measured: three observe drawers filed under 3.11.0, one mine in place under 3.12.0, seven drawers and none of the three kept. The report gives this class its own line, in the version-stale line's grammar and printed on every MemPalace: `conversation files normalize-stale: <n> (observe-filed <a>, miner-filed <b>), <why>`. It triggers the forecast, so no rename gate reads a palace a mine would rebuild as one it would not. Nothing in this release writes `normalize_version`: whether the observe's drawers may be stamped current is a decision of its own, [issue #1001](https://github.com/basecradle/basecradle-harness/issues/1001).
-
-### Fixed: `--pool-diagnosis` rebuilds MemPalace 3.12's search, so its verdicts hold there (issue #989)
-
-The mode rebuilds MemPalace's search to say where a drawer below the returned ones ranked, and checks every rebuild against the real search. On 3.12 the rebuild stopped matching wherever the search repeats itself wider, so those probes read `unknown`. 3.12 renamed the test that decides the repeat, and the test now also fires when the vector half skipped bookkeeping rows. The vector half itself now skips the rows MemPalace calls bookkeeping (its registry rows), and hands the merge every distance it measured. The rebuild now does each of these, read off the library, and matches the search again on 3.9, 3.11 and 3.12. Because 3.12 never returns the registry rows it skips, no `sentinels` verdict can name them there, so the line counts them on the vector half instead. The replay of the merge follows 3.12's too: it skips bookkeeping hits, reuses the distances the vector half measured, and keeps a hit whose embedding cannot be loaded, so `dropped` cannot occur on 3.12.
-
-### Changed: the `mempalace` extra installs MemPalace 3.12 again, and CI proves 3.11.0 beside it (issue #989)
-
-The hold of 0.209.0 is lifted now that the harness supports 3.12: the extra is `mempalace>=3.9.0` again, as it was before the hold, Dependabot no longer ignores 3.12 and later, and the lock moves to 3.12.0. The real-palace suite runs on three installs: the locked version, the declared floor and 3.11.0, the version every fleet palace runs, until the fleet moves off it. The fleet's own MemPalace pin is a separate decision and does not move with this release: on 3.12 every drawer filed before the upgrade is normalize-stale ([issue #1001](https://github.com/basecradle/basecradle-harness/issues/1001)).
-
 ## [0.211.0] - 2026-11-23
 
 ### Added: one definition of a secret, applied to every text the harness writes: logs, memory and tool captures (issue #999)
