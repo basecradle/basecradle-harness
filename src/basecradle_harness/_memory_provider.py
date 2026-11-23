@@ -30,8 +30,9 @@ partition on. `query` carries the turn's incoming text so a relevance-ranked pro
 (MemPalace) has something to retrieve *against* at Turn-0 time.
 
 Provider selection is config-driven (`memory_provider_from_env`): ``sqlite`` (the
-default), ``mempalace`` (the optional reference adapter), or a dotted
-``module:Class`` path to any custom `MemoryProvider`. One provider per agent.
+default), ``mempalace`` (the optional reference adapter, also selected by its second name
+``mempalace-previous``), or a dotted ``module:Class`` path to any custom `MemoryProvider`. One
+provider per agent.
 """
 
 from __future__ import annotations

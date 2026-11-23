@@ -855,8 +855,9 @@ def publish_palace_binding(palace_path: str | Path) -> Path | None:
 
     **Nothing here creates a palace.** It writes one small JSON file; it never runs ``init`` or
     ``mine``, and it never materializes ``~/.mempalace/palace``. It is reached only when an agent
-    binds the MemPalace provider (``HARNESS_MEMORY_PROVIDER=mempalace``), so a SQLite-provider
-    agent and a non-harness MemPalace user keep upstream's defaults exactly.
+    binds the MemPalace provider (``HARNESS_MEMORY_PROVIDER=mempalace`` or its second name,
+    ``mempalace-previous``), so a SQLite-provider agent and a non-harness MemPalace user keep
+    upstream's defaults exactly.
 
     **Bounded to this OS user, which is the isolation boundary.** ``~`` is the agent's own home, so
     per-agent palaces stay per-agent (one OS user per agent — the fleet's universal-identity rule).

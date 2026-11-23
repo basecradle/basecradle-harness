@@ -15,7 +15,7 @@ The memory redesign (basecradle#966) will give the name `mempalace` to a new ada
 
 - **`HARNESS_MEMORY_PROVIDER=mempalace-previous` selects exactly what `mempalace` selects**: the same adapter class, the same palace, the same `mempalace` extra, the same `memory_search` tool. Case-insensitive, like every built-in name. `basecradle-harness-resolve --memory-provider` takes it too.
 - **Nothing anyone reads changes.** The harness reports the provider it bound, read off the class, so an agent on either name reports `mempalace`: `--resolved-config`'s `memory_provider`, `basecradle-harness-resolve`'s `memory.provider`, and the `provider=mempalace` field on every `memory` log line. The palace commands (`basecradle-harness-palace-check`, `-scrub-palace`, `-prune-palace`) never read the setting, so they behave the same under either name.
-- **The one wording change** is in the refusal of a value that is neither a built-in name nor an import path, which now lists `mempalace-previous` among the built-ins.
+- **Two texts name the new value:** the refusal of a value that is neither a built-in name nor an import path, and the `--help` of `basecradle-harness-resolve --memory-provider`. Both now list `mempalace-previous` among the built-ins.
 - Every test that selects MemPalace by value runs under both names.
 
 ## [0.211.0] - 2026-11-23
