@@ -53,8 +53,12 @@ jobs:
   # The real-palace suite (`-m mempalace`, which the default run deselects): real MemPalace
   # palaces and the embedding model they download. A MemPalace bump merged on green that this
   # suite would have failed is the failure it catches (issue #742: 3.11.0 broke
-  # `--pool-diagnosis`, and nothing ran it). Two installs, because the harness supports a range:
-  # the locked MemPalace, which a Dependabot bump moves, and the floor `pyproject.toml` declares.
+  # `--pool-diagnosis`, and nothing ran it). Three installs, because the harness supports a range:
+  # the locked MemPalace, which a Dependabot bump moves, the floor `pyproject.toml` declares, and
+  # 3.11.0, the version every fleet palace runs (pinned in the fleet's own declared configuration,
+  # basecradle-noc). Each minor has moved something the harness reads (3.12: issue #989), so the
+  # fleet's own minor is proven until the fleet moves off it; this entry is removed then, by
+  # whoever lifts that pin's last agent (issue #1001 is the decision it waits on).
   #
   # It runs only when the change touches what the suite tests (the lock, `pyproject.toml`, a
   # palace module, the suite itself or this workflow); otherwise every step after the check is
@@ -70,7 +74,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mempalace: [locked, floor]
+        mempalace: [locked, "3.11.0", floor]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -136,6 +140,11 @@ jobs:
           EOF
           )
           uv pip install "mempalace==$floor"
+      - name: Install the fleet's MemPalace
+        if: steps.paths.outputs.run == 'true' && matrix.mempalace == '3.11.0'
+        env:
+          VERSION: ${{ matrix.mempalace }}
+        run: uv pip install "mempalace==$VERSION"
       - name: Which MemPalace
         id: versions
         if: steps.paths.outputs.run == 'true'

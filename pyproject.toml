@@ -106,12 +106,7 @@ anthropic = ["anthropic>=2.3.0,<3"]
 #
 # 3.9.0 is the floor because `search` passes `max_distance` (issue #625), and before 3.9.0
 # (MemPalace#1964) a threshold switches the union pool's lexical half off instead of scoring it.
-#
-# 3.12 is excluded because it removed the cross-file content-hash dedup (MemPalace#2800) that a
-# moved home's recognition rests on: on 3.12 a mine after a home move files every exchange a
-# second time, and the palace check can no longer forecast or relocate it (issue #988). The cap
-# is lifted with the support, in issue #989.
-mempalace = ["mempalace>=3.9.0,<3.12"]
+mempalace = ["mempalace>=3.9.0"]
 
 [project.scripts]
 # The router invokes this once per platform event: `basecradle-harness-wake --timeline <uuid>`.

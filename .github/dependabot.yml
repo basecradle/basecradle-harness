@@ -25,12 +25,6 @@ updates:
   cooldown:
     default-days: 7
   open-pull-requests-limit: 10
-  ignore:
-  # MemPalace 3.12 removed the content-hash dedup a moved home's recognition rests on
-  # (MemPalace#2800, issue #988), and `pyproject.toml` caps the extra below it. Lifted with the
-  # cap when the harness supports it (issue #989).
-  - dependency-name: mempalace
-    versions: [">=3.12.0"]
   # The publish path: the `build` dependency group in pyproject.toml and everything it pulls
   # into uv.lock, the packages that make the published bytes (issue #916). Exact names, one per
   # package: tests/test_dependabot.py walks the lock from the `build` group and fails while this
