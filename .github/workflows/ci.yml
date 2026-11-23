@@ -191,6 +191,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/build-distributions
+      # The package's public data files are a promise to readers who never import it (issue #997),
+      # and only the built wheel shows whether it keeps it.
+      - name: The wheel carries the published data files
+        run: python3 scripts/check_wheel_data.py dist
 
   # Each pinned action's `# vX.Y.Z` comment names the release its SHA is (issue #916). The pin
   # guard in the test job checks the shape offline; whether the comment is true can only be read

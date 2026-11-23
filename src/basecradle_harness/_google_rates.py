@@ -15,10 +15,12 @@ honest, and every figure they produce is a `ComputedCost`, which the line tags
   not carry, a call served on a non-standard traffic tier: each returns ``None``, and the line has
   no ``cost=`` — exactly what a vendor that reports nothing gets. A wrong number on the line is
   worse than a missing one, because the dashboard sums it.
-- **Every number is transcribed, never derived.** Each `Tier` below is one row of Google's pricing
-  page as it stood on the date in `SOURCE`, including the rows that look like typos (the one place a
-  row was implausible, the cell is left unstated rather than corrected). When the page changes, the
-  table is edited from the page, in a reviewed PR, with the new date.
+- **Every number is transcribed, never derived.** Each `Tier` is one row of Google's pricing page
+  as it stood on the date in `SOURCE`, including the rows that look like typos (the one place a row
+  was implausible, the cell is left unstated rather than corrected, and the row's ``note`` says so).
+  The numbers live in the package's public prices file (``data/prices.json``, read through
+  `basecradle_harness._prices`, issue #997), never here: when the page changes, the file's
+  ``google`` section is edited from the page, in a reviewed PR, with the new date.
 - **Which row applies is decided by the call's own facts.** The model id the call ran, the location
   it ran at (``global`` vs everything else, which Google prices separately for its Gemini 3 families),
   the prompt size (the >200K tier reprices *every* token of the call, input and output alike), the
@@ -58,36 +60,36 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from typing import Any
 
+from basecradle_harness import _prices
 from basecradle_harness._observability import ComputedCost
 
-#: Where every number in `RATES` was read, and when. Edit the table from this page, and move the
-#: date with it.
-SOURCE = (
-    "https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing "
-    "(Standard tier, read 2026-10-06)"
-)
+_DATA = _prices.vendor("google")
+
+#: Where every number in `RATES` and `GROUNDING` was read, and when. Edit the file's table from this page, and move
+#: the date with it.
+SOURCE = _prices.source(_DATA)
 
 #: Above this many prompt tokens a call is priced on the long-context row — **all** of its tokens,
 #: input and output alike ("If a query input context is longer than 200K tokens, all tokens (input
 #: and output) are charged at long context rates").
-LONG_CONTEXT_THRESHOLD = 200_000
+LONG_CONTEXT_THRESHOLD: int = _DATA["long_prompt"]["threshold"]
 
 #: The location Google prices as "Global". Every other location is "Non-global", which for the GA
 #: Gemini 3 families costs 10% more; the ``us`` and ``eu`` multi-regions are non-global.
-GLOBAL_LOCATION = "global"
+GLOBAL_LOCATION: str = _DATA["global_location"]
 
 #: The traffic tier the Standard rows price. A response that names no tier — or names it
-#: ``TRAFFIC_TYPE_UNSPECIFIED`` — is read as standard only when the request asked for the standard
-#: tier too (see `call_cost`).
-_STANDARD_TRAFFIC = frozenset({"ON_DEMAND"})
-_UNNAMED_TRAFFIC = frozenset({"", "TRAFFIC_TYPE_UNSPECIFIED"})
+#: ``TRAFFIC_TYPE_UNSPECIFIED``; the empty name is an unset field — is read as standard only when
+#: the request asked for the standard tier too (see `call_cost`).
+_STANDARD_TRAFFIC = frozenset(_DATA["standard_traffic_types"])
+_UNNAMED_TRAFFIC = frozenset(_DATA["unnamed_traffic_types"])
 
 #: What a request's ``service_tier`` is called when it asks for the standard tier: unset, or one of
 #: the SDK's two names for it (``ServiceTier.STANDARD``, and ``UNSPECIFIED``, "which is standard").
-_STANDARD_TIERS = frozenset({"", "STANDARD", "UNSPECIFIED", "SERVICE_TIER_UNSPECIFIED"})
+_STANDARD_TIERS = frozenset(_DATA["standard_service_tiers"])
 
 #: Google bills by the Pacific-time day, so a rate's last day ends at midnight in Los Angeles.
-_BILLING_TZ = "America/Los_Angeles"
+_BILLING_TZ: str = _DATA["billing_timezone"]
 
 
 @dataclass(frozen=True)
@@ -124,178 +126,36 @@ class Rates:
     non_global: tuple[Tier, Tier] | None
 
 
-def _flat(tier: Tier) -> tuple[Tier, Tier]:
-    """A model whose long-context row repeats its short one (the page states both, identically)."""
-    return (tier, tier)
+def _pair(rows: Mapping[str, Any] | None) -> tuple[Tier, Tier] | None:
+    """One endpoint class's ``(≤200K, >200K)`` rows from the file, or ``None`` where it is unpriced."""
+    if rows is None:
+        return None
+    return (_prices.row(Tier, rows["short"]), _prices.row(Tier, rows["long"]))
+
+
+def _day(value: str | None) -> date | None:
+    return None if value is None else date.fromisoformat(value)
 
 
 # --- the table --------------------------------------------------------------------------------
 #
-# Transcribed row by row from `SOURCE`. The Gemini 3.6 / 3.7 / 3.8 Flash introductory rows are
-# marked on the page "Promotional pricing provided through 50% credits back on net spend": the
-# introductory figure is what the operator pays net of that credit, which is the figure a cost
-# line exists to show.
-
-_FLASH_3X_INTRO = Rates(
-    start=None,
-    end=date(2026, 12, 31),
-    global_=_flat(Tier(input=0.75, cached=0.075, output=3.75)),
-    non_global=_flat(Tier(input=0.825, cached=0.0825, output=4.125)),
-)
-_FLASH_3X_STANDARD = Rates(
-    start=date(2027, 1, 1),
-    end=None,
-    global_=_flat(Tier(input=1.50, cached=0.15, output=7.50)),
-    non_global=_flat(Tier(input=1.65, cached=0.165, output=8.25)),
-)
+# Transcribed row by row from `SOURCE` into the prices file's ``google`` section. Where the page
+# states a long-context row identical to the short one, the file states both: a reader never has to
+# know that one row stands for two.
 
 #: Model id → its rows, oldest first. Keyed by the id the call is made with, exactly as Google
 #: publishes it on each model's page.
 RATES: Mapping[str, tuple[Rates, ...]] = {
-    "gemini-3.8-flash": (_FLASH_3X_INTRO, _FLASH_3X_STANDARD),
-    "gemini-3.7-flash": (_FLASH_3X_INTRO, _FLASH_3X_STANDARD),
-    "gemini-3.6-flash": (_FLASH_3X_INTRO, _FLASH_3X_STANDARD),
-    "gemini-3.5-flash": (
+    model: tuple(
         Rates(
-            start=None,
-            end=None,
-            global_=_flat(Tier(input=1.50, cached=0.15, output=9.00)),
-            non_global=_flat(Tier(input=1.65, cached=0.165, output=9.90)),
-        ),
-    ),
-    "gemini-3.5-flash-lite": (
-        Rates(
-            start=None,
-            end=None,
-            global_=_flat(Tier(input=0.30, cached=0.03, output=2.50)),
-            non_global=_flat(Tier(input=0.33, cached=0.033, output=2.75)),
-        ),
-    ),
-    "gemini-3.1-flash-lite": (
-        Rates(
-            start=None,
-            end=None,
-            global_=_flat(
-                Tier(
-                    input=0.25,
-                    cached=0.025,
-                    output=1.50,
-                    audio_input=0.50,
-                    audio_cached=0.05,
-                    audio_apart=True,
-                )
-            ),
-            non_global=_flat(
-                Tier(
-                    input=0.275,
-                    cached=0.0275,
-                    output=1.65,
-                    audio_input=0.55,
-                    audio_cached=0.055,
-                    audio_apart=True,
-                )
-            ),
-        ),
-    ),
-    "gemini-3.1-pro-preview": (
-        Rates(
-            start=None,
-            end=None,
-            global_=(
-                Tier(input=2.00, cached=0.20, output=12.00),
-                Tier(input=4.00, cached=0.40, output=18.00),
-            ),
-            # The page prices this preview at Global only.
-            non_global=None,
-        ),
-    ),
-    # The 2.5 family predates Google's non-global surcharge (which applies to GA Gemini 3 and
-    # later), so one set of rows serves every location.
-    "gemini-2.5-pro": (
-        Rates(
-            start=None,
-            end=None,
-            global_=(
-                Tier(input=1.25, cached=0.125, output=10.00),
-                Tier(input=2.50, cached=0.25, output=15.00),
-            ),
-            non_global=(
-                Tier(input=1.25, cached=0.125, output=10.00),
-                Tier(input=2.50, cached=0.25, output=15.00),
-            ),
-        ),
-    ),
-    "gemini-2.5-flash": (
-        Rates(
-            start=None,
-            end=None,
-            # The page lists this model's long-context **audio** input as cheaper than its short one
-            # ($0.30 against $1.00), which no other row on the page does. It is left unstated rather
-            # than corrected: a long-context call carrying audio is not priced.
-            global_=(
-                Tier(
-                    input=0.30,
-                    cached=0.03,
-                    output=2.50,
-                    audio_input=1.00,
-                    audio_cached=0.10,
-                    audio_apart=True,
-                ),
-                Tier(
-                    input=0.30,
-                    cached=0.03,
-                    output=2.50,
-                    audio_input=None,
-                    audio_cached=0.10,
-                    audio_apart=True,
-                ),
-            ),
-            non_global=(
-                Tier(
-                    input=0.30,
-                    cached=0.03,
-                    output=2.50,
-                    audio_input=1.00,
-                    audio_cached=0.10,
-                    audio_apart=True,
-                ),
-                Tier(
-                    input=0.30,
-                    cached=0.03,
-                    output=2.50,
-                    audio_input=None,
-                    audio_cached=0.10,
-                    audio_apart=True,
-                ),
-            ),
-        ),
-    ),
-    "gemini-2.5-flash-lite": (
-        Rates(
-            start=None,
-            end=None,
-            global_=_flat(
-                Tier(
-                    input=0.10,
-                    cached=0.01,
-                    output=0.40,
-                    audio_input=0.30,
-                    audio_cached=0.03,
-                    audio_apart=True,
-                )
-            ),
-            non_global=_flat(
-                Tier(
-                    input=0.10,
-                    cached=0.01,
-                    output=0.40,
-                    audio_input=0.30,
-                    audio_cached=0.03,
-                    audio_apart=True,
-                )
-            ),
-        ),
-    ),
+            start=_day(period["start"]),
+            end=_day(period["end"]),
+            global_=_pair(period["global"]),
+            non_global=_pair(period["non_global"]),
+        )
+        for period in entry["periods"]
+    )
+    for model, entry in _DATA["models"].items()
 }
 
 
@@ -312,26 +172,30 @@ class Grounding:
     free_tokens: bool = False
 
 
-#: "$14 per 1,000 Grounding Queries … Input tokens provided by Grounding with Google Search … are
-#: not charged" — the Gemini 3 section of `SOURCE`.
-_GROUNDING_3X = Grounding(per_query=14.00 / 1_000, free_tokens=True)
-#: "$35 per 1,000 Grounding Prompts … Even if multiple Grounding Queries are sent, there is only one
-#: charge for a Grounding Prompt" — the Gemini 2.5 section of `SOURCE`.
-_GROUNDING_25 = Grounding(per_prompt=35.00 / 1_000)
+def _grounding_of(scheme: Mapping[str, Any]) -> Grounding:
+    """A model's grounding scheme from the file, whose fees are stated per 1,000 as the page does.
+
+    Gemini 3: "$14 per 1,000 Grounding Queries … Input tokens provided by Grounding with Google
+    Search … are not charged". Gemini 2.5: "$35 per 1,000 Grounding Prompts … Even if multiple
+    Grounding Queries are sent, there is only one charge for a Grounding Prompt".
+    """
+    fields = {"usd_per_1000_queries", "usd_per_1000_prompts", "grounding_tokens_free"}
+    if set(scheme) != fields:
+        raise _prices.PricesFileError(
+            f"a grounding scheme in the prices file has fields {sorted(scheme)}, not {sorted(fields)}"
+        )
+    queries, prompts = scheme["usd_per_1000_queries"], scheme["usd_per_1000_prompts"]
+    return Grounding(
+        per_query=None if queries is None else queries / 1_000,
+        per_prompt=None if prompts is None else prompts / 1_000,
+        free_tokens=bool(scheme["grounding_tokens_free"]),
+    )
+
 
 #: Model id → its grounding scheme. Every model in `RATES`, so a model the token table prices is a
 #: model whose grounding can be priced too.
 GROUNDING: Mapping[str, Grounding] = {
-    "gemini-3.8-flash": _GROUNDING_3X,
-    "gemini-3.7-flash": _GROUNDING_3X,
-    "gemini-3.6-flash": _GROUNDING_3X,
-    "gemini-3.5-flash": _GROUNDING_3X,
-    "gemini-3.5-flash-lite": _GROUNDING_3X,
-    "gemini-3.1-flash-lite": _GROUNDING_3X,
-    "gemini-3.1-pro-preview": _GROUNDING_3X,
-    "gemini-2.5-pro": _GROUNDING_25,
-    "gemini-2.5-flash": _GROUNDING_25,
-    "gemini-2.5-flash-lite": _GROUNDING_25,
+    model: _grounding_of(entry["grounding"]) for model, entry in _DATA["models"].items()
 }
 
 
@@ -517,13 +381,10 @@ def _price(tier: Tier, usage: Usage) -> float | None:
     return total / 1_000_000
 
 
-def _model_key(model: str) -> str:
-    """`model` as the table keys it: the bare id, whatever resource path the caller wrote around it.
-
-    Vertex accepts ``publishers/google/models/<id>`` and the full ``projects/…/models/<id>`` path as
-    well as the bare id, and all three run (and bill) the same model.
-    """
-    return model.strip().rsplit("/", 1)[-1].lower()
+#: The file's model-key rule: the bare id, whatever resource path the caller wrote around it. Vertex
+#: accepts ``publishers/google/models/<id>`` and the full ``projects/…/models/<id>`` path as well as
+#: the bare id, and all three run (and bill) the same model.
+_model_key = _prices.model_key(_DATA)
 
 
 def _count(value: Any) -> int | None:
