@@ -456,30 +456,6 @@ def test_sentinels(root):
     assert (facts.raw_rank, facts.real_rank, facts.sentinels_above) == (201, 1, 200)
 
 
-#: Whether this MemPalace's search skips bookkeeping rows itself (3.12, issue #989).
-SKIPS_BOOKKEEPING = hasattr(pytest.importorskip("mempalace.searcher"), "is_bookkeeping")
-
-
-def test_registry_rows_as_mempalace_writes_them(root):
-    """200 registry rows nearer than ``P``, carrying ``ingest_mode="registry"`` as MemPalace's own
-    ``_register_file`` writes them.
-
-    From 3.12 the search skips them in its vector half, counts them, and repeats wider because they
-    left it short, so ``P`` reaches the pool; the rebuild must skip and count them the same way, or
-    its ranking is not the search's. Before 3.12 they are sentinels the harness drops, as above.
-    """
-    rows = _one_file("sentinel", H, 200, room=_REGISTRY_ROOM, ingest_mode="registry")
-    palace = _build(root, "registry", rows + [("probe", P, {})] + _fillers(20))
-    facts, word = _diagnose(palace, "probe")
-    assert facts.matches
-    if SKIPS_BOOKKEEPING:
-        assert facts.arms["1"]
-        assert facts.bookkeeping > 0  # skipped and counted, never ranked
-        assert facts.pool_scale > 1  # the skip left the page short, so the search went wider
-    else:
-        assert word == "sentinels"
-
-
 def test_missing_lexical_row(root):
     """``P``'s full-text row is gone: no lexical match for its own text, even with no window."""
     palace = _build(root, "missing", _copies(25) + [("probe", P, {})] + _fillers(40))

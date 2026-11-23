@@ -8,16 +8,12 @@ three fetches (arms 1, 2 and 3; arm 1R is arm 1 again). It is **token-free and r
 reranker runs, no model is called, nothing is written. It prints counts, drawer ids, ranks and
 digests: never memory text, never a query, never a path.
 
-**How MemPalace fills the pool**, which every fact below is read against (MemPalace 3.9 to 3.12,
+**How MemPalace fills the pool**, which every fact below is read against (MemPalace 3.9 to 3.11,
 ``search_memories`` with ``candidate_strategy="union"``, as `MemPalaceMemoryProvider._ranking`
 calls it with ``n_results=F``, the fetch width):
 
 1. **The vector half** proposes the ``3F`` nearest drawers (``_candidate_pool_limits``) and keeps
-   the ``F`` nearest of them. From 3.12 it first skips the bookkeeping rows MemPalace's own
-   ``is_bookkeeping`` names (a registry row as ``_register_file`` writes it, ``ingest_mode
-   "registry"``), counting them, so MemPalace's own registry rows never reach the harness there;
-   and it hands the merge every distance it measured, kept or not (``known_distances``), which the
-   merge uses for a lexical hit the vector half already measured instead of computing it again.
+   the ``F`` nearest of them.
 2. **The lexical half** asks the backend's ``lexical_search`` for ``3F`` drawers by BM25. On the
    Chroma backend that is an FTS ``MATCH`` of the query's tokens, **capped at a scan window** of
    ``max(500, 3F)`` rows, and BM25 then scores only the rows inside the window. Before MemPalace
@@ -31,17 +27,14 @@ calls it with ``n_results=F``, the fetch width):
    measured with the backend's own function.
 3. **The merge** adds each lexical hit the vector half did not keep, in lexical order, dropping
    one that shares a ``(source_file, chunk_index)`` with a drawer already admitted (**shadowed**: a
-   second copy filed under the same path, issue #606) and, under ``max_distance``, one whose
-   stored embedding cannot be loaded (**dropped**, the #625 risk). From 3.12 such a hit is kept,
-   with no distance, and holds its key, so ``dropped`` cannot occur there; the merge also skips
-   bookkeeping hits.
+   second copy filed under the same path, issue #606) and, under ``max_distance``, one whose stored embedding cannot be loaded
+   (**dropped**, the #625 risk).
 4. **The hybrid rank** scores every candidate ``0.6 × similarity + 0.4 × BM25`` (BM25 over the
    candidates, scaled to the best).
 5. **The fold** (MemPalace 3.11, ``_fold_copies_across_sources``; issue #742): hits whose text is
    identical, at least ``_FOLD_MIN_CHARS`` long and from **different source files** become one hit,
    the best-ranked, which lists the others under ``also_in``; copies within one file stay separate.
-   When folding leaves fewer than ``F`` hits, at least one of them carrying ``also_in`` (or, from
-   3.12, after the vector half skipped a bookkeeping row: ``_pool_left_results_short``), while the
+   When folding leaves fewer than ``F`` hits, at least one of them carrying ``also_in``, while the
    vector half's query came back full, MemPalace
    repeats the whole search with the vector half four times wider (``_scaled_pool_limits``), up to
    ``_MAX_POOL_SCALE`` times and never past ``_MAX_FOLD_POOL`` candidates. A MemPalace without the
@@ -116,7 +109,7 @@ import inspect
 import sys
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from basecradle_harness import _mempalace, _palace_recall
@@ -198,9 +191,6 @@ class Facts:
     vector_proposed: int = 0
     vector_kept: int = 0
     vector_rank: int | None = None
-    #: Bookkeeping rows the vector half skipped before proposing (MemPalace 3.12: its own registry
-    #: rows, which it never returns, so no ``sentinels`` verdict can name them; the count can).
-    bookkeeping: int = 0
     #: The drawer's own embedding finds it (`_palace_check._self_query`'s answer).
     vector_self: str = "unknown"
     #: Closets in the palace, whose boost this mode does not model; ``None`` when unreadable.
@@ -341,10 +331,6 @@ class Reconstruction:
     ranked: list[dict]
     #: The pool scale the search ended at: 1, or what the fold's retries widened it to.
     scale: int
-    #: Every distance the vector half measured, kept or not, by stored id: what 3.12's merge reads
-    #: (``known_distances``); and the bookkeeping rows it skipped (3.12, 0 before).
-    measured: dict = field(default_factory=dict)
-    skipped: int = 0
 
 
 def reconstruct(collection, query: str, n: int, threshold: float | None) -> Reconstruction:
@@ -352,25 +338,14 @@ def reconstruct(collection, query: str, n: int, threshold: float | None) -> Reco
 
     A MemPalace with the fold repeats a search whose folded copies left it short (module docstring,
     step 5), so the rebuild does too, with MemPalace's own test and bounds; one without the fold
-    never repeats. 3.12's test (``_pool_left_results_short``) also repeats when the vector half
-    skipped bookkeeping rows, so it is handed the count this pass skipped; 3.11's
-    (``_copies_left_results_short``) takes no such count.
+    never repeats.
     """
     searcher = _import("searcher")
-    short = getattr(searcher, "_pool_left_results_short", None)
-    legacy = getattr(searcher, "_copies_left_results_short", None)
+    short = getattr(searcher, "_copies_left_results_short", None)
     scale = 1
     while True:
-        built, asked, fetched, skipped = _reconstruct_at(
-            searcher, collection, query, n, threshold, scale
-        )
-        if short is not None:
-            again = short(built.ranked[:n], n, fetched, asked, skipped)
-        elif legacy is not None:
-            again = legacy(built.ranked[:n], n, fetched, asked)
-        else:
-            return built
-        if not again:
+        built, asked, fetched = _reconstruct_at(searcher, collection, query, n, threshold, scale)
+        if short is None or not short(built.ranked[:n], n, fetched, asked):
             return built
         if scale >= searcher._MAX_POOL_SCALE or asked >= searcher._MAX_FOLD_POOL:
             return built
@@ -378,15 +353,11 @@ def reconstruct(collection, query: str, n: int, threshold: float | None) -> Reco
 
 
 def _reconstruct_at(searcher, collection, query, n, threshold, scale):
-    """One pass of the search at ``scale``: ``(Reconstruction, asked, fetched, bookkeeping skipped)``.
+    """One pass of the search at pool ``scale``: ``(Reconstruction, rows asked, rows fetched)``.
 
     Every step but the first is MemPalace's own function; the first replicates
     ``search_memories``'s loop over the vector rows, without the closet boost (see the module
-    docstring). Where MemPalace's loop does more (3.12, issue #989), so does this one, each read
-    off the library rather than off a version number: it skips the bookkeeping rows its own
-    ``is_bookkeeping`` names, counting them for the retry test; it hands ``_candidate_out_of_scope``
-    the collection's metric where that takes one; and it hands the merge every distance the
-    vector half measured (``known_distances``), kept or not, where the merge takes them.
+    docstring).
     """
     metric = searcher._metric_for_collection(collection)
     stop_words = searcher._resolve_stop_words(None)
@@ -401,13 +372,8 @@ def _reconstruct_at(searcher, collection, query, n, threshold, scale):
     docs = searcher._first_or_empty(rows, "documents")
     stored = searcher._aligned_query_ids(rows, len(docs))
     dates = getattr(searcher, "_result_date_fields", None)
-    bookkeeping = getattr(searcher, "is_bookkeeping", None)
-    out_of_scope = searcher._candidate_out_of_scope
-    scope_metric = (metric,) if "metric" in _parameters(out_of_scope) else ()
     distance = threshold or 0.0
     proposed: list[dict] = []
-    measured: dict = {}
-    skipped = 0
     for stored_id, doc, meta, dist in zip(
         stored,
         docs,
@@ -415,12 +381,7 @@ def _reconstruct_at(searcher, collection, query, n, threshold, scale):
         searcher._first_or_empty(rows, "distances"),
     ):
         meta = meta or {}
-        if stored_id:
-            measured[stored_id] = dist
-        if bookkeeping is not None and bookkeeping(meta, stored_id):
-            skipped += 1
-            continue
-        if out_of_scope(dist, meta, distance, None, None, *scope_metric):
+        if searcher._candidate_out_of_scope(dist, meta, distance, None, None):
             continue
         source = meta.get("source_file", "") or ""
         proposed.append(
@@ -445,9 +406,9 @@ def _reconstruct_at(searcher, collection, query, n, threshold, scale):
         )
     proposed.sort(key=lambda hit: hit["_sort_key"])
     hits = [dict(hit) for hit in proposed[:kept_n]]
-    merge = searcher._apply_candidate_strategy
-    known = {"known_distances": measured} if "known_distances" in _parameters(merge) else {}
-    merge("union", hits, collection, query, None, None, n, max_distance=distance, **known)
+    searcher._apply_candidate_strategy(
+        "union", hits, collection, query, None, None, n, max_distance=distance
+    )
     weights = getattr(searcher, "_resolve_hybrid_rank_weights", None)
     searcher._hybrid_rank(
         hits, query, *(weights() if weights else ()), metric=metric, stop_words=stop_words
@@ -456,13 +417,7 @@ def _reconstruct_at(searcher, collection, query, n, threshold, scale):
     fold = getattr(searcher, "_fold_copies_across_sources", None)
     if fold is not None:
         ranked = fold(ranked, searcher._search_hit_source, searcher._search_hit_ref)
-    built = Reconstruction(proposed, kept_n, ranked, scale, measured, skipped)
-    return built, proposed_n, len(docs), skipped
-
-
-def _parameters(function) -> set[str]:
-    """The names a MemPalace function takes, so a step it gained is passed only where it exists."""
-    return set(inspect.signature(function).parameters)
+    return Reconstruction(proposed, kept_n, ranked, scale), proposed_n, len(docs)
 
 
 def _searched(palace: Path, query: str, n: int, threshold: float | None) -> list:
@@ -521,7 +476,6 @@ def _measure(provider, texts, total, facts, pool, self_query) -> None:
     built = reconstruct(collection, query, width, threshold)
     proposed, ranked, kept_n = built.proposed, built.ranked, built.kept
     facts.vector_proposed, facts.vector_kept, facts.pool_scale = len(proposed), kept_n, built.scale
-    facts.bookkeeping = built.skipped
     facts.vector_rank = _rank([hit["drawer_id"] for hit in proposed], drawer)
     facts.vector_self = self_query(provider.read_collection, drawer)
     facts.closets = _closets(provider.palace_path)
@@ -566,35 +520,19 @@ def _measure(provider, texts, total, facts, pool, self_query) -> None:
         # Proposed, and the merge refused it. Replayed over the whole lexical list in MemPalace's
         # order, because a key is refused for any drawer already admitted under it: a kept vector
         # hit, or a lexical hit ranked above it (`_merge_bm25_union_candidates`).
-        #
-        # MemPalace 3.12's merge (`_merge_bm25_union_candidates`, which takes ``known_distances``)
-        # differs in three ways, each mirrored: it skips bookkeeping hits; it reuses the distance
-        # the vector half measured for a hit it already saw; and a hit whose distance cannot be
-        # computed is kept, with ``distance=None``, rather than refused, so it holds its key.
-        searcher = _import("searcher")
-        newer = "known_distances" in _parameters(searcher._apply_candidate_strategy)
-        bookkeeping = getattr(searcher, "is_bookkeeping", None)
-        known = built.measured if newer else {}
         scored = None
         if threshold is not None:
+            searcher = _import("searcher")
             scored = searcher._lexical_hit_vector_distances(
-                collection,
-                query,
-                [hit for hit in lexical if hit.id not in known],
-                searcher._metric_for_collection(collection),
+                collection, query, lexical, searcher._metric_for_collection(collection)
             )
         holders = {_dedup_key(kept): kept["drawer_id"] for kept in proposed[:kept_n]}
         for hit in lexical:
-            if bookkeeping is not None and bookkeeping(hit.metadata or {}, hit.id):
+            if scored is not None and (hit.id not in scored or scored[hit.id] > threshold):
+                if hit.id == drawer:
+                    facts.dropped = hit.id not in scored
+                    break
                 continue
-            if scored is not None:
-                distance = known[hit.id] if hit.id in known else scored.get(hit.id)
-                unmeasured = distance is None
-                if (unmeasured and not newer) or (not unmeasured and distance > threshold):
-                    if hit.id == drawer:
-                        facts.dropped = unmeasured
-                        break
-                    continue
             key = _lexical_key(hit)
             if not key or key == "?":
                 if hit.id == drawer:
@@ -683,8 +621,6 @@ def render(facts: Facts) -> str:
         if facts.closets
         else ""
     )
-    if facts.bookkeeping:
-        vector += f", after skipping {facts.bookkeeping} bookkeeping rows"
     parts.append(f"vector half: {vector}; self-query {facts.vector_self}{closets}")
     lexical = (
         f"rank {facts.lexical_rank} of the {facts.lexical_asked} it asked for"
