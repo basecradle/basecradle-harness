@@ -28,6 +28,10 @@ MemPalace 3.12 also raised `NORMALIZE_VERSION` from 2 to 3, so every drawer file
 
 The mode rebuilds MemPalace's search to say where a drawer below the returned ones ranked, and checks every rebuild against the real search. On 3.12 the rebuild stopped matching wherever the search repeats itself wider, so those probes read `unknown`. 3.12 renamed the test that decides the repeat, and the test now also fires when the vector half skipped bookkeeping rows. The vector half itself now skips the rows MemPalace calls bookkeeping (its registry rows), and hands the merge every distance it measured. The rebuild now does each of these, read off the library, and matches the search again on 3.9, 3.11 and 3.12. Because 3.12 never returns the registry rows it skips, no `sentinels` verdict can name them there, so the line counts them on the vector half instead. The replay of the merge follows 3.12's too: it skips bookkeeping hits, reuses the distances the vector half measured, and keeps a hit whose embedding cannot be loaded, so `dropped` cannot occur on 3.12.
 
+### Changed: the `mempalace` extra installs MemPalace 3.12 again, and CI proves 3.11.0 beside it (issue #989)
+
+The hold of 0.209.0 is lifted now that the harness supports 3.12: the extra is `mempalace>=3.9.0` again, as it was before the hold, Dependabot no longer ignores 3.12 and later, and the lock moves to 3.12.0. The real-palace suite runs on three installs: the locked version, the declared floor and 3.11.0, the version every fleet palace runs, until the fleet moves off it. The fleet's own MemPalace pin is a separate decision and does not move with this release: on 3.12 every drawer filed before the upgrade is normalize-stale ([issue #1001](https://github.com/basecradle/basecradle-harness/issues/1001)).
+
 ## [0.211.0] - 2026-11-23
 
 ### Added: one definition of a secret, applied to every text the harness writes: logs, memory and tool captures (issue #999)

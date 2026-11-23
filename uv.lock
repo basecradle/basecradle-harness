@@ -342,7 +342,7 @@ requires-dist = [
     { name = "basecradle", specifier = ">=0.15.0" },
     { name = "google-genai", marker = "extra == 'google-genai'", specifier = ">=2.28.0,<4" },
     { name = "httpx", specifier = ">=0.28" },
-    { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.9.0,<3.12" },
+    { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.9.0" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=3.3.1,<4" },
     { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=1.1.70,<2" },
     { name = "pillow", specifier = ">=13,<14" },
@@ -1419,7 +1419,7 @@ wheels = [
 
 [[package]]
 name = "mempalace"
-version = "3.11.0"
+version = "3.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "chromadb" },
@@ -1429,9 +1429,9 @@ dependencies = [
     { name = "pyyaml" },
     { name = "tokenizers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b2/c5/c54c9950efe2b1e797ac05e352fafb660aa8fd4d8dfac08e889c084ec6ab/mempalace-3.11.0.tar.gz", hash = "sha256:5e5ff52671d5d751113d9067555d69d0ef77b672df1fbdc64dbc16f360639214", size = 26662966, upload-time = "2026-10-14T05:37:09.794Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d2/a5/debb4d7a3da8cc19b5cc1fcc0e24f117c5cc1146f88a92ee1bbef6937f89/mempalace-3.12.0.tar.gz", hash = "sha256:f54cd31d050fc8c76ba822bc30be93580ecbb838a7a50a335d9a1192bd27d335", size = 26892562, upload-time = "2026-11-12T10:25:54.871Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8d/fb/24cde4c9f29472483a7f33441d6e154bf56f45c6840fcffdb69f94853859/mempalace-3.11.0-py3-none-any.whl", hash = "sha256:43e4c690e339b66e86a3177fe4eea15da3d9541ecbd58e671431c1e13dc1bf0c", size = 1073747, upload-time = "2026-10-14T05:37:06.886Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/c7/17a4b25d5ba655f31f38208a0c6ff098be6f4c00233bf47fa1dc7dad03d2/mempalace-3.12.0-py3-none-any.whl", hash = "sha256:3832534f377f3a81a324f741f90bf3c1ec277d49404608257cde1b5b0d52626f", size = 1140726, upload-time = "2026-11-12T10:25:52.691Z" },
 ]
 
 [[package]]
