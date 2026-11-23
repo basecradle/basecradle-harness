@@ -79,9 +79,10 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._harness import Harness
 from basecradle_harness._messages import Message, ToolSpec
-from basecradle_harness._observability import FAILED, RETRYING, scrub, tally_llm_calls
+from basecradle_harness._observability import FAILED, RETRYING, tally_llm_calls
 from basecradle_harness._plugins import ResolvedTools
 from basecradle_harness._provider import Provider
+from basecradle_harness._redaction import scrub
 from basecradle_harness._tools import Tool
 from basecradle_harness._wake import seat_charter, wake_brief_parts, wake_harness
 
@@ -350,14 +351,11 @@ def _usage(calls: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def _text(error: BaseException) -> str:
     """An error's text for the verdict: never the configured key, scrubbed, and never empty.
 
-    The scrub knows credential *shapes*; a vendor echoing a key of a shape it does not know would
-    pass it. So the key this process was configured with is removed by value first.
+    A vendor echoing a key of a shape the scrub does not know would pass the shapes, so the key this
+    process was configured with goes by value: ``AI_API_KEY`` is one of the agent's configured
+    secrets, which `scrub` blanks wherever it stands (issue #999).
     """
-    text = str(error)
-    key = (os.environ.get("AI_API_KEY") or "").strip()
-    if len(key) >= 8:
-        text = text.replace(key, "[redacted]")
-    return scrub(text) or type(error).__name__
+    return scrub(str(error)) or type(error).__name__
 
 
 def main(argv: list[str] | None = None) -> int:

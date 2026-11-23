@@ -103,6 +103,28 @@ silently. A named image is shown to a vision model even from a server configured
 responses (playwright's ``--image-responses omit``): that setting governs what the *server* sends,
 and the model asked for this file by name. The harness only ever **reads** the file — it is the
 agent's, written at the model's request, and never ours to clean up.
+
+What a tool saves is redacted after the call that saved it (issue #999)
+-------------------------------------------------------------------------
+A browser tool writes what a page showed it to text files: a page snapshot, the console log, the
+network log. A page can show a credential, and a live one was found in such a file. So after every
+call of a stdio server, the text files the call wrote are put through the one redaction every text
+the harness writes goes through (`_redaction.redact_file`), and these are **exactly** the files it
+covers; anything not named here is never touched:
+
+- **every text file under the capture folder**, ``.playwright-mcp/`` in the server's working
+  directory (`CAPTURE_FOLDERS`; on a fleet box ``$HARNESS_HOME/.playwright-mcp/``), which is where
+  playwright-mcp writes when the model names no file;
+- **every text file the call's own arguments named**, inside the server's working directory, the
+  same evidence the named-screenshot rule above reads (`_named_files`);
+
+and of those, only a file **this call wrote** (its ``lstat`` before and after differ, `_stamp`),
+whose suffix is a text format's (`_redaction.TEXT_SUFFIXES`: an image is never opened), and which
+lies in no place meant to hold a secret (`secret_stores`: the config home, ``~/.config``, the vault,
+the wallets, ``~/.ssh``, ``~/.gnupg``), which is never read for redaction or changed. An HTTP server
+writes on its own host, so nothing of its is touched. A file that could not be redacted is named in
+a WARNING with the reason, so a capture left as it was is never silent. The file is rewritten in
+place (`_redaction.redact_file`), so nothing is left beside it.
 """
 
 from __future__ import annotations
@@ -132,7 +154,13 @@ from basecradle_harness._assets import (
 from basecradle_harness._install import config_home
 from basecradle_harness._media import sniff_media_ext
 from basecradle_harness._messages import ImageContent, ToolResult
-from basecradle_harness._observability import MCP_EXECUTOR, tool_failed
+from basecradle_harness._observability import (
+    MCP_EXECUTOR,
+    REDACTED_CAPTURE,
+    log_redacted,
+    tool_failed,
+)
+from basecradle_harness._redaction import is_text_file, names_a_credential, redact_file
 from basecradle_harness._secret import Secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 from basecradle_harness._venv import spawn_env
@@ -345,7 +373,10 @@ class McpServerConfig:
             object.__setattr__(
                 self,
                 name,
-                {k: v if isinstance(v, Secret) else Secret(v) for k, v in values.items()},
+                {
+                    k: v if isinstance(v, Secret) else Secret(v, credential=names_a_credential(k))
+                    for k, v in values.items()
+                },
             )
 
     @property
@@ -1202,6 +1233,74 @@ def _read_written_image(path: Path, root: Path, before: _Stamp | None) -> tuple[
     return mimetype, data
 
 
+# --- what a call saved, redacted (issue #999) --------------------------------------------------
+
+#: The folders, under a stdio server's working directory, whose text files a call wrote are
+#: redacted: playwright-mcp's default output folder. A tool that writes its captures somewhere of
+#: its own is added here, by name.
+CAPTURE_FOLDERS = (".playwright-mcp",)
+
+
+def secret_stores() -> tuple[Path, ...]:
+    """The places meant to hold a secret, resolved: never read for redaction, never changed.
+
+    The agent's config home (its ``agent.env``, its tool and MCP configs), ``~/.config`` (where Your
+    Home's law keeps a revocable secret, and a tool keeps its own credential file), ``~/vault``,
+    ``~/wallets``, ``~/.ssh`` and ``~/.gnupg``."""
+    home = Path.home()
+    places = [
+        config_home(),
+        *(home / name for name in (".config", "vault", "wallets", ".ssh", ".gnupg")),
+    ]
+    return tuple(_resolve(Path("/"), str(place)) or place for place in places)
+
+
+def _capture_files(root: Path) -> dict[Path, _Stamp | None]:
+    """Every text file under `root`'s capture folders (`CAPTURE_FOLDERS`), resolved, with its
+    `_stamp`. The walk follows no symlink, and a folder that is a link is not walked."""
+    found: dict[Path, _Stamp | None] = {}
+    for name in CAPTURE_FOLDERS:
+        folder = root / name
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        for directory, _, files in os.walk(folder, followlinks=False):
+            for file in files:
+                path = Path(directory, file)
+                if is_text_file(path):
+                    found[path] = _stamp(path)
+    return found
+
+
+def _capture_candidates(named: _NamedFiles) -> dict[Path, _Stamp | None]:
+    """The files one call may write that are redacted after it, as they stood before it ran: the
+    capture folders' text files and the text files its arguments named inside its root."""
+    candidates = _capture_files(named.root)
+    for path, before in named.before.items():
+        if _inside(path, named.root) and is_text_file(path):
+            candidates.setdefault(path, before)
+    return candidates
+
+
+def _redact_written(root: Path, before: Mapping[Path, _Stamp | None]) -> None:
+    """Redact every capture the call wrote: a candidate whose stamp moved, or a capture-folder text
+    file that is new. A file in a secret store is never opened; one that could not be redacted is a
+    WARNING naming it and why."""
+    stores = secret_stores()
+    after = _capture_files(root)
+    for path in sorted({*before, *after}):
+        stamp = _stamp(path)
+        if stamp is None or stamp == before.get(path) or not stat.S_ISREG(stamp[0]):
+            continue
+        if not _inside(path, root) or any(_inside(path, store) for store in stores):
+            continue
+        label = str(Path(*path.parts[len(root.parts) :]))
+        outcome = redact_file(path)
+        if isinstance(outcome, str):
+            _log.warning("MCP tool capture %r was not redacted: %s.", label, outcome)
+        else:
+            log_redacted(REDACTED_CAPTURE, outcome, path=label)
+
+
 def _human_bytes(n: int) -> str:
     """A compact human-readable byte size (``45.2 KB``) for an image placeholder."""
     if n < 1024:
@@ -1259,7 +1358,12 @@ class McpTool(Tool):
         """
         root = self._client.workdir
         named = _named_files(kwargs, root) if root is not None else None
-        result = self._client.call_tool(self._remote_name, dict(kwargs))
+        captures = _capture_candidates(named) if named is not None else {}
+        try:
+            result = self._client.call_tool(self._remote_name, dict(kwargs))
+        finally:
+            if named is not None:  # a call that failed may still have written a capture
+                _redact_written(named.root, captures)
         rendered = _render_tool_result(result, self._images, named)
         if result.get("isError"):
             # The server's own verdict, a real field on the result (issue #822): its text is

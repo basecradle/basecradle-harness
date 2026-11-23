@@ -1,0 +1,386 @@
+"""One definition of a secret, applied to every text the harness writes (issue #999).
+
+The definition is one module (`_redaction`) built from one public file
+(``data/secret-shapes.json``). These tests pin four things: the rules are the file (read here from
+the raw JSON, never back through the module under test) and the file is strict about its own shape
+and documented where its readers look; the shapes catch exactly what the log scrub caught before
+the move; the agent's own configured secrets are blanked by value, with the 20-character floor for
+a bare match; and a redacted file is rewritten only when it is a text file with something to lose.
+The places the definition is applied (a log line, an exchange filed into memory, a fact the memory
+tool stores, a capture a tool saved) are tested where each writer is: `test_memory_provider.py`,
+`test_mcp.py`, and the log tests.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import logging
+import os
+import re
+from pathlib import Path
+
+import pytest
+
+from basecradle_harness import _redaction
+from basecradle_harness._memory import SqliteMemoryStore
+from basecradle_harness._observability import kv, log_handler
+from basecradle_harness._redaction import (
+    CONFIGURED_VALUE_FLOOR,
+    REDACTED,
+    REDACTED_VALUE,
+    configured_values,
+    names_a_credential,
+    redact_file,
+    scrub,
+    scrub_counted,
+)
+from basecradle_harness._secret import Secret, known_secrets
+
+ROOT = Path(__file__).resolve().parent.parent
+FILE = ROOT / "src" / "basecradle_harness" / "data" / "secret-shapes.json"
+DOC = ROOT / "docs" / "secret-shapes.md"
+RAW = json.loads(FILE.read_text(encoding="utf-8"))
+
+#: A fabricated secret of no listed shape: no vendor prefix, no label, 32 characters. Only the value
+#: half can catch it.
+SHAPELESS = "Kq7vZt2Wm9LpXc4RbN8sYdHjQe5UaF3G"
+
+#: A fabricated configured value under the bare-match floor.
+SHORT = "Zr8Lq2Vx9Tm"
+
+
+# --- the file says what it is, and the rules are the file -----------------------------------------
+
+
+def test_the_file_names_its_format_and_version():
+    assert RAW["format"] == _redaction.FORMAT == "basecradle-harness-secret-shapes"
+    assert RAW["format_version"] == _redaction.FORMAT_VERSION == 1
+
+
+def test_the_package_reads_the_file_at_its_documented_path():
+    assert _redaction.RESOURCE == ("data", "secret-shapes.json")
+    assert _redaction.load() == RAW
+
+
+def test_the_vendor_key_rules_are_the_file_in_its_order():
+    assert _redaction._PREFIXED == tuple(
+        (rule["prefix"], rule["run"], rule["minimum_run"]) for rule in RAW["vendor_keys"]["rules"]
+    )
+
+
+def test_the_assignment_rule_and_the_markers_are_the_file():
+    rule = RAW["credential_assignment"]
+    assert _redaction.CREDENTIAL_WORDS == tuple(rule["words"])
+    assert _redaction.CREDENTIAL_TAIL == rule["tail"]
+    assert _redaction.CANARY_VALUE_STOPS == rule["value_stops"]
+    assert _redaction.CANARY_VALUE_FLOOR == rule["value_minimum_length"]
+    assert REDACTED == RAW["markers"]["redacted"] == "[redacted]"
+    assert REDACTED_VALUE == RAW["markers"]["redacted_value"] == "'<a redacted value>'"
+    assert CONFIGURED_VALUE_FLOOR == RAW["configured_values"]["minimum_length"] == 20
+
+
+def test_the_bearer_and_heartbeat_pieces_are_the_file():
+    assert _redaction._SCHEME_LETTERS == RAW["bearer"]["scheme"]
+    assert _redaction._BEARER_TOKEN.pattern == (
+        f"{RAW['bearer']['token']}{{{RAW['bearer']['minimum_token']},}}"
+    )
+    assert _redaction._HEARTBEAT == RAW["heartbeat_url"]["path"]
+
+
+#: Each label family's rule as the log scrub wrote it before the definition moved into the file
+#: (0.207.0's `_observability`), kept here as the oracle the file's literal names are held to.
+_BEFORE = {
+    "query_parameters": r"api[-_]?key|access[-_]?token|token|key",
+    "api_key_assignment": r"api[-_]?key",
+    "headers": r"x[-_]api[-_]?key",
+    "json_members": (
+        r"api[-_]?key|access[-_]?token|refresh[-_]?token|client[-_]?secret|password|secret"
+        r"|authorization"
+    ),
+}
+_LANGUAGE_SIZE = {"query_parameters": 8, "api_key_assignment": 3, "headers": 6, "json_members": 15}
+
+
+@pytest.mark.parametrize("section", sorted(_BEFORE))
+def test_each_label_family_names_exactly_what_the_scrub_matched_before(section):
+    """Each old rule is a finite language, and the file lists every word of it and nothing else."""
+    names = RAW[section]["names"]
+    assert len(set(names)) == len(names) == _LANGUAGE_SIZE[section]
+    assert all(re.fullmatch(_BEFORE[section], name) for name in names)
+
+
+def test_no_pattern_is_spelled_twice_in_the_package():
+    """The file is the one place a shape lives: no module of the package carries a vendor prefix,
+    a label family or a marker as a literal of its own."""
+    package = ROOT / "src" / "basecradle_harness"
+    spelled = [
+        "sk-or-|sk-|xai-",
+        "github_pat_",
+        "access[-_]?token",
+        "x[-_]api",
+        "/heartbeat/",
+        "'<a redacted value>'",
+        '"[redacted]"',
+        "PASSPHRASE",
+    ]
+    found = [
+        (path.name, literal)
+        for path in package.rglob("*.py")
+        for literal in spelled
+        if literal in _code(path.read_text(encoding="utf-8"))
+    ]
+    assert found == []
+
+
+def _code(source: str) -> str:
+    """`source` without its comments and docstrings, which may quote a shape."""
+    lines = []
+    in_doc = False
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        quotes = stripped.count('"""')
+        if in_doc or (quotes and stripped.startswith(('"""', 'r"""', 'f"""'))):
+            if quotes % 2:
+                in_doc = not in_doc
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+@pytest.mark.parametrize(
+    ("content", "match"),
+    [
+        ("{not json", "cannot be read"),
+        ("[]", "not a JSON object"),
+        (json.dumps({**RAW, "format_version": 2}), r"is \('basecradle-harness-secret-shapes', 2\)"),
+    ],
+)
+def test_a_file_this_version_cannot_read_is_a_loud_error(tmp_path, monkeypatch, content, match):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "secret-shapes.json").write_text(content, encoding="utf-8")
+    monkeypatch.setattr(_redaction.resources, "files", lambda _package: tmp_path)
+    _redaction.load.cache_clear()
+    try:
+        with pytest.raises(_redaction.ShapesFileError, match=match):
+            _redaction.load()
+    finally:
+        monkeypatch.undo()
+        _redaction.load.cache_clear()
+    assert _redaction.load() == RAW
+
+
+def _field_names(node):
+    names = set()
+    if isinstance(node, dict):
+        for key, value in node.items():
+            names.add(key)
+            names |= _field_names(value)
+    elif isinstance(node, list):
+        for item in node:
+            names |= _field_names(item)
+    return names
+
+
+def test_every_field_the_file_carries_is_documented():
+    doc = DOC.read_text(encoding="utf-8")
+    missing = sorted(name for name in _field_names(RAW) if f"`{name}`" not in doc)
+    assert not missing, f"docs/secret-shapes.md does not document {missing}"
+
+
+def test_the_doc_and_the_readme_name_the_path_and_the_format():
+    doc = DOC.read_text(encoding="utf-8")
+    assert "basecradle_harness/data/secret-shapes.json" in doc
+    assert f"`{_redaction.FORMAT}`" in doc
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "basecradle_harness/data/secret-shapes.json" in readme
+    assert "docs/secret-shapes.md" in readme
+
+
+# --- by value: the agent's own configured secrets ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "names_one"),
+    [
+        ("AI_API_KEY", True),
+        ("BASECRADLE_TOKEN", True),
+        ("NTFY_DM_TOKEN", True),
+        ("SECRET_KEY_BASE", True),
+        ("PASSWORD", True),
+        ("X-API-Key", True),  # an MCP header name, read upper-cased with `-` as `_`
+        ("GH_TOKEN_FILE", False),  # the one tail is `_BASE`; nothing else follows the word
+        ("HARNESS_DESCRIBER_CREDENTIALS_FILE", False),  # a path, not a secret
+        ("AI_MODEL", False),
+        ("PLAYWRIGHT_BROWSERS_PATH", False),
+    ],
+)
+def test_a_name_names_a_credential_by_the_assignment_rules_words(name, names_one):
+    assert names_a_credential(name) is names_one
+
+
+def test_a_configured_secret_is_blanked_wherever_it_stands(monkeypatch):
+    monkeypatch.setenv("AI_API_KEY", SHAPELESS)
+    assert SHAPELESS in configured_values()
+    text, count = scrub_counted(f"the vendor said {SHAPELESS} was refused; retry {SHAPELESS}.")
+    assert text == f"the vendor said {REDACTED} was refused; retry {REDACTED}."
+    assert count == 2
+
+
+def test_the_value_half_is_off_for_a_name_that_names_no_credential(monkeypatch):
+    monkeypatch.setenv("HARNESS_SOME_SETTING", SHAPELESS)
+    assert SHAPELESS not in configured_values()
+    assert scrub(f"value {SHAPELESS}") == f"value {SHAPELESS}"
+
+
+def test_a_short_value_is_not_blanked_bare_but_is_after_its_name(monkeypatch):
+    """`@briggs`'s floor: under 20 characters a bare match would take ordinary words out of a
+    memory; where a credential name introduces the value, the assignment rule still takes it."""
+    monkeypatch.setenv("NTFY_DM_TOKEN", SHORT)
+    assert SHORT not in configured_values()
+    assert scrub(f"saw {SHORT} here") == f"saw {SHORT} here"
+    assert scrub(f"NTFY_DM_TOKEN={SHORT}") == f"NTFY_DM_TOKEN={REDACTED_VALUE}"
+
+
+def test_a_held_secret_is_known_while_it_lives_and_forgotten_after():
+    held = Secret(SHAPELESS)
+    assert SHAPELESS in known_secrets()
+    assert scrub(f"key {SHAPELESS}") == f"key {REDACTED}"
+    del held
+    gc.collect()
+    assert SHAPELESS not in known_secrets()
+    assert scrub(f"key {SHAPELESS}") == f"key {SHAPELESS}"
+
+
+def test_a_value_wrapped_only_for_privacy_is_not_redacted():
+    """An MCP server's ``env`` entry whose name names no credential is wrapped to keep it out of a
+    representation, and is not a secret to blank from every text (a browsers path, a log level)."""
+    path = "/home/nova/.cache/ms-playwright/chromium"
+    held = Secret(path, credential=False)
+    assert path not in known_secrets()
+    assert scrub(f"launching {path}") == f"launching {path}"
+    del held
+
+
+def test_the_held_list_never_keeps_a_value_in_plain_text():
+    """It holds `Secret` objects weakly, so a walk of the module finds no credential."""
+    held = Secret(SHAPELESS)
+    from basecradle_harness import _secret
+
+    assert SHAPELESS not in repr(vars(_secret))
+    del held
+
+
+def test_a_configured_value_is_redacted_in_a_log_line(monkeypatch):
+    """The log half of the DoD: a configured value goes from a `kv` value and from a prose line."""
+    monkeypatch.setenv("AI_API_KEY", SHAPELESS)
+    assert SHAPELESS not in kv(error=f"401: key {SHAPELESS} is invalid")
+    record = logging.LogRecord(
+        "basecradle_harness", logging.WARNING, __file__, 1, "refused: %s", (SHAPELESS,), None
+    )
+    line = log_handler().format(record)
+    assert SHAPELESS not in line
+    assert REDACTED in line
+
+
+def test_without_a_configured_value_the_shapes_alone_decide(monkeypatch):
+    """With no value configured the scrub is the shape scrub, so every shape test of the log scrub
+    (`test_log_value_cut.py`, `test_credential_assignment.py`) still pins exactly what it caught."""
+    for name in [name for name in os.environ if names_a_credential(name)]:
+        monkeypatch.delenv(name)
+    gc.collect()
+    assert [value for value in configured_values() if value in SHAPELESS] == []
+    assert scrub(f"value {SHAPELESS}") == f"value {SHAPELESS}"
+
+
+# --- a text file ------------------------------------------------------------------------------
+
+
+def test_a_text_file_is_redacted_in_place(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_API_KEY", SHAPELESS)
+    capture = tmp_path / "console.log"
+    capture.write_text(f"[log] token {SHAPELESS}\nAuthorization: Bearer eyJhbGciOiJIUzI1NiJ9.e30\n")
+    inode = capture.stat().st_ino
+    os.chmod(capture, 0o640)
+
+    assert redact_file(capture) == 2
+    assert capture.read_text() == f"[log] token {REDACTED}\nAuthorization: {REDACTED}\n"
+    assert capture.stat().st_ino == inode  # rewritten in place: nothing staged beside it
+    assert capture.stat().st_mode & 0o777 == 0o640
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["console.log"]
+
+
+def test_a_clean_text_file_is_never_rewritten(tmp_path):
+    capture = tmp_path / "page.yml"
+    capture.write_text("- heading: Example Domain\n")
+    before = capture.stat()
+    assert redact_file(capture) == 0
+    assert capture.stat().st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.parametrize("name", ["shot.png", "clip.webm", "trace.zip", "page.pdf", "noext"])
+def test_a_file_that_is_not_text_is_never_opened(tmp_path, monkeypatch, name):
+    monkeypatch.setenv("AI_API_KEY", SHAPELESS)
+    data = b"\x89PNG\r\n\x1a\n" + SHAPELESS.encode()
+    path = tmp_path / name
+    path.write_bytes(data)
+    opened = []
+    real_open = os.open
+    monkeypatch.setattr(os, "open", lambda *a, **k: opened.append(a[0]) or real_open(*a, **k))
+    assert redact_file(path) == "it is not a text file"
+    assert opened == []
+    assert path.read_bytes() == data
+
+
+def test_a_text_file_that_is_not_utf8_is_left_byte_for_byte(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_API_KEY", SHAPELESS)
+    data = b"\xff\xfe" + SHAPELESS.encode()
+    path = tmp_path / "dump.txt"
+    path.write_bytes(data)
+    assert redact_file(path) == "it is not UTF-8 text"
+    assert path.read_bytes() == data
+
+
+def test_a_symlinked_capture_is_never_followed(tmp_path, monkeypatch):
+    monkeypatch.setenv("AI_API_KEY", SHAPELESS)
+    target = tmp_path / "elsewhere.txt"
+    target.write_text(SHAPELESS)
+    link = tmp_path / "capture.txt"
+    link.symlink_to(target)
+    assert isinstance(redact_file(link), str)
+    assert target.read_text() == SHAPELESS
+
+
+# --- a fact the memory tool stores ---------------------------------------------------------------
+
+
+def test_a_fact_is_stored_redacted_and_still_found_by_its_key(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("AI_API_KEY", SHAPELESS)
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    try:
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            reply = store.write("vendor", f"the vendor key is {SHAPELESS}")
+        assert "1 secret(s) in it were redacted" in reply
+        assert store.read("vendor") == f"the vendor key is {REDACTED}"
+        assert "secrets redacted kind=fact count=1" in caplog.text
+        assert SHAPELESS not in (tmp_path / "memory.db").read_bytes().decode("latin-1")
+    finally:
+        store.close()
+
+
+def test_a_fact_that_cannot_be_redacted_is_never_written(tmp_path, monkeypatch):
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    try:
+        store.write("kept", "before")
+
+        def broken(text):
+            raise RuntimeError("the redaction failed")
+
+        monkeypatch.setattr("basecradle_harness._memory.scrub_counted", broken)
+        with pytest.raises(RuntimeError):
+            store.write("vendor", f"the key is {SHAPELESS}")
+        assert store.list() == "kept"
+    finally:
+        store.close()

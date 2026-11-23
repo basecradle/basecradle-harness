@@ -47,7 +47,11 @@ tool can never drift apart on *how* the palace is searched. See `_CANDIDATE_STRA
 ``<palace>/conversations/`` — the record, which `basecradle-harness-scrub-palace` removes with its
 drawers — and files that same text through MemPalace's canonical write path for live agents,
 `file_conversation_exchange`: **one exchange, one drawer, verbatim**, past
-`EXCHANGE_PIECE_CHARS` split at line boundaries into as few drawers as fit (issue #741). It no
+`EXCHANGE_PIECE_CHARS` split at line boundaries into as few drawers as fit (issue #741). **Verbatim
+has one exception** (issue #999, `@briggs`'s rule): every secret is blanked before the exchange
+reaches this adapter (`_wake.WakeAgent._observe`, through `_redaction.scrub`), so the file and its
+drawers hold the definition's marker where a secret stood and everything else as it was said. Do
+not put a value back to honour "verbatim". It no
 longer mines the directory: MemPalace's convo chunker reads every ``>`` line as a new turn, so a
 multi-line message was filed one drawer per line, its short lines dropped. Each drawer carries the
 metadata MemPalace's own miner reads to decide a file is already filed (`_file`), so a
@@ -339,6 +343,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
     def observe(self, exchange: MemoryExchange) -> None:
         """File one completed exchange into MemPalace: one exchange, one drawer, verbatim.
+
+        Verbatim but for its secrets, which the wake blanked before handing it here (issue #999).
 
         Writes the exchange as a quote-formatted markdown file under ``<palace>/conversations/``
         (the record) and files that text through MemPalace's ``file_conversation_exchange``

@@ -1609,3 +1609,124 @@ def test_compose_brief_omits_safety_when_absent():
         initialize="INIT", manifest="TOOLS", dashboard=None, system_prompt="CHARTER"
     )
     assert "INIT" in brief and "TOOLS" in brief
+
+
+# --- what a call saves is redacted after it (issue #999) ------------------------------------------
+
+#: A fabricated configured secret of no listed shape: only the value half catches it.
+_CAPTURE_SECRET = "Wd5Hq9Mz3Lc7Vt1Xp8Nb4Rk6Jg2Sf0Ye"
+
+# A browser-tool stand-in: each call writes what the page "showed" it to a console log and a page
+# snapshot in its capture folder, a screenshot beside them, and every file the call names.
+_CAPTURING_SERVER = r"""
+import json, os, sys
+
+SECRET = sys.argv[1]
+
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    rid = req.get("id")
+    if rid is None:
+        continue
+    if req["method"] == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-06-18"}})
+    elif req["method"] == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [{
+            "name": "browser_snapshot", "description": "snap", "inputSchema": {}}]}})
+    elif req["method"] == "tools/call":
+        os.makedirs(".playwright-mcp", exist_ok=True)
+        with open(".playwright-mcp/console.log", "a") as out:
+            out.write("[log] page token " + SECRET + "\n")
+        with open(".playwright-mcp/page.yml", "w") as out:
+            out.write("- text: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.e30\n")
+        with open(".playwright-mcp/shot.png", "wb") as out:
+            out.write(b"\x89PNG\r\n\x1a\n" + SECRET.encode())
+        for name in req["params"]["arguments"].values():
+            os.makedirs(os.path.dirname(name) or ".", exist_ok=True)
+            with open(name, "w") as out:
+                out.write("saved " + SECRET + "\n")
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "ok"}]}})
+"""
+
+
+@pytest.fixture
+def capturing_tool(tmp_path, monkeypatch):
+    """The capturing server, spawned in a working directory that is the agent's home, so the
+    places meant to hold a secret (`~/.config`, the vault, the wallets) are inside its reach."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(home / ".config" / "basecradle"))
+    monkeypatch.setenv("FAL_KEY", _CAPTURE_SECRET)
+    monkeypatch.chdir(home)
+    script = tmp_path / "capturing.py"
+    script.write_text(_CAPTURING_SERVER, encoding="utf-8")
+    config = tmp_path / "config"
+    _drop_config(config, "pw", {"command": sys.executable, "args": [str(script), _CAPTURE_SECRET]})
+    resolution = load_mcp_tools(config, timeout=10)
+    try:
+        (tool,) = resolution.tools
+        yield tool, home
+    finally:
+        for client in resolution.clients:
+            client.close()
+
+
+def test_a_capture_the_call_wrote_is_redacted(capturing_tool, caplog):
+    tool, home = capturing_tool
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        tool.run()
+    captures = home / ".playwright-mcp"
+    assert (captures / "console.log").read_text() == "[log] page token [redacted]\n"
+    assert (captures / "page.yml").read_text() == "- text: Authorization: [redacted]\n"
+    assert "secrets redacted kind=capture count=1 path=.playwright-mcp/console.log" in caplog.text
+    assert _CAPTURE_SECRET not in caplog.text
+
+
+def test_a_screenshot_is_left_byte_for_byte(capturing_tool):
+    tool, home = capturing_tool
+    tool.run()
+    assert (home / ".playwright-mcp" / "shot.png").read_bytes() == (
+        b"\x89PNG\r\n\x1a\n" + _CAPTURE_SECRET.encode()
+    )
+
+
+def test_a_text_file_the_call_named_is_redacted(capturing_tool):
+    tool, home = capturing_tool
+    tool.run(filename="notes/page.md")
+    assert (home / "notes" / "page.md").read_text() == "saved [redacted]\n"
+
+
+@pytest.mark.parametrize(
+    "named",
+    [
+        ".config/basecradle/agent.env",
+        ".config/steel/state.json",
+        "vault/derived/notes.md",
+        "wallets/eth/index.md",
+        ".ssh/notes.txt",
+    ],
+)
+def test_a_file_in_a_place_meant_for_secrets_is_never_changed(capturing_tool, named):
+    """The config home, `~/.config`, the vault, the wallets: never read for redaction, never
+    changed, even when a call wrote there."""
+    tool, home = capturing_tool
+    tool.run(filename=named)
+    assert (home / named).read_text() == f"saved {_CAPTURE_SECRET}\n"
+
+
+def test_a_capture_the_call_did_not_write_is_left_alone(capturing_tool):
+    """Only what the call wrote is redacted: a text file already in the folder is the agent's."""
+    tool, home = capturing_tool
+    earlier = home / ".playwright-mcp" / "earlier.md"
+    earlier.parent.mkdir()
+    earlier.write_text(f"kept {_CAPTURE_SECRET}\n")
+    tool.run()
+    assert earlier.read_text() == f"kept {_CAPTURE_SECRET}\n"

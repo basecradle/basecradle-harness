@@ -6,7 +6,7 @@ whole file's sha256 there is `9186b95bcc40f282a147b46f31b0dc047dbfe6cad7f79a2b2f
 and the excerpt's is `770c95555c7faca832aac087035ccb183394cbaff83b5197351acd45e73835a7`, which
 `tests/test_credential_assignment.py` checks. It is never edited here: when the router's reading changes, the excerpt is copied again
 from the router's commit, and the commit, the line range and both checksums change with it. The
-test holds `_observability.redact_credentials` and `_observability._value_end` to these
+test holds `_redaction.redact_credentials` and `_redaction._value_end` to these
 functions.
 """
 

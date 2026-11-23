@@ -57,8 +57,9 @@ from collections.abc import Callable
 
 import httpx
 
-from basecradle_harness._observability import bounded, kv, scrub, tool_failed
+from basecradle_harness._observability import kv, tool_failed
 from basecradle_harness._platform import PlatformTool
+from basecradle_harness._redaction import bounded, scrub
 from basecradle_harness._secret import reveal, secret
 
 logger = logging.getLogger("basecradle_harness")
@@ -98,7 +99,7 @@ class _DeliveryFailed(Exception):
     """ntfy could not be reached or refused the message, with a model-readable reason.
 
     Its message is always safe to show: it names the status or the transport failure, and any
-    response text it carries has been through `_redact`. `slug` is the same fact as the line's
+    response text it carries has been through `scrub`, which blanks the publish token by value. `slug` is the same fact as the line's
     ``reason=``: ``transport`` (ntfy never answered), ``server_error`` (it failed on its own side),
     or ``refused`` (its verdict on this request, a 4xx).
     """
@@ -283,7 +284,7 @@ class DirectMessageTool(PlatformTool):
                 else:
                     if response.status_code < 300:
                         return
-                    reason = _refusal(response, token)
+                    reason = _refusal(response)
                     if response.status_code < 500:
                         # ntfy's verdict on this request; a retry sends the same thing
                         slug = "refused"
@@ -299,19 +300,13 @@ class DirectMessageTool(PlatformTool):
 _REFUSAL_CAP = 200
 
 
-def _refusal(response: httpx.Response, token: str) -> str:
-    """Why ntfy refused, as one model-readable sentence with the token scrubbed out."""
-    detail = bounded(scrub(_redact(response.text, token).strip()), _REFUSAL_CAP)
+def _refusal(response: httpx.Response) -> str:
+    """Why ntfy refused, as one model-readable sentence with the token scrubbed out.
+
+    ntfy has no reason to echo the credential back, which is exactly why the scrub runs: the token
+    is one of the agent's configured secrets (``NTFY_DM_TOKEN``, or the `Secret` this tool holds),
+    so `scrub` blanks it by value wherever it stands, mechanically (issue #999)."""
+    detail = bounded(scrub(response.text.strip()), _REFUSAL_CAP)
     if detail:
         return f"ntfy.sh returned HTTP {response.status_code}: {detail}."
     return f"ntfy.sh returned HTTP {response.status_code}."
-
-
-def _redact(text: str, token: str) -> str:
-    """`text` with the publish token replaced, so no path can leak it into a log or a result.
-
-    ntfy has no reason to echo the credential back, which is exactly why this is here: the
-    invariant that the token never appears in log or error text should hold *mechanically*,
-    not because every future edit to this file remembers it.
-    """
-    return text.replace(token, "[redacted]") if token else text

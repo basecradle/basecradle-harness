@@ -18,16 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from basecradle_harness import _observability
+from basecradle_harness import _redaction
 from basecradle_harness._exceptions import ProviderError, ProviderServerError
-from basecradle_harness._observability import (
+from basecradle_harness._observability import MAX_VALUE, _value, kv
+from basecradle_harness._redaction import (
     _HEARTBEAT_RUN,
-    MAX_VALUE,
     REDACTED_VALUE,
     _heartbeat,
-    _value,
     bounded,
-    kv,
     redact_credentials,
     scrub,
 )
@@ -369,7 +367,7 @@ def test_an_identifier_the_harness_writes_is_not_mistaken_for_a_credential():
 
 # --- a vendor prefix inside a word is a word, not a credential (issue #794) ---------------------
 
-#: One fabricated sample per **prefix-anchored** rule (`_observability._PREFIXED`) — the rules a word can contain.
+#: One fabricated sample per **prefix-anchored** rule (`_redaction._PREFIXED`) — the rules a word can contain.
 PREFIX_SAMPLES = {
     "sk-": "sk-ant-api03-Ab3Cd5Ef7Gh9",
     "sk-or-": "sk-or-v1-0f3a9c2b7d4e6f8a",
@@ -1179,9 +1177,9 @@ def test_dropping_an_opener_at_a_close_keeps_no_key_and_breaks_no_line(monkeypat
         for _ in range(rng.randint(0, 3)):
             line = json.dumps({"log": line})
         cases.append((line, scrub(line)))
-    monkeypatch.setattr(_observability, "_closes", lambda match: False)
+    monkeypatch.setattr(_redaction, "_closes", lambda match: False)
     for line, new in cases:
-        old = _observability.scrub(line)
+        old = _redaction.scrub(line)
         assert SHAPELESS_KEY in old or SHAPELESS_KEY not in new, repr(line)
         assert _depth_parsed(new) >= _depth_parsed(old), repr(line)
 

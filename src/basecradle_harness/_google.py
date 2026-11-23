@@ -158,7 +158,6 @@ from basecradle_harness._observability import (
     UNKNOWN_MODEL,
     UNPRICED_TIER,
     answered,
-    bounded,
     finish_reason,
     generation_id,
     log_cost_unpriced,
@@ -167,12 +166,12 @@ from basecradle_harness._observability import (
     meter_failure,
     meter_tool,
     read_answer,
-    scrub,
     tally_server_tools,
     token_counts,
     usage_reported,
 )
 from basecradle_harness._openai_wire import format_citations
+from basecradle_harness._redaction import bounded, scrub
 from basecradle_harness._retry import diagnostics, fault_slug
 from basecradle_harness._secret import Sealed as _Sealed
 from basecradle_harness._server_tools import record

@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.211.0] - 2026-11-23
+
+### Added: one definition of a secret, applied to every text the harness writes: logs, memory and tool captures (issue #999)
+
+A live credential was found in a text file an agent's browser tool had saved. The credential scrub lived in the log module and only log lines went through it, so what the harness filed into memory and what a tool saved under the agent's home were never redacted.
+
+- **What a secret is lives in one module, `_redaction`, and one public file, `basecradle_harness/data/secret-shapes.json`.** The vendor key prefixes and their runs, the credential-named assignment's words, tail, stops and floor, the bearer scheme and token, each label family (query parameters, `api_key=`, `x-api-key` headers, credential-named JSON members), the heartbeat path and both markers are read from the file and nowhere else. It is documented in [`docs/secret-shapes.md`](docs/secret-shapes.md), with the same stability promise as the prices file, and CI proves the wheel carries it byte for byte. The log scrub is unchanged in what its shapes catch: a differential of 300,000 fuzzed texts against 0.210.0 gives the same bytes from `scrub`, `bounded` and `redact_credentials`.
+- **The agent's own configured secrets are redacted by value.** Every environment variable whose name names a credential by the assignment rule's words (`AI_API_KEY`, `BASECRADLE_TOKEN`, `NTFY_DM_TOKEN`, …), and every credential the harness holds under such a name, is blanked wherever it appears, when it is at least 20 characters long. A shorter value is still blanked where a credential name introduces it. This needs no pattern, so it catches a vendor nobody listed. The brain check's and the direct-message tool's own by-value replacements are gone: the definition does both.
+- **An exchange is redacted before it is filed into memory.** The secret goes, the definition's own marker stays, and the rest of the exchange is filed (`@briggs`'s rule, recorded on the issue). It happens before any provider sees the exchange, so before it is split into drawers or written under `conversations/`. An exchange the redaction cannot run on is not filed at all, and says so (`memory op=observe result=skipped reason=redaction_failed`). A fact the memory tool stores is redacted the same way, and the model is told how many secrets it lost. Nothing already in memory is rewritten.
+- **A text file a tool saved is redacted after the call that wrote it.** Under a stdio MCP server's working directory: every text file in `.playwright-mcp/`, and every text file the call named, that the call wrote. It is rewritten in place, so nothing is left beside it. An image or any other non-text file is never opened, and the config home, `~/.config`, `~/vault`, `~/wallets`, `~/.ssh` and `~/.gnupg` are never read or changed. A capture that could not be redacted is named in a WARNING.
+- **Each redaction outside the log is counted** on one INFO line, `secrets redacted kind=<exchange|fact|capture> count=<n>`, which never carries the text (`docs/telemetry.md`).
+- **The agent is told:** a secret put anywhere but where secrets belong *may* be redacted automatically, so it should never count on finding it there, or on it being caught (`initialize.md`).
+
 ## [0.210.0] - 2026-11-22
 
 ### Added: the vendor price tables are a public data file in the package (issue #997)

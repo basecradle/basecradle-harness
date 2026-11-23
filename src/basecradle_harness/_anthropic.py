@@ -228,18 +228,17 @@ from basecradle_harness._observability import (
     UNPRICED_TIER,
     UNREADABLE,
     ServerToolTally,
-    bounded,
     generation_id,
     log_cost_unpriced,
     log_llm_call,
     log_server_tools,
-    scrub,
     slug,
     stamp_generation_id,
     token_counts,
     usage_reported,
 )
 from basecradle_harness._openai_wire import format_citations
+from basecradle_harness._redaction import bounded, scrub
 from basecradle_harness._secret import Sealed
 from basecradle_harness._server_tools import mark_failed, record, summarize
 

@@ -43,7 +43,7 @@ def plain(text: str) -> str:
 #: of basecradle-noc#1560, 2026-11-18; `docs/observability.md` §10), and as basecradle-router holds
 #: it in its own `tests/conftest.py` (its widened copy moves in basecradle-router#504). Widened by `@origin`'s decision on basecradle-noc#1547
 #: (2026-11-17, issue #927): a bare word is a name, and `_BASE` is the one tail after the word. The
-#: scrub's definition of a credential's name (`_observability.CREDENTIAL_NAME`, issue #918) is held
+#: scrub's definition of a credential's name (`_redaction.CREDENTIAL_NAME`, issue #918) is held
 #: to these bytes, and every credential-assignment test uses this pattern as its oracle. Moving it is
 #: a change to the NOC's rule: move it here with it.
 NOC_CREDENTIAL_ASSIGNMENT = r'[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}'

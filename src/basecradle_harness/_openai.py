@@ -104,7 +104,6 @@ from basecradle_harness._observability import (
     reasoning_apart,
     reported_cost,
     routed_web_searches,
-    scrub,
     serving_endpoint,
     stamp_generation_id,
     tally_server_tools,
@@ -132,6 +131,7 @@ from basecradle_harness._openai_wire import (
     reasoning_to_send_back,
     server_tool_uses,
 )
+from basecradle_harness._redaction import scrub
 from basecradle_harness._refuseless_pricing import beyond_any_row, pricing_of
 from basecradle_harness._refuseless_pricing import call_cost as listed_call_cost
 from basecradle_harness._refuseless_pricing import usage_of as listed_usage

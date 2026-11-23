@@ -220,21 +220,22 @@ from basecradle_harness._observability import (
     COST_BASIS_COMPUTED,
     GREEN,
     RED,
+    REDACTED_EXCHANGE,
     YELLOW,
-    bounded,
     delivery_id,
     describe_provider,
     head,
     in_wake,
     kv,
     last_word,
+    log_redacted,
     log_unspoken,
-    scrub,
 )
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._plugins import ResolvedTools
 from basecradle_harness._probe import verify_marked
 from basecradle_harness._provider import Provider
+from basecradle_harness._redaction import bounded, scrub, scrub_counted
 from basecradle_harness._report import (
     BILLING,
     OUTAGE,
@@ -3383,6 +3384,25 @@ class WakeAgent:
             # Nothing but scaffolding, or a degraded turn on an item with no text of its own.
             # Mining an empty exchange writes a drawer that can only ever dilute retrieval.
             return
+        try:
+            # The one exception to filing verbatim (issue #999): every secret goes, its marker
+            # stays, and the rest is filed. Before any provider sees the exchange, so before it is
+            # split into drawers or written under `conversations/`.
+            user, from_user = scrub_counted(user)
+            assistant, from_assistant = scrub_counted(assistant)
+        except Exception:  # noqa: BLE001 - an exchange that cannot be redacted is never filed
+            _log.warning(
+                "memory %s",
+                kv(
+                    op="observe",
+                    result="skipped",
+                    reason="redaction_failed",
+                    timeline=self.timeline_uuid,
+                ),
+                exc_info=True,
+            )
+            return
+        log_redacted(REDACTED_EXCHANGE, from_user + from_assistant, timeline=self.timeline_uuid)
         try:
             self.memory_provider.observe(
                 MemoryExchange(
