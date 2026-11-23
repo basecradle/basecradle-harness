@@ -46,7 +46,7 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 
 | Field | Meaning |
 |---|---|
-| `provider` | Who did the work. On a model call or a tool, the vendor that bills it (`AI_PROVIDER`'s value for the brain); on a memory line, the memory system's software (`mempalace`). Software never names a head (issue #485); it appears only here. Always a lowercase slug, `^[a-z0-9._-]+$`, and never a display name (see [Identifiers](#identifiers)). |
+| `provider` | Who did the work. On a model call or a tool, the vendor that bills it (`AI_PROVIDER`'s value for the brain); on a memory line, the memory system's software, by the name its adapter was selected by (`mempalace`, or `mempalace-previous` for today's adapter under its second name, issue #1010). Software never names a head (issue #485); it appears only here. Always a lowercase slug, `^[a-z0-9._-]+$`, and never a display name (see [Identifiers](#identifiers)). |
 | `model` | The vendor's model id the work ran on, exactly as configured. No grammar of the harness's own (see [Identifiers](#identifiers)). |
 | `timeline` | The uuid of the BaseCradle timeline the work is for. |
 | `item` | The uuid of the message or task a wake is working. |

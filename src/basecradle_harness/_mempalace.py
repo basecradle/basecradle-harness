@@ -86,6 +86,7 @@ from pathlib import Path
 
 from basecradle_harness._memory_provider import (
     _MEMPALACE,
+    _MEMPALACE_SELECTORS,
     MemoryExchange,
     MemoryProvider,
     MemoryScope,
@@ -316,6 +317,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
             inject a double; there is no way to *disable* an env-configured reranker from here,
             because the env var already is the switch and a second one would be a way to disagree
             with it.
+        name: The name this adapter was selected by, ``mempalace`` (the default) or its second
+            name ``mempalace-previous`` (issue #1010). It is the name the harness reports: the
+            ``provider=`` field of every ``memory`` line this adapter writes, and the bound name
+            `describe_memory_provider` gives ``--resolved-config`` and ``basecradle-harness-resolve``.
+            The setting is read once, where the provider is built (`memory_provider_named`), and
+            carried here, so a report is still read off the bound object and the NOC can see an
+            agent's move between names. Any other value is refused.
     """
 
     def __init__(
@@ -325,7 +333,14 @@ class MemPalaceMemoryProvider(MemoryProvider):
         n_results: int = DEFAULT_N_RESULTS,
         agent: str = "harness",
         reranker: MemPalaceReranker | None = None,
+        name: str = _MEMPALACE,
     ) -> None:
+        if name not in _MEMPALACE_SELECTORS:
+            raise ValueError(
+                f"{name!r} is not a name of the MemPalace adapter; use one of "
+                f"{', '.join(repr(each) for each in sorted(_MEMPALACE_SELECTORS))}."
+            )
+        self.name = name
         self.palace_path = Path(palace_path)
         self.n_results = n_results
         self.agent = agent
@@ -444,7 +459,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
                     if drawer is None:  # a piece is never blank (`_pieces`); upstream changed
                         raise RuntimeError("MemPalace filed no drawer for a non-empty piece")
             except BaseException:
-                if _unfile(collection, str(path)):
+                if _unfile(collection, str(path), provider=self.name):
                     path.unlink(missing_ok=True)
                 raise
 
@@ -557,6 +572,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             # not upstream's.
             hits = hits[:wanted]
         _log_recall(
+            provider=self.name,
             surface=surface,
             reranked=reranked,
             pool=pool,
@@ -625,7 +641,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if decision[0] is None:
             _log.info(
                 "memory threshold %s",
-                kv(provider=_MEMPALACE, max_distance="off", reason=decision[1]),
+                kv(provider=self.name, max_distance="off", reason=decision[1]),
             )
         return decision
 
@@ -679,7 +695,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             )
             raw = result.get("results") if isinstance(result, dict) else None
             if not isinstance(raw, list) or (isinstance(result, dict) and "error" in result):
-                _log_search_failure(result, surface=surface)
+                _log_search_failure(result, provider=self.name, surface=surface)
                 if found is not None:
                     return found
                 # Reads as no hits from here on, so the tool's answer is an honest-looking "nothing
@@ -943,6 +959,7 @@ def _write_cli_config(config_dir: Path, config_file: Path, data: dict) -> None:
 
 def _log_recall(
     *,
+    provider: str,
     surface: str,
     reranked: bool,
     pool: int,
@@ -997,7 +1014,7 @@ def _log_recall(
     _log.info(
         "memory recall %s",
         kv(
-            provider=_MEMPALACE,
+            provider=provider,
             surface=surface,
             rerank="on" if reranked else "off",
             pool=pool,
@@ -1009,7 +1026,7 @@ def _log_recall(
     )
 
 
-def _log_search_failure(result: object, *, surface: str) -> None:
+def _log_search_failure(result: object, *, provider: str, surface: str) -> None:
     """One WARNING for a MemPalace search that answered with an error, not a ranking (issue #617).
 
     Before it, such a search returned no hits and the ``memory recall`` line said ``injected=0``,
@@ -1035,7 +1052,7 @@ def _log_search_failure(result: object, *, surface: str) -> None:
         kv(
             op="search",
             result="failed",
-            provider=_MEMPALACE,
+            provider=provider,
             surface=surface,
             reason=reason,
             **extra,
@@ -1171,7 +1188,7 @@ def _cut(line: str, size: int) -> list[str]:
     return parts
 
 
-def _unfile(collection, source_file: str) -> bool:
+def _unfile(collection, source_file: str, *, provider: str) -> bool:
     """Delete every drawer recorded under ``source_file``; ``True`` once none is left.
 
     By the recorded path, not by the ids a failed `MemPalaceMemoryProvider._file` collected: an
@@ -1189,7 +1206,7 @@ def _unfile(collection, source_file: str) -> bool:
     except Exception:  # noqa: BLE001 - the filing's error is the one the caller must see
         _log.warning(
             "memory %s",
-            kv(op="observe", result="unfile_failed", provider=_MEMPALACE),
+            kv(op="observe", result="unfile_failed", provider=provider),
             exc_info=True,
         )
         return False

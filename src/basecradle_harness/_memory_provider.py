@@ -185,8 +185,10 @@ _MEMPALACE = "mempalace"
 # The same MemPalace adapter under a second name (issue #1010). The memory redesign
 # (basecradle#966) gives `mempalace` to a new adapter and keeps today's selectable as
 # `mempalace-previous`, so each agent moves one at a time and can be set back. Until the new
-# adapter lands the two names select one class: same palace, same extra, same tools, and the same
-# bound name (`describe_memory_provider` reads the class, so both report `mempalace`).
+# adapter lands the two names select one class: same palace, same extra, same tools. Each reports
+# the name it was selected by (the capital's amendment on the issue): the adapter carries it, so
+# the NOC reads an agent's move off its resolved configuration and its `memory` lines, and the
+# release that gives `mempalace` to the new adapter changes no reported value.
 _MEMPALACE_PREVIOUS = "mempalace-previous"
 _MEMPALACE_SELECTORS = frozenset({_MEMPALACE, _MEMPALACE_PREVIOUS})
 
@@ -197,7 +199,7 @@ _MEMPALACE_CLASS = "basecradle_harness._mempalace.MemPalaceMemoryProvider"
 # The PyPI distribution backing each built-in alias, for the manifest's version field. Only
 # `mempalace` has one (the harness's `[mempalace]` extra); `sqlite` is absent on purpose — see
 # `describe_memory_provider`.
-_PROVIDER_DISTRIBUTIONS = {_MEMPALACE: "mempalace"}
+_PROVIDER_DISTRIBUTIONS = {_MEMPALACE: "mempalace", _MEMPALACE_PREVIOUS: "mempalace"}
 
 # MemPalace's *own* palace-path environment variables, in upstream's precedence order
 # (`mempalace.config.MempalaceConfig.palace_path`). The harness reads the same two, in the same
@@ -227,6 +229,20 @@ def memory_provider_from_env(home: str | os.PathLike[str] | None = None) -> Memo
     return memory_provider_named(os.environ.get(_PROVIDER_VAR), home)
 
 
+def configured_mempalace_name() -> str:
+    """The MemPalace adapter's name as this agent's ``HARNESS_MEMORY_PROVIDER`` selects it.
+
+    For a command that opens a palace by its path rather than binding the agent's memory provider
+    (`basecradle-harness-palace-check`), so its ``memory`` lines carry the name the agent's own
+    wakes do (issue #1010). The setting when it names the adapter (``mempalace`` or
+    ``mempalace-previous``, any case), else ``mempalace``: the command examines a MemPalace palace
+    whatever the agent binds, and refusing to run on another setting would hide the palace it was
+    asked to read.
+    """
+    lowered = (os.environ.get(_PROVIDER_VAR) or "").strip().lower()
+    return lowered if lowered in _MEMPALACE_SELECTORS else _MEMPALACE
+
+
 def memory_provider_named(
     selector: str | None, home: str | os.PathLike[str] | None = None
 ) -> MemoryProvider:
@@ -253,7 +269,7 @@ def memory_provider_named(
     if lowered in _MEMPALACE_SELECTORS:
         from basecradle_harness._mempalace import MemPalaceMemoryProvider
 
-        return MemPalaceMemoryProvider(palace_path=_palace_path(home))
+        return MemPalaceMemoryProvider(palace_path=_palace_path(home), name=lowered)
     return _load_custom_provider(raw)
 
 
@@ -266,10 +282,12 @@ def describe_memory_provider(provider: MemoryProvider) -> tuple[str, str | None]
     a dotted path naming a built-in class would report as "custom" when it is not.
 
     - **name** — ``sqlite`` or ``mempalace`` for the built-ins (whichever alias *or* dotted
-      path selected them: the class is the truth, so every spelling normalizes to the alias, and
-      ``mempalace-previous`` reports ``mempalace``),
+      path selected them: the class is the truth, so every spelling normalizes to the alias),
       else ``module:Class`` — the import path of the custom provider actually bound. A
-      *subclass* of a built-in is a custom provider and reports its own path, not the alias.
+      *subclass* of a built-in is a custom provider and reports its own path, not the alias. The
+      MemPalace adapter reports the name it carries, the one it was selected by: ``mempalace``,
+      or ``mempalace-previous`` for its second name (issue #1010), read off the object like the
+      rest. A dotted path naming its class builds it under its default name, ``mempalace``.
     - **version** — the installed version of the **backing distribution** the harness pins for
       that provider — today that means the ``mempalace`` extra — else ``None``. ``None`` for the
       built-in ``sqlite`` store, which ships *inside the harness* (its engine is stdlib
@@ -283,12 +301,13 @@ def describe_memory_provider(provider: MemoryProvider) -> tuple[str, str | None]
       `observe`/`context`) while its package is absent, so the agent will lose its palace at the
       first wake.
     """
-    name = _provider_name(type(provider))
+    name = _provider_name(provider)
     return name, _provider_version(name)
 
 
-def _provider_name(cls: type[MemoryProvider]) -> str:
-    """The bound provider class's manifest name (see `describe_memory_provider`)."""
+def _provider_name(provider: MemoryProvider) -> str:
+    """The bound provider's manifest name (see `describe_memory_provider`)."""
+    cls = type(provider)
     if cls is SqliteMemoryProvider:
         return _SQLITE
     # Compare by import path, not `isinstance`: the MemPalace adapter is an optional-extra
@@ -296,7 +315,7 @@ def _provider_name(cls: type[MemoryProvider]) -> str:
     # adapter itself keeps around chromadb), and an exact-class check is what makes a
     # *subclass* correctly report as the custom provider it is.
     if f"{cls.__module__}.{cls.__qualname__}" == _MEMPALACE_CLASS:
-        return _MEMPALACE
+        return provider.name  # the name it was selected by (issue #1010)
     return f"{cls.__module__}:{cls.__qualname__}"
 
 

@@ -2610,8 +2610,8 @@ def test_resolved_config_reports_a_bound_mempalace_provider(
 
     report = resolved_config()
 
-    # Either name binds the one adapter, so either reports `mempalace` (issue #1010).
-    assert report["memory_provider"] == "mempalace"
+    # Each name reports itself, so the NOC reads an agent's move off this field (issue #1010).
+    assert report["memory_provider"] == mempalace_selector
     assert report["memory_provider_version"] is None
     # The provider's own tools fold into the resolved set, so a MemPalace agent carries its
     # read-only `memory_search` (issue #267) and *not* the SQLite `memory` tool. The tool axis

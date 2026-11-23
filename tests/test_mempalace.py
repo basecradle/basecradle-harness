@@ -231,10 +231,14 @@ def test_a_write_that_fails_leaves_no_file_behind(fake_mempalace, tmp_path, monk
     assert list((tmp_path / "palace" / "conversations").glob("*.md")) == []
 
 
-def test_drawers_that_cannot_be_deleted_keep_their_file(fake_mempalace, tmp_path, caplog):
-    """An orphaned partial set is invisible; one that still has its file is named and re-filed."""
+def test_drawers_that_cannot_be_deleted_keep_their_file(
+    fake_mempalace, tmp_path, caplog, mempalace_selector
+):
+    """An orphaned partial set is invisible; one that still has its file is named and re-filed.
+
+    The warning names the adapter as it was selected (issue #1010)."""
     convo_miner, _ = fake_mempalace
-    provider = MemPalaceMemoryProvider(tmp_path / "palace")
+    provider = MemPalaceMemoryProvider(tmp_path / "palace", name=mempalace_selector)
     filed = convo_miner.file_conversation_exchange
 
     def fail_on_the_second(collection, **kwargs):
@@ -251,7 +255,7 @@ def test_drawers_that_cannot_be_deleted_keep_their_file(fake_mempalace, tmp_path
 
     (path,) = (tmp_path / "palace" / "conversations").glob("*.md")
     assert convo_miner.filed[0]["source_file"] == str(path)
-    assert "result=unfile_failed" in caplog.text
+    assert f"result=unfile_failed provider={mempalace_selector}" in caplog.text
 
 
 def test_a_piece_must_hold_more_than_the_quote_mark():
@@ -661,7 +665,7 @@ def test_every_search_passes_max_distance_on_a_cosine_palace(fake_mempalace, tmp
     ],
 )
 def test_no_max_distance_where_it_could_cut_a_candidate(
-    fake_mempalace, tmp_path, caplog, monkeypatch, metric, version, reason
+    fake_mempalace, tmp_path, caplog, monkeypatch, metric, version, reason, mempalace_selector
 ):
     """The capital's ruling: it must never cut a candidate. Anywhere 2.0 is not a no-op filter, the
     search is the one made before issue #625, byte for byte, and one line says why."""
@@ -670,7 +674,7 @@ def test_no_max_distance_where_it_could_cut_a_candidate(
     monkeypatch.setattr(_mempalace, "mempalace_version", lambda: version)
     palace = tmp_path / "palace"
     palace.mkdir()
-    provider = MemPalaceMemoryProvider(palace)
+    provider = MemPalaceMemoryProvider(palace, name=mempalace_selector)
 
     with caplog.at_level("INFO", logger="basecradle_harness"):
         provider.search("anything")
@@ -680,7 +684,8 @@ def test_no_max_distance_where_it_could_cut_a_candidate(
         {"n_results": _unranked(DEFAULT_N_RESULTS), "candidate_strategy": "union"}
     ] * 2
     lines = [r.getMessage() for r in caplog.records]
-    assert lines.count(f"memory threshold provider=mempalace max_distance=off reason={reason}") == 1
+    threshold = f"memory threshold provider={mempalace_selector} max_distance=off reason={reason}"
+    assert lines.count(threshold) == 1
     assert not [line for line in lines if "max_distance=" in line and "recall" in line]
 
 
@@ -1155,7 +1160,7 @@ _ERROR = f"Search error: no such column near {_QUERY!r}"
     ],
 )
 def test_a_search_upstream_could_not_serve_logs_one_warning(
-    fake_mempalace, tmp_path, caplog, answer, fields
+    fake_mempalace, tmp_path, caplog, answer, fields, mempalace_selector
 ):
     """An agent woke with no memories and nothing said why (issue #617): the recall line of a failed
     search reads ``injected=0``, exactly like a palace with nothing relevant. One WARNING now says
@@ -1167,17 +1172,20 @@ def test_a_search_upstream_could_not_serve_logs_one_warning(
     palace.mkdir()
 
     with caplog.at_level("INFO", logger="basecradle_harness"):
-        hits = MemPalaceMemoryProvider(palace).search(_QUERY, 5, surface="turn0")
+        hits = MemPalaceMemoryProvider(palace, name=mempalace_selector).search(
+            _QUERY, 5, surface="turn0"
+        )
 
     assert hits == []
     (warning,) = [r for r in caplog.records if r.levelname == "WARNING"]
     assert warning.getMessage() == (
-        f"memory op=search result=failed provider=mempalace surface=turn0 {fields}"
+        f"memory op=search result=failed provider={mempalace_selector} surface=turn0 {fields}"
     )
     for record in caplog.records:
         assert "AZURE" not in record.getMessage()
         assert "Search error" not in record.getMessage()
-    assert any(r.getMessage().startswith("memory recall ") for r in caplog.records)
+    recall = f"memory recall provider={mempalace_selector} surface=turn0 "
+    assert any(r.getMessage().startswith(recall) for r in caplog.records)
 
 
 def test_a_search_that_answers_logs_no_warning(fake_mempalace, tmp_path, caplog):

@@ -34,7 +34,11 @@ from basecradle_harness import (
     memory_provider_from_env,
 )
 from basecradle_harness._context import Compactor, ContextBudget
-from basecradle_harness._memory_provider import describe_memory_provider, memory_provider_named
+from basecradle_harness._memory_provider import (
+    configured_mempalace_name,
+    describe_memory_provider,
+    memory_provider_named,
+)
 from basecradle_harness._mempalace import MemPalaceMemoryProvider
 from basecradle_harness._messages import Message
 from tests.conftest import MEMPALACE_SELECTORS
@@ -160,9 +164,9 @@ def test_both_mempalace_names_bind_the_one_adapter_identically(
     """`mempalace-previous` is a second name for today's adapter, nothing more (issue #1010).
 
     The memory redesign (basecradle#966) will give `mempalace` to a new adapter; until it lands,
-    either name binds the same class over the same palace, contributes the same tools, and reports
-    the same bound name. The bound name staying `mempalace` is what keeps every line and report
-    the NOC reads unchanged. Case-insensitive like every built-in selector.
+    either name binds the same class over the same palace and contributes the same tools. Each
+    reports the name it was selected by, in its lowercase spelling, so `mempalace` reports what it
+    always did and an agent's move is visible to the NOC. Case-insensitive like every built-in.
     """
     monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
     monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
@@ -174,8 +178,54 @@ def test_both_mempalace_names_bind_the_one_adapter_identically(
         assert type(provider) is MemPalaceMemoryProvider
         assert provider.palace_path == tmp_path / "mempalace"
         assert [tool.name for tool in provider.tools()] == ["memory_search"]
-        assert describe_memory_provider(provider) == ("mempalace", None)
-        assert type(memory_provider_named(spelling, tmp_path)) is MemPalaceMemoryProvider
+        assert provider.name == mempalace_selector
+        assert describe_memory_provider(provider) == (mempalace_selector, None)
+        named = memory_provider_named(spelling, tmp_path)
+        assert type(named) is MemPalaceMemoryProvider
+        assert named.name == mempalace_selector
+
+
+def test_the_mempalace_extras_version_is_reported_under_either_name(
+    tmp_path, monkeypatch, mempalace_selector
+):
+    """The version is the `mempalace` distribution's under both names (issue #1010)."""
+    monkeypatch.setattr(metadata, "version", lambda dist: {"mempalace": "3.5.0"}[dist])
+    provider = memory_provider_named(mempalace_selector, tmp_path)
+
+    assert describe_memory_provider(provider) == (mempalace_selector, "3.5.0")
+
+
+def test_the_adapter_built_directly_keeps_its_name_and_refuses_another(tmp_path):
+    """Built with no name, as a dotted path or a palace command builds it, the adapter is
+    `mempalace`, what it always reported. A name that is not one of its own is refused, so no
+    report or line can carry a provider value the selection does not know."""
+    assert describe_memory_provider(MemPalaceMemoryProvider(tmp_path / "palace"))[0] == "mempalace"
+    with pytest.raises(ValueError, match="not a name of the MemPalace adapter"):
+        MemPalaceMemoryProvider(tmp_path / "palace", name="sqlite")
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [
+        ("mempalace", "mempalace"),
+        ("mempalace-previous", "mempalace-previous"),
+        (" MemPalace-Previous ", "mempalace-previous"),
+        ("sqlite", "mempalace"),
+        ("", "mempalace"),
+        (None, "mempalace"),
+    ],
+)
+def test_a_palace_command_names_the_adapter_as_the_agents_setting_does(
+    monkeypatch, setting, expected
+):
+    """`basecradle-harness-palace-check` opens a palace by path, so it takes its `provider=` from
+    the agent's setting when that names the adapter, and is `mempalace` otherwise."""
+    if setting is None:
+        monkeypatch.delenv("HARNESS_MEMORY_PROVIDER", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", setting)
+
+    assert configured_mempalace_name() == expected
 
 
 def test_the_paired_selector_list_is_the_modules_own():
