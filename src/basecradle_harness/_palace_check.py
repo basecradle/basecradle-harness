@@ -49,24 +49,12 @@ else: MemPalace's miner's drawers really were cut by the older chunker, so they 
 MemPalace and reported. Every report counts both kinds on one line (`stale_line`). It **writes to
 the palace** and has a ``--dry-run`` form.
 
-**One write for a moved palace: ``--relocate-source-file``** (issues #831, #989). A mine purges a
-file's drawers by their ``source_file``, so a file whose drawers are recorded under a previous home
-is filed a second time beside them. This mode rewrites ``source_file`` on those drawers to this
-location, so the mine that follows is the in-place case, or, for a current file, a skip
-(`relocate_source_file`). On 3.11 that is needed for MemPalace's miner's version-stale files; on
-3.12, which recognises a file by its path alone, for every file, the observe's included, which
-keep the path their id was derived from (`ID_SOURCE_FILE`). It takes the previous home as an
-argument, proves each file separately, **writes to the palace**, deletes nothing, and has a
-``--dry-run`` form.
-
-**What MemPalace recognises decides which write a move needs** (issue #989). Before 3.12 a mine
-recognises a moved file by its content hash in the mining wing (`recognises_content`), so a moved
-palace needs ``--register-off-wing`` for an off-wing file and ``--relocate-source-file`` for a
-version-stale one. 3.12 removed that on purpose (MemPalace#2800) and recognises a file at its
-recorded path only, so there ``--register-off-wing`` has nothing to register and
-``--relocate-source-file`` records every provable file here. 3.12 also raised ``normalize_version``
-to 3, which makes every drawer filed before it unfiled to a mine: the report counts that class on
-its own line (`normalize_line`), and nothing here writes the version (issue #1001).
+**One write for a moved palace's re-mine: ``--relocate-source-file``** (issue #831). A 3.11 mine
+purges a file's drawers by their ``source_file``, so a file whose drawers are recorded under a
+previous home is filed a second time beside them. This mode rewrites ``source_file`` on those
+drawers to this location and changes nothing else, so the mine that follows is the in-place case
+(`relocate_source_file`). It takes the previous home as an argument, proves each file separately,
+**writes to the palace**, deletes nothing, and has a ``--dry-run`` form.
 
 **Three probes, or a sample** (issue #606, phase 3). By default the check searches for three real
 drawers (the oldest, middle and newest), which says whether a moved palace serves at all. Three
@@ -120,9 +108,7 @@ import contextlib
 import hashlib
 import io
 import logging
-import math
 import os
-import re
 import statistics
 import sys
 import time
@@ -137,15 +123,12 @@ from basecradle_harness._memory_provider import MemoryExchange, MemoryScope, _pa
 from basecradle_harness._mempalace import (
     _CONVERSATIONS_WING,
     _REGISTRY_ROOM,
-    ID_SOURCE_FILE,
     MemPalaceMemoryProvider,
     _import,
     candidate_pool,
     chunker_version,
     content_hashes,
     filed_by_observe,
-    mempalace_version,
-    recognises_content,
 )
 from basecradle_harness._observability import last_word, log_handler
 from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL, reranker_from_env
@@ -207,8 +190,7 @@ class Census:
     real: list[tuple[str, dict, str]] = field(default_factory=list)
     #: Real drawers whose ``source_file`` is not in this palace's ``conversations`` directory.
     elsewhere: list[tuple[str, dict, str]] = field(default_factory=list)
-    #: Real chunk-0 drawers with no ``content_hash`` (MemPalace's miner stamps none before 3.7 or
-    #: from 3.12, and nothing then proves the file after a move, issue #989). After a move, a mine
+    #: Real chunk-0 drawers with no ``content_hash`` (MemPalace before 3.7). After a move, a mine
     #: re-files their files as new drawers instead of recognising them.
     unhashed: int = 0
     files: int = 0
@@ -236,18 +218,6 @@ class Census:
     #: location (a moved home) a second time, beside the old drawers, which it keeps.
     stale_files_ours: int = 0
     stale_files_theirs: int = 0
-    #: The installed MemPalace's ``NORMALIZE_VERSION``; ``None`` when it defines none.
-    normalize: int | None = None
-    #: Whether the installed MemPalace recognises a moved file by its content (`recognises_content`).
-    by_content: bool = True
-    #: Conversation files on disk with a record at an older ``normalize_version`` and no record
-    #: MemPalace accepts, split the same way (issue #989). MemPalace 3.12 raised the version to 3,
-    #: and every drawer filed before it is at 2, the observe's included. Measured on 3.12.0: a mine
-    #: in place deletes such a file's drawers and files it again through its chunker (3 observe
-    #: drawers became 7, none kept), and one whose drawers are only at another location it files a
-    #: second time, beside them.
-    normalize_files_ours: int = 0
-    normalize_files_theirs: int = 0
 
 
 def census(collection, palace: Path) -> Census:
@@ -255,24 +225,16 @@ def census(collection, palace: Path) -> Census:
     convos = palace / _CONVERSATIONS_WING
     here = convos.resolve()
     prefix = str(here) + os.sep
-    module = _import("palace")
-    out = Census(
-        chunker=chunker_version(),
-        normalize=getattr(module, "NORMALIZE_VERSION", None),
-        by_content=recognises_content(),
-    )
-    normalize = out.normalize
+    out = Census(chunker=chunker_version())
+    normalize = getattr(_import("palace"), "NORMALIZE_VERSION", None) if out.chunker else None
     recorded: set[str] = set()
     # Per conversation file name (issue #751): names with a record MemPalace accepts, names with a
     # version-stale record, and, among the version-stale real drawers, names with one the observe
-    # filed and names with one it did not. The same three for a stale ``normalize_version``.
+    # filed and names with one it did not.
     current_names: set[str] = set()
     stale: set[str] = set()
     observed: set[str] = set()
     theirs: set[str] = set()
-    renormal: set[str] = set()
-    renormal_observed: set[str] = set()
-    renormal_theirs: set[str] = set()
     # Per recorded path at this location, per stored ``source_mtime``: drawers seen and the
     # ``chunk_total`` they claim. MemPalace's own completeness rule (``prefetch_mined_set``).
     groups: dict[str, dict[object, list]] = {}
@@ -292,9 +254,9 @@ def census(collection, palace: Path) -> Census:
             if source.startswith(prefix):
                 recorded.add(source)
             registry = meta.get("room") == _REGISTRY_ROOM
-            if _exchange_mode(meta) and (out.chunker is not None or normalize is not None):
+            if out.chunker is not None and _exchange_mode(meta):
                 name = Path(source).name
-                if out.chunker is not None and _version_stale(meta, out.chunker, normalize):
+                if _version_stale(meta, out.chunker, normalize):
                     stale.add(name)
                     # A registry row is MemPalace's bookkeeping, never a drawer: it says nothing
                     # about who filed the file, so only real drawers decide that.
@@ -305,18 +267,18 @@ def census(collection, palace: Path) -> Census:
                         (out.stale_ours if ours else out.stale_theirs).append(
                             (drawer_id, meta, text)
                         )
-                elif normalize is not None and _normalize_stale(meta, normalize):
-                    renormal.add(name)
-                    if not registry:
-                        ours = filed_by_observe(drawer_id, meta, text)
-                        (renormal_observed if ours else renormal_theirs).add(name)
-                elif _accepted(meta, source, prefix, normalize, out.by_content):
+                elif _accepted(meta, source, prefix, normalize):
                     current_names.add(name)
             if registry:
                 out.registry += 1
                 continue
             if source.startswith(prefix):
-                _count_in(groups.setdefault(source, {}), meta)
+                group = groups.setdefault(source, {}).setdefault(
+                    meta.get("source_mtime"), [0, None]
+                )
+                group[0] += 1
+                if meta.get("chunk_total") is not None:
+                    group[1] = meta.get("chunk_total")
             row = (drawer_id, meta, text)
             out.real.append(row)
             if not source.startswith(prefix):
@@ -334,44 +296,23 @@ def census(collection, palace: Path) -> Census:
                 out.stale_files_ours += 1
             else:
                 out.stale_files_theirs += 1
-        if path.name in renormal and path.name not in current_names:
-            if path.name in renormal_observed and path.name not in renormal_theirs:
-                out.normalize_files_ours += 1
-            else:
-                out.normalize_files_theirs += 1
     return out
 
 
-def _accepted(
-    meta: dict, source: str, prefix: str, normalize: int | None, by_content: bool
-) -> bool:
+def _accepted(meta: dict, source: str, prefix: str, normalize: int | None) -> bool:
     """Whether a current record is one MemPalace's miner would take as filing its file.
 
-    By path when it was filed at this location (``prefetch_mined_set``), or, on a MemPalace that
-    recognises a moved file by its content (before 3.12, `recognises_content`), by content when
-    it carries a hash in the observe's wing (``prefetch_content_hashes``, which reads one wing). A
-    current record anywhere else (another wing, another home, no hash, or any record elsewhere on
-    3.12) files nothing for a mine here. Its mtime is not compared: the forecast, which is
-    MemPalace's own, is the authority on that.
+    By path when it was filed at this location (``prefetch_mined_set``), or by content when it
+    carries a hash in the observe's wing (``prefetch_content_hashes``, which reads one wing). A
+    current record anywhere else (another wing, another home, no hash) files nothing for a mine
+    here. Its mtime is not compared: the forecast, which is MemPalace's own, is the authority on
+    that.
     """
-    if normalize is not None and _normalize_stale(meta, normalize):
+    if normalize is not None and meta.get("normalize_version", 1) < normalize:
         return False
     if source.startswith(prefix):
         return True
-    return by_content and meta.get("wing") == _CONVERSATIONS_WING and bool(meta.get("content_hash"))
-
-
-def _normalize_stale(meta: dict, normalize: int) -> bool:
-    """Whether MemPalace reads a record as unfiled because of its ``normalize_version``.
-
-    MemPalace's own rule (``palace._meta_is_current``): a record with none counts as version 1, and
-    one older than the installed constant is not filed, in any extract mode. A value that is not
-    a plain number MemPalace calls unprovable and reads as unfiled too.
-    """
-    version = meta.get("normalize_version", 1)
-    if not isinstance(version, (int, float)) or isinstance(version, bool) or math.isnan(version):
-        return True
-    return version < normalize
+    return meta.get("wing") == _CONVERSATIONS_WING and bool(meta.get("content_hash"))
 
 
 def _version_stale(meta: dict, chunker: int, normalize: int | None) -> bool:
@@ -382,7 +323,7 @@ def _version_stale(meta: dict, chunker: int, normalize: int | None) -> bool:
     filed. A record whose ``normalize_version`` is stale too is not this class: its reason is that
     one, and stamping the chunker version would not make it current.
     """
-    if normalize is not None and _normalize_stale(meta, normalize):
+    if normalize is not None and meta.get("normalize_version", 1) < normalize:
         return False
     return meta.get("convo_chunker_version", 1) < chunker
 
@@ -403,35 +344,20 @@ def _short(groups: dict[object, list] | None) -> bool:
 class Forecast:
     """What a mine of the conversation files would do, per MemPalace's own dry run."""
 
-    #: Files the mine recognises as already filed and files nothing for: at this path, or, before
-    #: MemPalace 3.12, by their content elsewhere, which writes one registry row each.
-    recognised: int
+    #: Files whose content is already filed elsewhere: each gets one registry row, no drawers.
+    duplicate: int
     #: Names of the files that will be mined as new drawers.
     new: list[str]
 
 
-#: The counts MemPalace's mine prints of the files it skipped as already filed and of the ones it
-#: read and did not skip (3.9 to 3.12).
-_SKIPPED = re.compile(r"^\s*Files skipped \(already filed\): (\d+)$")
-_PROCESSED = re.compile(r"^\s*Files processed: (\d+)$")
-
-
 def forecast(palace: Path, agent: str) -> Forecast | None:
-    """What a mine of the directory would do: which files it recognises, which it mines as new.
+    """What a mine of the directory would do: which files get a registry row, which are mined as new.
 
     MemPalace's own dry-run mine of the directory, with the arguments the adapter mined with until
-    0.164.0, read off the lines it prints: one per file it would mine, and its count of the files
-    it skipped as already filed. A file the observe filed is skipped by it: its drawers carry the
-    ``source_mtime`` and ``chunk_total`` the miner decides by (`MemPalaceMemoryProvider._file`),
-    so it is recognised here, and, after a move, by its ``content_hash`` before 3.12 or once
-    ``--relocate-source-file`` has recorded it here from 3.12 (issue #989).
-
-    ``None`` when the output cannot be read whole, so a changed upstream format is reported as
-    unknown rather than as a forecast of nothing: each count must be printed exactly once, and the
-    files MemPalace says it processed must be exactly the files named on a per-file line. A
-    per-file line in a wording this does not read would otherwise leave ``new`` empty beside a
-    readable skip count, a confident "0 new". The cost of the check is one honest unknown: a
-    conversation file that normalizes to nothing is processed and names no line.
+    0.164.0, read off the per-file lines it prints. A file the observe filed is skipped by it: its
+    drawers carry the ``source_mtime``, ``chunk_total`` and ``content_hash`` the miner decides by
+    (`MemPalaceMemoryProvider._file`), so it is neither new here nor, after a move, unrecognised. ``None`` when those lines cannot be read, so a changed upstream format
+    is reported as unknown rather than as a forecast of nothing.
     """
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
@@ -444,34 +370,14 @@ def forecast(palace: Path, agent: str) -> Forecast | None:
             dry_run=True,
         )
     lines = out.getvalue().splitlines()
-    skipped = [int(match.group(1)) for line in lines if (match := _SKIPPED.match(line))]
+    duplicate = sum("duplicate of" in line for line in lines)
     # "    [DRY RUN] <name> -> room:<room> (<n> drawers)"
     new = [
         line.split("[DRY RUN]", 1)[1].split("->", 1)[0].strip()
         for line in lines
         if "[DRY RUN]" in line and "->" in line
     ]
-    processed = [int(match.group(1)) for line in lines if (match := _PROCESSED.match(line))]
-    if len(skipped) != 1 or processed != [len(new)]:
-        return None
-    return Forecast(skipped[0], new)
-
-
-def forecast_line(predicted: Forecast | None) -> str:
-    """The forecast's summary line, which the NOC's rename flow matches whole (``FORECAST_RE``).
-
-    ``next observe (dry run): <r> files -> recognised, <n> files -> mined as new drawers``. It keeps
-    the words "next observe" for that reader, though since 0.164.0 the observe never mines
-    (issue #741). Until 3.12 the first count named a registry sentinel, the row a mine wrote for a
-    file it recognised by its content; 3.12 recognises a file by its path alone and writes none,
-    so the count names what both do (issue #989).
-    """
-    if predicted is None:
-        return "next observe (dry run): unknown, MemPalace's dry-run output was not readable"
-    return (
-        f"next observe (dry run): {predicted.recognised} files -> recognised, "
-        f"{len(predicted.new)} files -> mined as new drawers"
-    )
+    return Forecast(duplicate, new) if duplicate or new else None
 
 
 def accepted_hashes(open_collection: Callable[[], Any]) -> dict | None:
@@ -516,11 +422,7 @@ def new_file_diagnosis(found: Census, convos: Path, name: str, accepted: dict | 
     try:
         today = _today(convos / name)
         matches = "yes" if set(today) & stored else "no"
-        reason = (
-            _new_reason(found, here, today, bool(hashed), bool(rows), accepted)
-            if found.by_content
-            else _path_reason(found, convos / name, here)
-        )
+        reason = _new_reason(found, here, today, bool(hashed), bool(rows), accepted)
     except ImportError:
         raise
     except Exception as error:  # noqa: BLE001 - a diagnosis line, never a crash of the check
@@ -612,7 +514,7 @@ def _new_reason(
         modes = ", ".join(sorted({str(meta.get("extract_mode") or "-") for meta in in_wing}))
         return f"its content is filed only under extract_mode {modes}, not exchange{count}"
     current = getattr(_import("palace"), "NORMALIZE_VERSION", None)
-    if current is not None and all(_normalize_stale(meta, current) for meta in exchange):
+    if current is not None and all(meta.get("normalize_version", 1) < current for meta in exchange):
         versions = ", ".join(sorted({str(meta.get("normalize_version", 1)) for meta in exchange}))
         return (
             f"its content is filed only at normalize_version {versions}, older than "
@@ -631,110 +533,29 @@ def _new_reason(
         and _version_stale(row[1], chunker, current)
     ]
     if chunked:
-        return _chunker_reason(chunked, chunker, here) + count
+        exchange = [meta for _, meta, _ in chunked]
+        versions = ", ".join(
+            sorted({str(meta.get("convo_chunker_version", 1)) for meta in exchange})
+        )
+        ours = all(filed_by_observe(*row) for row in chunked)
+        remedy = (
+            "; the observe filed it, so --stamp-chunker-version makes it current"
+            if ours
+            else "; MemPalace's miner filed it, and it is left to MemPalace"
+        )
+        located = any(str(meta.get("source_file")) == here for meta in exchange)
+        effect = (
+            "a mine deletes its drawers here and files it again through MemPalace's chunker"
+            if located
+            else "a mine files it again here, beside its old drawers, which it keeps"
+        )
+        return (
+            f"version-stale: its content is filed only at convo_chunker_version {versions}, older "
+            f"than MemPalace's {chunker}, by an earlier MemPalace; {effect}{remedy}{count}"
+        )
     return (
         f"MemPalace does not accept its recorded hash, for a reason this check cannot name{count}"
     )
-
-
-def _chunker_reason(chunked: list[tuple[str, dict, str]], chunker: int, here: str) -> str:
-    """The version-stale reason for drawers stale by their chunker version alone (issue #751)."""
-    exchange = [meta for _, meta, _ in chunked]
-    versions = ", ".join(sorted({str(meta.get("convo_chunker_version", 1)) for meta in exchange}))
-    ours = all(filed_by_observe(*row) for row in chunked)
-    remedy = (
-        "; the observe filed it, so --stamp-chunker-version makes it current"
-        if ours
-        else "; MemPalace's miner filed it, and it is left to MemPalace"
-    )
-    return (
-        f"version-stale: its content is filed only at convo_chunker_version {versions}, older "
-        f"than MemPalace's {chunker}, by an earlier MemPalace; {_effect(exchange, here)}{remedy}"
-    )
-
-
-def _effect(exchange: list[dict], here: str) -> str:
-    """What a mine does to a file whose records it does not accept, by where they are filed."""
-    if any(str(meta.get("source_file")) == here for meta in exchange):
-        return "a mine deletes its drawers here and files it again through MemPalace's chunker"
-    return "a mine files it again here, beside its old drawers, which it keeps"
-
-
-def _path_reason(found: Census, path: Path, here: str) -> str:
-    """Why a MemPalace that recognises a file by its path alone (3.12) files ``path`` as new.
-
-    The mine looks for a complete set of current drawers recorded at this exact path whose
-    ``source_mtime`` is the file's own (``prefetch_mined_set``), and nothing else: not the content,
-    not another location, and not the wing. So the reason is read off the drawers recorded under
-    this file name, here first, and then elsewhere.
-    """
-    name = path.name
-    rows = [row for row in found.real if Path(str(row[1].get("source_file") or "")).name == name]
-    if not rows:
-        return "it was never filed"
-    exchange = [row for row in rows if _exchange_mode(row[1])]
-    located = [row for row in exchange if str(row[1].get("source_file")) == here]
-    if not located:
-        if not exchange:
-            return "it is filed only under another extract_mode, not exchange"
-        effect = (
-            "it is filed only at another location, and this MemPalace recognises a file by its "
-            "path alone, so a mine files it again here, beside its old drawers, which it keeps"
-        )
-        ours = [filed_by_observe(*row) for row in exchange]
-        held = _why_not_observed(exchange, found) if ours and all(ours) else None
-        if held is not None:
-            return f"{effect}; --relocate-source-file leaves it alone: {held}"
-        return (
-            f"{effect}; --relocate-source-file records a file moved from a previous home here, "
-            "once it proves it is the same file"
-        )
-    normalize, chunker = found.normalize, found.chunker
-    renormal = [
-        row for row in located if normalize is not None and _normalize_stale(row[1], normalize)
-    ]
-    if renormal:
-        return _normalize_reason(renormal, normalize or 0, here)
-    chunked = [
-        row for row in located if chunker is not None and _version_stale(row[1], chunker, normalize)
-    ]
-    if chunked:
-        return _chunker_reason(chunked, chunker or 0, here)
-    if _short(_groups(located)):
-        return "it was filed here short of its drawers, so a mine deletes them and files it again"
-    return "it changed since it was filed here, and a mine deletes its drawers and files it again"
-
-
-def _normalize_reason(rows: list[tuple[str, dict, str]], normalize: int, here: str) -> str:
-    """The reason for drawers MemPalace reads as unfiled by their ``normalize_version`` (#989)."""
-    exchange = [meta for _, meta, _ in rows]
-    versions = ", ".join(sorted({str(meta.get("normalize_version", 1)) for meta in exchange}))
-    ours = all(filed_by_observe(*row) for row in rows)
-    remedy = (
-        "; the observe filed it, and this harness has no step that makes it current"
-        if ours
-        else "; MemPalace's miner filed it, and it is left to MemPalace"
-    )
-    return (
-        f"normalize-stale: its content is filed only at normalize_version {versions}, older than "
-        f"MemPalace's {normalize}; {_effect(exchange, here)}{remedy}"
-    )
-
-
-def _groups(rows: list[tuple[str, dict, str]]) -> dict[object, list]:
-    """Per stored ``source_mtime``: drawers seen and the ``chunk_total`` they claim (`_short`)."""
-    groups: dict[object, list] = {}
-    for _, meta, _ in rows:
-        _count_in(groups, meta)
-    return groups
-
-
-def _count_in(groups: dict[object, list], meta: dict) -> None:
-    """Count one drawer into its ``source_mtime`` group: MemPalace's completeness rule's input."""
-    group = groups.setdefault(meta.get("source_mtime"), [0, None])
-    group[0] += 1
-    if meta.get("chunk_total") is not None:
-        group[1] = meta.get("chunk_total")
 
 
 def _exchange_mode(meta: dict) -> bool:
@@ -799,26 +620,6 @@ def register_off_wing(provider: MemPalaceMemoryProvider, palace: Path, *, dry_ru
     """
     word = "dry run, writes nothing" if dry_run else "WRITES TO THE PALACE"
     print(f"register off-wing ({word}):")
-    if not recognises_content():
-        # The registry row this writes is the one a mine writes for content it recognises, and
-        # 3.12 recognises none: a single-file mine there files drawers, never a row. A moved
-        # off-wing file is recorded at its new path by --relocate-source-file instead (#989).
-        version = mempalace_version() or "?"
-        print(
-            f"  nothing to register: MemPalace {version} recognises a moved file by its path "
-            "alone; --relocate-source-file records a moved off-wing file here"
-        )
-        if dry_run:
-            print(
-                "register off-wing (dry run): files to register 0, registry rows to write 0, "
-                "drawers to write 0"
-            )
-        else:
-            print(
-                "register off-wing: WROTE to this palace: files registered 0, "
-                "registry rows written 0, drawers written 0"
-            )
-        return 0
     collection = _import("palace").get_collection(str(palace), create=False, read_only=True)
     found = census(collection, palace)
     predicted = forecast(palace, provider.agent) if found.unregistered else Forecast(0, [])
@@ -909,35 +710,6 @@ def stale_line(found: Census) -> str:
     )
 
 
-#: What the normalize-stale line's second half says, printed whenever a file is normalize-stale.
-NORMALIZE_CONSEQUENCE = (
-    "a mine deletes each normalize-stale file's drawers filed at this location and files it again "
-    "through MemPalace's chunker, the observe's included, and files each one filed only at "
-    "another location a second time, beside its old drawers; nothing in this harness makes the "
-    "observe's current, and each file's reason: line says what --relocate-source-file does for it"
-)
-
-
-def normalize_line(found: Census) -> str:
-    """The normalize-stale count, the version-stale line's sibling (issue #989), always printed.
-
-    ``conversation files normalize-stale: <n> (observe-filed <a>, miner-filed <b>), <why>``, in the
-    version-stale line's grammar so one reader parses both. MemPalace 3.12 raised the version to 3
-    and every drawer filed before it is at 2, so on 3.12 this counts every file a palace filed
-    before the upgrade.
-    """
-    ours, theirs = found.normalize_files_ours, found.normalize_files_theirs
-    why = (
-        f"normalize_version older than MemPalace's {found.normalize}"
-        if found.normalize is not None
-        else "this MemPalace defines no normalize_version"
-    )
-    return (
-        f"conversation files normalize-stale: {ours + theirs} "
-        f"(observe-filed {ours}, miner-filed {theirs}), {why}"
-    )
-
-
 def stamp_chunker_version(palace: Path, *, dry_run: bool) -> int:
     """Stamp the observe's own version-stale drawers with the installed chunker version (#751).
 
@@ -1010,102 +782,38 @@ class Relocation:
     files: dict[str, list[tuple[str, dict]]] = field(default_factory=dict)
     #: ``(name, reason)`` for each file a mine would duplicate that this cannot prove.
     left_alone: list[tuple[str, str]] = field(default_factory=list)
-    #: The proven files whose drawers the observe filed (issue #989): each keeps the path its id
-    #: was derived from in `ID_SOURCE_FILE`.
-    observed: set[str] = field(default_factory=set)
-    #: Per proven file, its ``source_mtime`` today, read after the proof; ``None`` when its drawers
-    #: are not one complete filing, whose mtime is never aligned (`relocated`).
-    mtimes: dict[str, float | None] = field(default_factory=dict)
 
     @property
     def drawers(self) -> int:
         return sum(len(rows) for rows in self.files.values())
 
 
-def _reads_back(back: dict | None, expected: dict) -> bool:
-    """Whether a rewritten drawer reads back as `relocated` wrote it.
-
-    Exactly, but for a float: MemPalace 3.12's store keeps one to the microsecond (measured: a
-    ``source_mtime`` of ``…687.4985867`` read back as ``…687.498587``), so an aligned mtime is
-    compared within that and nothing looser. Every other value, and every key, must match.
-    """
-    if back is None or set(back) != set(expected):
-        return False
-    for key, want in expected.items():
-        got = back[key]
-        if isinstance(want, float) and isinstance(got, (int, float)) and not isinstance(got, bool):
-            if abs(got - want) > 1e-6:
-                return False
-        elif got != want:
-            return False
-    return True
-
-
-def relocated(meta: dict, path: str, *, observed: bool, mtime: float | None, current: bool) -> dict:
-    """A proven drawer's metadata at its new path: what `_write_relocation` writes and reads back.
-
-    ``source_file`` is the new path. An observe drawer keeps the path its id was derived from:
-    `ID_SOURCE_FILE` is written as its old ``source_file`` when it carries none yet, and never
-    rewritten once it does, so `filed_by_observe` still holds of it (issue #989). A drawer the
-    mine would take as current takes the file's ``source_mtime`` today when the move changed it,
-    within MemPalace's own tolerance (``_is_unchanged_since_last_mine``), and only then: that is
-    what makes the mine skip it rather than file it again. A stale drawer keeps its own, because
-    the mine files it again in place whatever its mtime, and so does one of a file whose drawers
-    are not one complete filing (``mtime`` ``None``): aligning drawers from two filings would merge
-    them into one group a mine could read as complete. Nothing else changes.
-    """
-    out = {**meta, "source_file": path}
-    if observed and out.get(ID_SOURCE_FILE) is None:
-        out[ID_SOURCE_FILE] = meta.get("source_file")
-    stored = meta.get("source_mtime")
-    if (
-        current
-        and mtime is not None
-        and isinstance(stored, (int, float))
-        and abs(stored - mtime) >= 0.001
-    ):
-        out["source_mtime"] = mtime
-    return out
-
-
 def _unfiled(meta: dict, chunker: int, normalize: int | None) -> bool:
     """Whether MemPalace reads an exchange-mode record as unfiled (``palace._meta_is_current``)."""
     return meta.get("convo_chunker_version", 1) < chunker or (
-        normalize is not None and _normalize_stale(meta, normalize)
+        normalize is not None and meta.get("normalize_version", 1) < normalize
     )
 
 
 def _why_not_relocatable(
-    rows: list[tuple[str, dict, str]], here: Path, old: Path, found: Census
+    rows: list[tuple[str, dict, str]], here: Path, old: Path, chunker: int, normalize: int | None
 ) -> str | None:
     """Why this file's drawers may not be rewritten to ``here``, or ``None`` when they may.
 
     ``rows`` is every real drawer recorded under the file's name, wherever it was filed. A file is
-    moved whole or not at all, and each check names a way the rewrite would be false or useless.
-    Every MemPalace:
+    moved whole or not at all, and each check names a way the rewrite would be false or useless:
 
     - the file must be here, or there is nothing for a mine to read;
     - the recorded path must be gone, or the file was never moved;
     - every drawer must be at the previous location, so the rewrite does not merge two filings;
+    - every drawer must be in the observe's wing, which is the one a mine of ``conversations/``
+      purges;
+    - no drawer may be the observe's, because its id is derived from ``source_file`` (the rewrite
+      would make `filed_by_observe` false of it) and the mine recognises it by content anyway;
+    - every drawer must be stale by its chunker version alone, the class measured here (a current
+      drawer is recognised by the mine, and a stale ``normalize_version`` is another migration);
     - the content hashes the drawers carry must be today's hashes of the file here, which is what
-      makes it the same file and not merely the same name. Checked last, because it reads the file.
-
-    A MemPalace that recognises a moved file by its content (before 3.12) recognises a current
-    drawer at another location without help, so only the class measured on 3.11 is moved
-    (issue #831): every drawer in the observe's wing, none of them the observe's (whose stale
-    drawers `stamp_chunker_version` makes current, and then recognised), and every one stale by
-    its chunker version alone. An off-wing file is `register_off_wing`'s there.
-
-    A MemPalace that recognises a file by its path alone (3.12, issue #989) recognises nothing at
-    another location, so every file there is moved that proves itself:
-
-    - every drawer is in one wing (a mine skips a file by its path whatever the wing, so an
-      off-wing file filed whole in its own wing is recorded here like any other);
-    - the observe's file is the observe's whole, and current by every version: relocated stale,
-      a mine would delete its drawers and cut it again through MemPalace's chunker, which turns a
-      second copy into a re-chunk rather than preventing either, so it is left alone and named;
-    - MemPalace's miner's may be current (the mine then skips it) or stale (the mine files it
-      again in place, upstream's own migration, as on 3.11), but must be in exchange mode.
+      makes it the same file and not merely the same name.
     """
     try:
         present = here.is_file()
@@ -1123,14 +831,19 @@ def _why_not_relocatable(
         return "its recorded path still exists, so it was not moved"
     if {str(meta.get("source_file")) for _, meta, _ in rows} != {str(old)}:
         return "it has drawers recorded somewhere other than the previous home"
-    why = (_why_not_by_content if found.by_content else _why_not_by_path)(rows, found)
-    if why is not None:
-        return why
+    wings = sorted({str(meta.get("wing") or "-") for _, meta, _ in rows})
+    if wings != [_CONVERSATIONS_WING]:
+        return f"it has drawers in wing {', '.join(wings)}, not only {_CONVERSATIONS_WING!r}"
+    if any(filed_by_observe(*row) for row in rows):
+        return "the observe filed it; --stamp-chunker-version makes it current"
+    if not all(
+        _exchange_mode(meta) and _version_stale(meta, chunker, normalize) for _, meta, _ in rows
+    ):
+        return "not every drawer is stale by its chunker version alone, the class this relocates"
     stored = {h for _, meta, _ in rows for h in _hashes(meta)}
     if not stored:
         return (
-            "its drawers carry no content hash (MemPalace's miner stamped one from 3.7 until "
-            "3.12), so nothing proves it"
+            "its drawers carry no content hash (filed before MemPalace 3.7), so nothing proves it"
         )
     try:
         today = set(_today(here))
@@ -1143,80 +856,16 @@ def _why_not_relocatable(
     return None
 
 
-def _why_not_by_content(rows: list[tuple[str, dict, str]], found: Census) -> str | None:
-    """The rules for a MemPalace that recognises a moved file by its content (`_why_not_relocatable`)."""
-    chunker, normalize = found.chunker or 0, found.normalize
-    wings = sorted({str(meta.get("wing") or "-") for _, meta, _ in rows})
-    if wings != [_CONVERSATIONS_WING]:
-        return f"it has drawers in wing {', '.join(wings)}, not only {_CONVERSATIONS_WING!r}"
-    if any(filed_by_observe(*row) for row in rows):
-        # Considered only because a drawer is stale, so this names which way; a current observe
-        # file at another location is recognised by its content and never reaches here.
-        return _why_not_observed(rows, found) or (
-            "the observe filed it, and this MemPalace recognises it by its content"
-        )
-    if not all(
-        _exchange_mode(meta) and _version_stale(meta, chunker, normalize) for _, meta, _ in rows
-    ):
-        return "not every drawer is stale by its chunker version alone, the class this relocates"
-    return None
-
-
-def _why_not_by_path(rows: list[tuple[str, dict, str]], found: Census) -> str | None:
-    """The rules for a MemPalace that recognises a file by its path alone (`_why_not_relocatable`)."""
-    wings = sorted({str(meta.get("wing") or "-") for _, meta, _ in rows})
-    if len(wings) != 1 or wings == ["-"]:
-        return f"it has drawers in wing {', '.join(wings)}, not in one wing"
-    if not all(_exchange_mode(meta) for _, meta, _ in rows):
-        return "not every drawer is in exchange mode, the mode a mine of conversations/ reads"
-    ours = [filed_by_observe(*row) for row in rows]
-    if not any(ours):
-        return None
-    if not all(ours):
-        return "it has drawers the observe filed and drawers MemPalace's miner filed"
-    return _why_not_observed(rows, found)
-
-
-def _why_not_observed(rows: list[tuple[str, dict, str]], found: Census) -> str | None:
-    """Why the observe's file may not be relocated, or ``None``: it must be one current filing.
-
-    Relocated stale, a mine deletes its drawers and cuts it again through MemPalace's chunker,
-    which turns a second copy into a re-chunk rather than preventing either (issue #989).
-    """
-    chunker, normalize = found.chunker or 0, found.normalize
-    renormal = sorted(
-        {
-            str(meta.get("normalize_version", 1))
-            for _, meta, _ in rows
-            if normalize is not None and _normalize_stale(meta, normalize)
-        }
-    )
-    if renormal:
-        return (
-            f"the observe filed it at normalize_version {', '.join(renormal)}, older than "
-            f"MemPalace's {normalize}, so a mine files it again wherever it is recorded, and this "
-            "harness has no step that makes it current"
-        )
-    if any(_version_stale(meta, chunker, normalize) for _, meta, _ in rows):
-        return (
-            "the observe filed it under an older chunker; --stamp-chunker-version makes it current"
-        )
-    if _short(_groups(rows)) or len(_groups(rows)) != 1:
-        return "its drawers are not one complete filing, so a mine files it again wherever it is"
-    return None
-
-
-def relocation(found: Census, convos: Path, previous: Path) -> Relocation:
+def relocation(found: Census, convos: Path, previous: Path, normalize: int | None) -> Relocation:
     """Which files ``--relocate-source-file`` proves, read off the census.
 
     A file is considered when a real drawer recorded in the previous home's ``conversations``
-    directory under the file's name is one a mine here would file a second time, so it is either
-    relocated here or named. Before MemPalace 3.12 that is a drawer the miner reads as unfiled, by
-    its chunker version or its ``normalize_version``: a current one it recognises by its content.
-    From 3.12, which recognises a file by its path alone, it is every exchange-mode drawer there
-    (issue #989).
+    directory under the file's name is one the miner reads as unfiled, by its chunker version or
+    its ``normalize_version``: that is what a mine would file a second time, so it is either
+    relocated here or named. A drawer the miner reads as current is recognised by its content and
+    needs nothing, so it is not considered and not reported.
     """
-    chunker, normalize = found.chunker, found.normalize
+    chunker = found.chunker
     out = Relocation()
     if chunker is None:
         return out
@@ -1230,29 +879,16 @@ def relocation(found: Census, convos: Path, previous: Path) -> Relocation:
             for _, meta, _ in found.elsewhere
             if str(Path(str(meta.get("source_file"))).parent) == old_dir
             and _exchange_mode(meta)
-            and (not found.by_content or _unfiled(meta, chunker, normalize))
+            and _unfiled(meta, chunker, normalize)
         }
     )
     for name in considered:
         rows = named[name]
-        # Stat before the proof reads the file: a change after the stat then shows as an mtime the
-        # mine does not match, and is filed again, where a stat after the hash could certify
-        # content the hash never read (the order MemPalace keeps, one fstat with the read).
-        try:
-            mtime: float | None = os.path.getmtime(convos / name)
-        except OSError:
-            mtime = None
-        why = _why_not_relocatable(rows, convos / name, Path(old_dir) / name, found)
-        if why is None and mtime is None:
-            why = "it could not be read (OSError)"
-        if why is not None:
+        why = _why_not_relocatable(rows, convos / name, Path(old_dir) / name, chunker, normalize)
+        if why is None:
+            out.files[name] = [(drawer_id, meta) for drawer_id, meta, _ in rows]
+        else:
             out.left_alone.append((name, why))
-            continue
-        out.files[name] = [(drawer_id, meta) for drawer_id, meta, _ in rows]
-        groups = _groups(rows)
-        out.mtimes[name] = mtime if len(groups) == 1 and not _short(groups) else None
-        if any(filed_by_observe(*row) for row in rows):
-            out.observed.add(name)
     return out
 
 
@@ -1275,33 +911,23 @@ def _whole_files(files: dict[str, list[tuple[str, dict]]], size: int) -> list[li
 
 
 def relocate_source_file(palace: Path, home: Path, previous: Path, *, dry_run: bool) -> int:
-    """Record a moved palace's old-home drawers at this location, so a mine never files them twice.
+    """Record a moved palace's old-home drawers at this location, so a mine re-chunks them in place.
 
     MemPalace's mine finds what to purge by ``source_file`` alone, plus the extract mode
     (``convo_miner._source_file_delete_ids``). After a home move the drawers still name the old
     path, so a mine of the file here deletes nothing and files every drawer a second time. Measured
     on a palace mined under 3.10.0, moved and mined under 3.11.0: 215 drawers became 430; with
     ``source_file`` rewritten first they became exactly the 215 the dry run planned, with no
-    duplicate, and the mine removed the registry rows a rename left at the new path.
-    ``source_dir_ino`` is never changed. Only ``sync`` reads it, and a drawer whose home was copied
-    rather than renamed keeps the old directory's identity, which ``sync`` reads as unresolved and
-    keeps, never deletes; rewriting it would be a second claim about where a file came from.
-
-    **On MemPalace 3.12 it is the whole of a moved home's recognition** (issue #989, `@briggs`'s
-    rule, decided by `@origin`). 3.12 recognises a file at its recorded path only, so every file a
-    move left at another location is considered, the observe's included: a current one is then
-    skipped by the mine, and a stale miner-filed one re-filed in place. What a rewrite writes is
-    `relocated`'s: the new ``source_file``; for an observe drawer, `ID_SOURCE_FILE` as the old path
-    when it carries none, never rewritten, so `filed_by_observe` still holds of it; and for a
-    current drawer, the file's ``source_mtime`` today when the move changed it, after the proof.
-    The rules each file proves itself by are `_why_not_relocatable`'s.
+    duplicate, and the mine removed the registry rows a rename left at the new path. No other
+    field takes part, so no other field changes, ``source_dir_ino`` included (only ``sync`` reads
+    it, the old drawers do not carry it, and the mine replaces these drawers).
 
     ``previous`` is the ``HARNESS_HOME`` the palace used to live under, stated by whoever runs
     this; each file must then prove itself against it (`_why_not_relocatable`). Registry rows are
     never touched. **Nothing here deletes a drawer**: the count of drawers and rows is compared
     before and after, and every rewritten drawer is read back by id and must hold exactly its old
-    metadata with `relocated`'s changes. Idempotent: a rewritten drawer is at this location, so a
-    second run finds nothing. Holds MemPalace's per-palace lock from the plan's read to the last write,
+    metadata with the new path. Idempotent: a rewritten drawer is at this location, so a second run
+    finds nothing. Holds MemPalace's per-palace lock from the plan's read to the last write,
     because a mine that read the palace before this ran would file the drawers beside themselves;
     every other writer fails against that lock too, an observe included, so run it with the
     agent's wakes held. Returns the exit code.
@@ -1316,10 +942,11 @@ def relocate_source_file(palace: Path, home: Path, previous: Path, *, dry_run: b
     module = _import("palace")
     previous_palace = previous / palace.relative_to(home)
     convos = (palace / _CONVERSATIONS_WING).resolve()
+    normalize = getattr(module, "NORMALIZE_VERSION", None)
 
     def plan(collection) -> tuple[Census, Relocation]:
         found = census(collection, palace)
-        return found, relocation(found, convos, previous_palace)
+        return found, relocation(found, convos, previous_palace, normalize)
 
     def tail(found: Census, moved: Relocation) -> str:
         return (
@@ -1357,15 +984,8 @@ def _write_relocation(
     another process has touched ``chroma.sqlite3``, MemPalace's backend closes its clients on the
     next open, and every collection it had handed out with them (``ChromaBackend._drain_clients``).
     """
-    chunker, normalize = found.chunker or 0, found.normalize
     expected = {
-        drawer_id: relocated(
-            meta,
-            str(convos / name),
-            observed=name in moved.observed,
-            mtime=moved.mtimes[name],
-            current=not _unfiled(meta, chunker, normalize),
-        )
+        drawer_id: {**meta, "source_file": str(convos / name)}
         for name, rows in moved.files.items()
         for drawer_id, meta in rows
     }
@@ -1379,9 +999,7 @@ def _write_relocation(
         batch = ids[start : start + _PAGE]
         got = collection.get(ids=batch, include=["metadatas"])
         back = dict(zip(got.get("ids") or [], got.get("metadatas") or []))
-        wrong += sum(
-            not _reads_back(back.get(drawer_id), expected[drawer_id]) for drawer_id in batch
-        )
+        wrong += sum(back.get(drawer_id) != expected[drawer_id] for drawer_id in batch)
     fresh = census(collection, palace)
     after = (len(fresh.real), fresh.registry)
     print(
@@ -1780,12 +1398,10 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "WRITES TO THE PALACE. Before the report, rewrite source_file to this location on the "
             "drawers of each conversation file filed only under --previous-home, so a mine "
-            "re-chunks it in place, or skips it, instead of filing it a second time. Each file "
-            "must prove it was moved: its recorded path gone, the same content here. Before "
-            "MemPalace 3.12 only MemPalace's miner's version-stale files are moved; from 3.12 "
-            "every file that proves itself, an observe file only when it is current, keeping the "
-            "path its id was derived from. Deletes nothing, and a second run finds nothing. Add "
-            "--dry-run to print what it would do."
+            "re-chunks it in place instead of filing it a second time. Each file must prove it "
+            "was moved: its recorded path gone, the same content here, every drawer version-stale "
+            "and MemPalace's miner's. Deletes nothing, changes no other field, and a second run "
+            "finds nothing. Add --dry-run to print what it would do."
         ),
     )
     parser.add_argument(
@@ -2013,10 +1629,7 @@ def main(argv: list[str] | None = None) -> int:
             f"{found.registry} registry sentinels"
         )
         print(f"real drawers filed at another location: {len(found.elsewhere)}")
-        print(
-            "real chunk-0 drawers without content_hash (MemPalace's miner stamps none before 3.7 "
-            f"or from 3.12): {found.unhashed}"
-        )
+        print(f"real chunk-0 drawers without content_hash (pre-3.7 schema): {found.unhashed}")
         print(
             f"conversation files: {found.files}, "
             f"not yet registered at this location: {found.unregistered}"
@@ -2025,24 +1638,24 @@ def main(argv: list[str] | None = None) -> int:
         print(stale_line(found))
         if found.stale_files_ours or found.stale_files_theirs:
             print(f"  {STALE_CONSEQUENCE}")
-        print(normalize_line(found))
-        if found.normalize_files_ours or found.normalize_files_theirs:
-            print(f"  {NORMALIZE_CONSEQUENCE}")
-        # The forecast names conversation files, and is the move check's business. Its line is
-        # matched whole by the NOC's rename flow (`FORECAST_RE` in basecradle-noc), as is the
-        # "conversation files:" line above (`forecast_line`).
-        stale = (
-            found.stale_files_ours
-            + found.stale_files_theirs
-            + found.normalize_files_ours
-            + found.normalize_files_theirs
-        )
+        # The forecast names conversation files, and is the move check's business. Its line keeps
+        # the words "next observe" because the NOC's rename flow matches it whole (`FORECAST_RE` in
+        # basecradle-noc), as it does the "conversation files:" line above; it forecasts a mine of
+        # the directory, which since 0.164.0 the observe never runs (issue #741).
+        stale = found.stale_files_ours + found.stale_files_theirs
         if (found.unregistered or found.short or stale) and paths:
             predicted = forecast(palace, provider.agent)
-            print(forecast_line(predicted))
-            if predicted is not None and predicted.new:
+            if predicted is None:
+                print(
+                    "next observe (dry run): unknown, MemPalace's dry-run output was not readable"
+                )
+            else:
+                print(
+                    f"next observe (dry run): {predicted.duplicate} files -> registry sentinel, "
+                    f"{len(predicted.new)} files -> mined as new drawers"
+                )
                 convos = palace / _CONVERSATIONS_WING
-                accepted = accepted_hashes(provider.read_collection) if found.by_content else None
+                accepted = accepted_hashes(provider.read_collection) if predicted.new else None
                 for new_name in predicted.new:
                     print(new_file_diagnosis(found, convos, new_name, accepted))
         if reranker is not None:

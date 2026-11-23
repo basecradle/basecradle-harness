@@ -79,7 +79,6 @@ def _drawers(home, *, registered_here=0, unhashed=0):
             "filed_at": f"2026-09-0{index + 1}T00:00:00",
             "chunk_index": 0,
             "room": "technical",
-            "normalize_version": 2,
         }
         if index >= unhashed:
             meta["content_hash"] = f"{index:064x}"
@@ -105,8 +104,6 @@ def fake(monkeypatch):
         missing=set(),
         cut=set(),
         dry_run_lines=None,
-        skipped=0,
-        processed=None,
         hash_map_fails=False,
         simulate=False,
         misbehave=False,
@@ -180,11 +177,6 @@ def fake(monkeypatch):
             _simulate_mine(state, Path(convo_dir), kwargs, prefetch_content_hashes)
         elif kwargs.get("dry_run") and state.dry_run_lines is not None:
             print("\n".join(state.dry_run_lines))
-            if state.skipped is not None:
-                named = sum("[DRY RUN]" in line for line in state.dry_run_lines)
-                processed = named if state.processed is None else state.processed
-                print(f"  Files processed: {processed}")
-                print(f"  Files skipped (already filed): {state.skipped}")
 
     def file_conversation_exchange(collection, **kwargs):
         state.filed.append(kwargs)
@@ -219,11 +211,9 @@ def _simulate_mine(state, path, kwargs, prefetch_content_hashes):
     wing, dry = kwargs["wing"], kwargs.get("dry_run")
     known = {meta.get("source_file") for _, meta in drawers.values()}
     accepted = prefetch_content_hashes(state.collection, extract_mode="exchange")
-    skipped = processed = 0
     for file in sorted(path.glob("*.md")) if path.is_dir() else [path]:
         source = str(file.resolve())
         if source in known:
-            skipped += 1
             continue
         text = file.read_text(encoding="utf-8")
         content_hash = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
@@ -236,9 +226,7 @@ def _simulate_mine(state, path, kwargs, prefetch_content_hashes):
                     {"source_file": source, "room": "_registry", "wing": wing},
                 )
             if not (state.misbehave and not dry):
-                skipped += 1
                 continue
-        processed += 1
         if dry:
             print(f"    [DRY RUN] {file.name} -> room:general (1 drawers)")
             continue
@@ -253,8 +241,6 @@ def _simulate_mine(state, path, kwargs, prefetch_content_hashes):
                 normalize_version=2,
             ),
         )
-    print(f"  Files processed: {processed}")
-    print(f"  Files skipped (already filed): {skipped}")
 
 
 def _run(capsys, *argv):
@@ -297,18 +283,17 @@ def test_the_report_counts_what_a_moved_palace_holds(home, fake, capsys):
         f"  = [   2/4] {NAMES[2]}  duplicate of {NAMES[2]}",
         f"    [DRY RUN] {NAMES[3]} -> room:technical (1 drawers)",
     ]
-    fake.skipped = 3  # the registered file by its path, the two duplicates by their content
 
     _, lines = _run(capsys, home)
 
     assert "drawers: 5 total, 4 real, 1 registry sentinels" in lines
     assert "real drawers filed at another location: 4" in lines
-    assert (
-        "real chunk-0 drawers without content_hash (MemPalace's miner stamps none before 3.7 or "
-        "from 3.12): 2"
-    ) in lines
+    assert "real chunk-0 drawers without content_hash (pre-3.7 schema): 2" in lines
     assert "conversation files: 4, not yet registered at this location: 3" in lines
-    assert "next observe (dry run): 3 files -> recognised, 1 files -> mined as new drawers" in lines
+    assert (
+        "next observe (dry run): 2 files -> registry sentinel, 1 files -> mined as new drawers"
+        in (lines)
+    )
 
 
 def test_a_filing_cut_short_is_counted_and_forecast(home, fake, capsys):
@@ -331,44 +316,28 @@ def test_a_filing_cut_short_is_counted_and_forecast(home, fake, capsys):
                 "chunk_index": 0,
                 "filed_at": f"2026-10-0{index + 1}T00:00:00",
                 "room": "general",
-                "normalize_version": 2,
             },
         )
     fake.collection = FakeCollection(drawers)
     fake.dry_run_lines = [f"    [DRY RUN] {NAMES[0]} -> room:general (3 drawers)"]
-    fake.skipped = 3
 
     _, lines = _run(capsys, home)
 
     assert "conversation files: 4, not yet registered at this location: 0" in lines
     assert "conversation files filed short of their drawers: 1" in lines
-    assert "next observe (dry run): 3 files -> recognised, 1 files -> mined as new drawers" in lines
+    assert (
+        "next observe (dry run): 0 files -> registry sentinel, 1 files -> mined as new drawers"
+        in lines
+    )
 
 
 def test_an_unreadable_dry_run_is_reported_as_unknown_not_as_nothing(home, fake, capsys):
     fake.collection = FakeCollection(_drawers(home))
     fake.dry_run_lines = ["a format this version does not know"]
-    fake.skipped = None
 
     _, lines = _run(capsys, home)
 
     assert "next observe (dry run): unknown, MemPalace's dry-run output was not readable" in lines
-
-
-def test_per_file_lines_it_cannot_read_are_unknown_never_zero_new(home, fake, capsys):
-    """A readable skip count beside per-file lines in a new wording is not a forecast of nothing.
-
-    MemPalace processed four files and named none in a form this reads, so ``new`` is empty: without
-    the cross-check the report would say ``0 files -> mined as new drawers``, a false all-clear.
-    """
-    fake.collection = FakeCollection(_drawers(home))
-    fake.dry_run_lines = [f"    [WOULD FILE] {name} into general (1 drawers)" for name in NAMES]
-    fake.processed = 4
-
-    _, lines = _run(capsys, home)
-
-    assert "next observe (dry run): unknown, MemPalace's dry-run output was not readable" in lines
-    assert not [line for line in lines if "mined as new drawers" in line]
 
 
 def test_no_model_call_and_the_named_home_decides_the_palace(
@@ -458,16 +427,7 @@ TEXT = "John asked Nova whether the queue worker lock was released after the dep
 
 
 def _meta(source, filed, **extra):
-    """A drawer's metadata; ``normalize_version`` 2, which every drawer MemPalace 3.9 to 3.11 files
-    carries."""
-    return {
-        "source_file": source,
-        "filed_at": filed,
-        "chunk_index": 0,
-        "room": "general",
-        "normalize_version": 2,
-        **extra,
-    }
+    return {"source_file": source, "filed_at": filed, "chunk_index": 0, "room": "general", **extra}
 
 
 def _many(count, *, root=OLD, prefix="drawer", day="2026-09-01"):
@@ -887,7 +847,10 @@ def test_register_off_wing_writes_one_registry_row_in_the_drawers_wing_and_no_dr
     assert kwargs["extract_mode"] == "exchange"
     assert sum(meta.get("room") != "_registry" for _, meta in drawers.values()) == real_before
     # And the report that follows: the next observe files nothing new.
-    assert "next observe (dry run): 5 files -> recognised, 0 files -> mined as new drawers" in lines
+    assert (
+        "next observe (dry run): 4 files -> registry sentinel, 0 files -> mined as new drawers"
+        in (lines)
+    )
 
 
 def test_register_off_wing_twice_registers_nothing_the_second_time(home, fake, capsys):
@@ -1036,115 +999,6 @@ def test_register_off_wing_leaves_an_unreadable_file_alone_and_names_it(
     assert not _writes(fake)
 
 
-# --- issue #989: a MemPalace that recognises a file by its path alone (3.12) ---
-
-
-@pytest.fixture
-def by_path(fake, monkeypatch):
-    """The fake as MemPalace 3.12: no content-hash map, so no file is recognised by its content."""
-    monkeypatch.delattr(sys.modules["mempalace.palace"], "prefetch_content_hashes")
-    sys.modules["mempalace.palace"].NORMALIZE_VERSION = 3
-    return fake
-
-
-def test_without_content_recognition_register_off_wing_registers_nothing(home, by_path, capsys):
-    """Its registry row is the one a mine writes for content it recognises, and 3.12 has none."""
-    drawers = _moved_palace(home, by_path, hand={"normalize_version": 3})
-    before = dict(drawers)
-
-    for flags, summary in (
-        (
-            ("--register-off-wing", "--dry-run"),
-            (
-                "register off-wing (dry run): files to register 0, registry rows to write 0, "
-                "drawers to write 0"
-            ),
-        ),
-        (
-            ("--register-off-wing",),
-            (
-                "register off-wing: WROTE to this palace: files registered 0, registry rows written 0, "
-                "drawers written 0"
-            ),
-        ),
-    ):
-        code, lines = _run(capsys, *flags, home)
-        assert code == 0, lines
-        assert summary in lines
-        assert any("--relocate-source-file records a moved off-wing file here" in x for x in lines)
-    assert drawers == before
-    assert not _writes(by_path)
-
-
-def test_without_content_recognition_a_moved_file_is_named_filed_elsewhere(home, by_path, capsys):
-    """No map to read: the reason is the path, and names the step that records the file here."""
-    by_path.collection = FakeCollection(_hand_file(home, normalize_version=3))
-    by_path.dry_run_lines = [f"    [DRY RUN] {HAND} -> room:planning (5 drawers)"]
-
-    assert _reason(capsys, home) == [
-        (
-            "    reason: it is filed only at another location, and this MemPalace recognises a file by "
-            "its path alone, so a mine files it again here, beside its old drawers, which it keeps; "
-            "--relocate-source-file records a file moved from a previous home here, once it proves "
-            "it is the same file"
-        )
-    ]
-
-
-def test_a_normalize_stale_file_here_is_counted_and_forecast(home, by_path, capsys):
-    """Every drawer filed before 3.12 is at ``normalize_version`` 2, which 3.12 reads as unfiled.
-
-    Nothing is unregistered, short or version-stale, so without its own line the report would
-    print no forecast at all while a mine deletes and re-files every one of these files.
-    """
-    here = str((home / "mempalace" / "conversations").resolve())
-    by_path.collection = FakeCollection(
-        {
-            f"drawer-{index}": (
-                f"Nova told John fact number {index}.",
-                _meta(f"{here}/{name}", "2026-10-01T00:00:00", source_mtime=1.0, chunk_total=1),
-            )
-            for index, name in enumerate(NAMES)
-        }
-    )
-    by_path.dry_run_lines = [f"    [DRY RUN] {name} -> room:general (1 drawers)" for name in NAMES]
-
-    _, lines = _run(capsys, home)
-
-    assert "conversation files: 4, not yet registered at this location: 0" in lines
-    assert (
-        "conversation files normalize-stale: 4 (observe-filed 0, miner-filed 4), "
-        "normalize_version older than MemPalace's 3"
-    ) in lines
-    assert f"  {_palace_check.NORMALIZE_CONSEQUENCE}" in lines
-    assert "next observe (dry run): 0 files -> recognised, 4 files -> mined as new drawers" in lines
-    reasons = [line for line in lines if line.startswith("    reason: ")]
-    assert (
-        reasons
-        == [
-            (
-                "    reason: normalize-stale: its content is filed only at normalize_version 2, older than "
-                "MemPalace's 3; a mine deletes its drawers here and files it again through MemPalace's "
-                "chunker; MemPalace's miner filed it, and it is left to MemPalace"
-            )
-        ]
-        * 4
-    )
-
-
-def test_a_normalize_stale_line_reads_whole_on_every_mempalace(home, fake, capsys):
-    """Always printed, in the version-stale line's grammar, so one reader parses both."""
-    fake.collection = FakeCollection(_drawers(home))
-    delattr(sys.modules["mempalace.palace"], "NORMALIZE_VERSION")
-
-    _, lines = _run(capsys, home)
-
-    assert (
-        "conversation files normalize-stale: 0 (observe-filed 0, miner-filed 0), "
-        "this MemPalace defines no normalize_version"
-    ) in lines
-
-
 # --- --reranked-pool: the reranked path, with no model call (issue #617) -------
 
 POOL = _palace_check._RERANK_POOL
@@ -1289,17 +1143,3 @@ def test_relocation_batches_never_split_a_file():
 
     assert [name for batch in batches for name in batch] == list(files)
     assert batches == [["0.md", "1.md"], ["2.md", "3.md"], ["4.md"], ["big.md"]]
-
-
-def test_a_relocated_drawer_reads_back_exactly_but_for_a_float_kept_to_the_microsecond():
-    """MemPalace 3.12's store keeps a float to the microsecond; nothing else may differ (#989)."""
-    wrote = {"source_file": "/home/nova/c/a.md", "source_mtime": 1795404687.4985867, "n": 2}
-    reads = _palace_check._reads_back
-
-    assert reads({**wrote, "source_mtime": 1795404687.498587}, wrote)
-    assert not reads({**wrote, "source_mtime": 1795404687.4986}, wrote)
-    assert not reads({**wrote, "source_file": "/home/old/c/a.md"}, wrote)
-    assert not reads({**wrote, "n": 2.0000001}, wrote)  # only a float written may round
-    assert not reads({**wrote, "extra": 1}, wrote)
-    assert not reads({k: v for k, v in wrote.items() if k != "n"}, wrote)
-    assert not reads(None, wrote)

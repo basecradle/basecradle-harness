@@ -103,9 +103,8 @@ def test_each_drawer_carries_what_mempalaces_miner_decides_by(fake_mempalace, tm
     """Without these a `mempalace mine` of the directory files the exchange again, shredded.
 
     ``source_mtime`` lets the miner skip the file by path, ``chunk_total`` says the set is whole,
-    ``content_hash`` (the miner's own, on every drawer) lets it recognise the file by content after
-    a home move before MemPalace 3.12 and proves the moved file from 3.12, and ``id_source_file``
-    keeps the path the id was derived from, which a move never rewrites (issue #989).
+    and ``content_hash`` (the miner's own, on every drawer) lets it recognise the file by content
+    after a home move.
     """
     convo_miner, _ = fake_mempalace
     provider = MemPalaceMemoryProvider(tmp_path / "palace")
@@ -119,9 +118,7 @@ def test_each_drawer_carries_what_mempalaces_miner_decides_by(fake_mempalace, tm
         "source_mtime": os.path.getmtime(path),
         "chunk_total": 1,
         "content_hash": hashlib.sha256(content.strip().encode("utf-8")).hexdigest(),
-        _mempalace.ID_SOURCE_FILE: str(path),
     }
-    assert drawer["extra_metadata"][_mempalace.ID_SOURCE_FILE] == drawer["source_file"]
     assert drawer["room"] == "general"  # MemPalace's own room detection, as the miner does it
 
 
