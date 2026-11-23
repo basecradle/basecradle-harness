@@ -562,7 +562,10 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   every credential `Secret` alive, at least 20 characters for a bare match) and the shapes. It is
   applied to log lines, to an exchange before it is filed into memory (the one exception to filing
   verbatim, `@briggs`'s rule: the marker stays, the rest is filed, and an exchange the redaction
-  cannot run on is not filed at all), to a fact the memory tool stores, and to the text files a
+  cannot run on is not filed at all), to the session transcript **where it is recorded**
+  (`_session._payload`, on the way out and before the caps, because the file is rewritten from the
+  turn on every save; an interrupted create's replayable arguments are the one exception, kept
+  whole as recovery evidence), to a fact the memory tool stores, and to the text files a
   stdio MCP call wrote in `.playwright-mcp/` or named (`_mcp`, never an image, never a secret
   store). **A new place the harness writes text down applies it, or it is an unredacted copy.**
   Images are out of scope by founder decision, and nothing already filed is rewritten.

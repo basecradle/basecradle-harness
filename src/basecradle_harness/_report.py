@@ -219,7 +219,8 @@ def stall_detail(error: BaseException) -> str:
     the text stays in the log where it belongs.
     """
     if isinstance(error, ProviderError):
-        detail = bounded(verbatim(error).strip(), STALL_DETAIL_CAP) or type(error).__name__
+        # Scrubbed before it is cut, and before it is kept on the claim as the note's words.
+        detail = bounded(scrub(verbatim(error)).strip(), STALL_DETAIL_CAP) or type(error).__name__
         return f"last error: {detail}"
     return f"last error: an internal fault ({type(error).__name__}); the details are in its log"
 

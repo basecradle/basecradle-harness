@@ -430,3 +430,142 @@ def test_a_key_holding_a_secret_is_refused_and_an_old_row_stays_reachable(tmp_pa
         assert store.delete("deploy sk-abcdefgh12345").startswith("Forgot")
     finally:
         store.close()
+
+
+# --- the session transcript, where a turn is recorded (issue #999, the capital's amendment) ------
+
+from basecradle_harness import Harness, Message, Session, Tool, ToolCall  # noqa: E402
+from basecradle_harness._engine import _TRUNCATED_NOTE  # noqa: E402
+from basecradle_harness._session import INTERRUPTED, STOPPED, STOPPED_NOTE, _payload  # noqa: E402
+
+#: A fabricated account password, typed into a login form through a browser tool: no listed shape,
+#: so only the value half catches it, as it was configured for the agent.
+_PASSWORD = "Tq6Wn2Ld8Xr4Vb9Kz3Mf7Hc1Jp5Gy0Sa"
+
+
+class _Scripted:
+    """A provider that replays prepared replies and keeps what it was shown on each call."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.shown = []
+
+    def chat(self, messages, tools=None):
+        self.shown.append(
+            "\n".join(m.content or "" for m in messages)
+            + "".join(json.dumps(c.arguments) for m in messages for c in (m.tool_calls or []))
+        )
+        return self.replies.pop(0)
+
+
+def _login_turn(path, typed):
+    class Fill(Tool):
+        name = "browser_fill"
+        description = "type into a field"
+        parameters = {"type": "object", "properties": {}}
+
+        def run(self, **kwargs):
+            typed.append((kwargs["value"], path.read_text()))  # the pre-dispatch save, on disk
+            return f'Filled "#password" with "{kwargs["value"]}". Ran: page.fill("#password", ...)'
+
+    provider = _Scripted(
+        Message.assistant(
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    name="browser_fill",
+                    arguments={"selector": "#password", "value": _PASSWORD},
+                )
+            ]
+        ),
+        Message.assistant(content=f"Logged in; the form took {_PASSWORD}."),
+    )
+    session = Session("timeline:x", Harness(provider, tools=[Fill()]).engine, path=path)
+    session.send("log in to the vendor")
+    return provider, session
+
+
+def test_a_value_typed_through_a_tool_call_is_absent_after_the_turn_and_the_next(
+    tmp_path, monkeypatch
+):
+    """The way it failed: one browser login put the password in the session log three times (the
+    call's argument, its result, the echoed call), and the log came back after every hand redaction
+    because it is rewritten from the transcript. The value is blanked where the turn is recorded,
+    so it is absent after the turn ends **and** after the next turn opens."""
+    monkeypatch.setenv("VENDOR_PASSWORD", _PASSWORD)
+    path = tmp_path / "timeline.json"
+    typed = []
+    _login_turn(path, typed)
+
+    ((value, on_disk_mid_turn),) = typed
+    assert value == _PASSWORD  # the tool was handed the value itself
+    assert _PASSWORD not in on_disk_mid_turn  # and the save before dispatch never held it
+    after_turn = path.read_text()
+    assert _PASSWORD not in after_turn
+    assert after_turn.count(REDACTED) == 3  # the argument, the result, the echo
+
+    provider = _Scripted(Message.assistant(content="Done."))
+    Session("timeline:x", Harness(provider).engine, path=path).send("anything else?")
+    assert _PASSWORD not in path.read_text()
+    assert _PASSWORD not in provider.shown[0]  # the next turn opened on the redacted form
+
+
+def test_the_model_keeps_the_value_for_the_turn_that_saw_it(tmp_path, monkeypatch):
+    """Redacted on the way out, never in the live list: the turn in flight still reads the value."""
+    monkeypatch.setenv("VENDOR_PASSWORD", _PASSWORD)
+    provider, session = _login_turn(tmp_path / "timeline.json", [])
+    assert _PASSWORD in provider.shown[1]
+    assert any(_PASSWORD in (m.content or "") for m in session.history)
+
+
+def _create_turn(result):
+    call = ToolCall(
+        id="c1", name="messages", arguments={"action": "create", "body": f"key {_PASSWORD}"}
+    )
+    return [
+        Message.user("post it"),
+        Message.assistant(tool_calls=[call]),
+        Message(role="tool", content=result, tool_call_id="c1"),
+    ]
+
+
+def test_an_interrupted_create_keeps_its_arguments_whole_until_its_re_issue_lands(monkeypatch):
+    """The recovery re-issues an interrupted platform create from the bytes on disk, under the key
+    its dead wake minted; those arguments are recovery evidence and are kept as the cap keeps them.
+    Once a real result answers the call, the next save redacts them."""
+    monkeypatch.setenv("VENDOR_PASSWORD", _PASSWORD)
+    interrupted = json.loads(_payload(_create_turn(INTERRUPTED)))
+    assert interrupted[1]["tool_calls"][0]["arguments"]["body"] == f"key {_PASSWORD}"
+    assert interrupted[2]["content"] == INTERRUPTED
+    answered = json.loads(_payload(_create_turn("message 0198e3f1-0000-7000-8000-000000000001")))
+    assert answered[1]["tool_calls"][0]["arguments"]["body"] == f"key {REDACTED}"
+
+
+def test_every_sentinel_a_later_wake_reads_survives_the_redaction_byte_for_byte():
+    for sentinel in (INTERRUPTED, STOPPED, STOPPED_NOTE, _TRUNCATED_NOTE):
+        assert scrub(sentinel) == sentinel
+
+
+def test_a_secret_configured_after_a_save_is_redacted_on_the_next(tmp_path, monkeypatch):
+    """The per-session memo rescans nothing that has not changed, but a change in the configured
+    secrets is a change: what was saved before is redacted on the next save."""
+    path = tmp_path / "timeline.json"
+    provider = _Scripted(Message.assistant(content=f"noted {_PASSWORD}"))
+    session = Session("timeline:x", Harness(provider).engine, path=path)
+    session.send("remember this")
+    assert _PASSWORD in path.read_text()  # not yet one of the agent's secrets
+    monkeypatch.setenv("VENDOR_PASSWORD", _PASSWORD)
+    session._save()
+    assert _PASSWORD not in path.read_text()
+
+
+def test_the_redaction_memo_shows_nothing_it_holds(tmp_path, monkeypatch):
+    import pickle
+
+    monkeypatch.setenv("VENDOR_PASSWORD", _PASSWORD)
+    _, session = _login_turn(tmp_path / "timeline.json", [])
+    memo = session._redactions
+    assert _PASSWORD not in repr(memo)
+    assert not hasattr(memo, "__dict__")
+    with pytest.raises(TypeError):
+        pickle.dumps(memo)
