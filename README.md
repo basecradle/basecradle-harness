@@ -305,7 +305,7 @@ MemPalace records every drawer's source as an absolute path, so renaming an agen
 basecradle-harness-palace-check /home/<user>/harness    # or set $HARNESS_HOME and pass nothing
 ```
 
-It opens the palace exactly as a wake resolves it from that `HARNESS_HOME` (an inherited `MEMPALACE_PALACE_PATH` is ignored, and the reranker is off for the run). It then picks three real drawers, preferring ones filed under another path, and searches for each through the harness's own recall. It **exits 0 only if every one comes back**. The report also states:
+It opens the palace exactly as a wake resolves it from that `HARNESS_HOME` (an inherited `MEMPALACE_PALACE_PATH` is ignored, and the reranker is off for the run). Its `memory` lines name the adapter by the `HARNESS_MEMORY_PROVIDER` in its own environment, so run it under the agent's environment to have an agent on `mempalace-previous` reported as one; without it, they say `mempalace`. It then picks three real drawers, preferring ones filed under another path, and searches for each through the harness's own recall. It **exits 0 only if every one comes back**. The report also states:
 
 - how many registry rows the palace holds;
 - how many chunk-0 drawers predate MemPalace 3.7 (with no `content_hash`; after a move, their files would re-mine as new drawers, so this should be 0);

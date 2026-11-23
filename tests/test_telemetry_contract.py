@@ -2279,10 +2279,21 @@ def test_the_provider_scan_finds_every_kind_of_site():
 
     assert {"openai", "xai"} <= written.keys()  # `metered(provider="…")` literals
     assert {"anthropic", "google", "openrouter"} <= written.keys()  # module-level `PROVIDER`
-    # An imported constant (`kv(provider=_MEMPALACE)`) was the third kind until issue #1010 made
-    # the MemPalace adapter write the name it was selected by; `emittable` reads those names from
-    # `_MEMPALACE_SELECTORS`, and the package-wide constant resolution stays for the next one.
+    # An imported constant, the third kind, has no real instance since issue #1010 made the
+    # MemPalace adapter write the name it was selected by; the synthetic test below proves it.
     assert "log_grammar_probe" in written  # `PROVIDER = REASON`, an alias
+
+
+def test_the_provider_scan_resolves_a_slug_imported_from_another_module(tmp_path):
+    """The third kind of site, kept proven after its last real instance left (issue #1010): a
+    ``provider=`` naming a constant another module defines, the shape `_MEMPALACE` once had."""
+    (tmp_path / "_names.py").write_text('_VENDOR = "acme"\n', encoding="utf-8")
+    (tmp_path / "_writer.py").write_text(
+        "from _names import _VENDOR\n\n\ndef emit():\n    kv(provider=_VENDOR)\n",
+        encoding="utf-8",
+    )
+
+    assert written_providers(tmp_path) == {"acme": "_writer.py:5"}
 
 
 def test_every_provider_the_harness_can_write_has_a_display_name(emittable, rendered):

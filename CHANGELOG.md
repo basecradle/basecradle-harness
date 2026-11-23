@@ -15,10 +15,10 @@ The memory redesign (basecradle#966) will give the name `mempalace` to a new ada
 
 - **`HARNESS_MEMORY_PROVIDER=mempalace-previous` selects exactly what `mempalace` selects**: the same adapter class, the same palace, the same `mempalace` extra, the same `memory_search` tool. Case-insensitive, like every built-in name. `basecradle-harness-resolve --memory-provider` takes it too.
 - **Each name reports itself.** The adapter carries the name it was selected by, so an agent on `mempalace-previous` reports `mempalace-previous` in `--resolved-config`'s `memory_provider`, in `basecradle-harness-resolve`'s `memory.provider`, and in the `provider=` field of every `memory` line it writes (`memory recall`, `memory threshold`, `memory op=search result=failed`, `memory op=observe result=unfile_failed`). An agent on `mempalace` prints exactly what it printed before. `memory_provider_version` and `memory.tools` are the same under both. The NOC can verify an agent's move from its resolved configuration, and the release that gives `mempalace` to the new adapter changes no reported value.
-- **`basecradle-harness-palace-check`** opens a palace by its path, so its `memory` lines take the name from the agent's own setting when it names the adapter, and `mempalace` otherwise. The scrub and prune commands write no `provider=` field and never read the setting.
+- **`basecradle-harness-palace-check`** opens a palace by its path, so its `memory` lines take the name from the `HARNESS_MEMORY_PROVIDER` in its own process environment when that names the adapter, and say `mempalace` otherwise. It does not read `agent.env`: run it under the agent's environment to see an agent on `mempalace-previous` reported as one. The scrub and prune commands write no `provider=` field and never read the setting.
 - **The new slug has a display name**, `MemPalace Previous` (`_report._PROVIDER_LABELS`), so a by-Provider chart shows it apart.
 - The refusal of an unknown value and the `--help` of `basecradle-harness-resolve --memory-provider` list `mempalace-previous` among the built-ins.
-- Every test that selects MemPalace by value runs under both names and asserts the name it was configured with.
+- Every test that selects MemPalace by value runs under both names. Each one that checks a reported name or a `memory` line asserts the name the adapter was configured with.
 
 ## [0.211.0] - 2026-11-23
 

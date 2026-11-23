@@ -248,6 +248,33 @@ def _run(capsys, *argv):
     return code, capsys.readouterr().out.splitlines()
 
 
+def test_the_check_names_the_adapter_as_the_agents_setting_does(
+    home, fake, caplog, monkeypatch, mempalace_selector
+):
+    """The palace is opened by its path, so the adapter's name comes from the agent's setting in
+    this process's environment, and every `memory` line it writes carries it (issue #1010)."""
+    fake.collection = FakeCollection(_drawers(home))
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
+    built = []
+    real = _palace_check.MemPalaceMemoryProvider
+
+    def spy(*args, **kwargs):
+        provider = real(*args, **kwargs)
+        built.append(provider.name)
+        return provider
+
+    monkeypatch.setattr(_palace_check, "MemPalaceMemoryProvider", spy)
+
+    with caplog.at_level("INFO", logger="basecradle_harness"):
+        code = _palace_check.main([str(home)])
+
+    assert code == 0
+    assert built == [mempalace_selector]
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("memory ")]
+    assert lines, "the check wrote no memory line to judge"
+    assert all(f"provider={mempalace_selector} " in line for line in lines)
+
+
 def test_every_probe_found_passes_and_reads_the_palace_read_only(home, fake, capsys):
     fake.collection = FakeCollection(_drawers(home))
 

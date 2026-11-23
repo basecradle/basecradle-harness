@@ -287,7 +287,7 @@ def describe_memory_provider(provider: MemoryProvider) -> tuple[str, str | None]
       *subclass* of a built-in is a custom provider and reports its own path, not the alias. The
       MemPalace adapter reports the name it carries, the one it was selected by: ``mempalace``,
       or ``mempalace-previous`` for its second name (issue #1010), read off the object like the
-      rest. A dotted path naming its class builds it under its default name, ``mempalace``.
+      rest; one built directly with no name is ``mempalace``.
     - **version** — the installed version of the **backing distribution** the harness pins for
       that provider — today that means the ``mempalace`` extra — else ``None``. ``None`` for the
       built-in ``sqlite`` store, which ships *inside the harness* (its engine is stdlib

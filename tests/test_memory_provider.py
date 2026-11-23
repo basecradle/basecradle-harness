@@ -196,8 +196,7 @@ def test_the_mempalace_extras_version_is_reported_under_either_name(
 
 
 def test_the_adapter_built_directly_keeps_its_name_and_refuses_another(tmp_path):
-    """Built with no name, as a dotted path or a palace command builds it, the adapter is
-    `mempalace`, what it always reported. A name that is not one of its own is refused, so no
+    """Built directly with no name, the adapter is `mempalace`, what it always reported. A name that is not one of its own is refused, so no
     report or line can carry a provider value the selection does not know."""
     assert describe_memory_provider(MemPalaceMemoryProvider(tmp_path / "palace"))[0] == "mempalace"
     with pytest.raises(ValueError, match="not a name of the MemPalace adapter"):
