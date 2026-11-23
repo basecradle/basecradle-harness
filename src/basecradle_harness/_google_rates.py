@@ -65,7 +65,7 @@ from basecradle_harness._observability import ComputedCost
 
 _DATA = _prices.vendor("google")
 
-#: Where every number in `RATES` was read, and when. Edit the file's table from this page, and move
+#: Where every number in `RATES` and `GROUNDING` was read, and when. Edit the file's table from this page, and move
 #: the date with it.
 SOURCE = _prices.source(_DATA)
 

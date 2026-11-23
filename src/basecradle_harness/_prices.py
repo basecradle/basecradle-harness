@@ -8,9 +8,10 @@ keep the arithmetic — usage parsing, tier and geography gating, row choice —
 not two: a number lives in the file and nowhere else.
 
 A file this package cannot read is a broken install, so it fails at import like a missing module
-would: the format and its version are checked, and every row is built from exactly the fields its
-dataclass declares (`row`), so a misspelled or missing field is an error here rather than a default
-someone has to notice.
+would: a file that cannot be read, or is of another format or version, raises `PricesFileError`;
+every row is built from exactly the fields its dataclass declares (`row`), so a misspelled or missing
+row field is a `PricesFileError` too rather than a default someone has to notice; and a section the
+code reads that the file lacks is the ``KeyError`` naming it.
 """
 
 from __future__ import annotations
@@ -41,9 +42,11 @@ class PricesFileError(RuntimeError):
 def load() -> Mapping[str, Any]:
     """The whole prices file, parsed and checked for its format and version."""
     try:
-        text = resources.files("basecradle_harness").joinpath(*RESOURCE).read_text(encoding="utf-8")
-        data = json.loads(text)
-    except (OSError, ValueError) as exc:
+        node = resources.files("basecradle_harness")
+        for part in RESOURCE:  # one segment per call: not every 3.11 Traversable takes several
+            node = node.joinpath(part)
+        data = json.loads(node.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
         raise PricesFileError(f"the package's {'/'.join(RESOURCE)} cannot be read: {exc}") from exc
     if not isinstance(data, dict):
         raise PricesFileError(f"the package's {'/'.join(RESOURCE)} is not a JSON object")
@@ -57,7 +60,10 @@ def load() -> Mapping[str, Any]:
 
 def vendor(name: str) -> Mapping[str, Any]:
     """One vendor's section of the file."""
-    return load()["vendors"][name]
+    try:
+        return load()["vendors"][name]
+    except (KeyError, TypeError) as exc:
+        raise PricesFileError(f"the prices file carries no {name!r} vendor section") from exc
 
 
 def source(section: Mapping[str, Any]) -> str:

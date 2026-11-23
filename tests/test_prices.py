@@ -205,7 +205,7 @@ def test_an_unknown_no_long_row_rule_is_refused():
     [
         ("{not json", "cannot be read"),
         ("[]", "not a JSON object"),
-        (json.dumps({**RAW, "format_version": 2}), "format_version|2"),
+        (json.dumps({**RAW, "format_version": 2}), r"is \('basecradle-harness-prices', 2\)"),
         (json.dumps({**RAW, "format": "something-else"}), "something-else"),
     ],
 )
@@ -221,6 +221,36 @@ def test_a_file_this_version_cannot_read_is_a_loud_error(tmp_path, monkeypatch, 
         monkeypatch.undo()
         _prices.load.cache_clear()
     assert _prices.load() == RAW
+
+
+class _OneSegmentPath:
+    """A Traversable whose ``joinpath`` takes one segment, as 3.11's ``MultiplexedPath`` does."""
+
+    def __init__(self, path):
+        self._path = path
+
+    def joinpath(self, child):
+        return _OneSegmentPath(self._path / child)
+
+    def read_text(self, encoding=None):
+        return self._path.read_text(encoding=encoding)
+
+
+def test_the_file_is_reached_one_segment_at_a_time(monkeypatch):
+    """Not every resource loader joins several segments in one call; the read must not need it."""
+    package = FILE.parent.parent
+    monkeypatch.setattr(_prices.resources, "files", lambda _package: _OneSegmentPath(package))
+    _prices.load.cache_clear()
+    try:
+        assert _prices.load() == RAW
+    finally:
+        monkeypatch.undo()
+        _prices.load.cache_clear()
+
+
+def test_an_absent_vendor_section_is_a_prices_file_error():
+    with pytest.raises(_prices.PricesFileError, match="'xai'"):
+        _prices.vendor("xai")
 
 
 def test_a_missing_file_is_a_loud_error(tmp_path, monkeypatch):

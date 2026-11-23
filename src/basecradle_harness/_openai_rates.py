@@ -63,7 +63,7 @@ from basecradle_harness._observability import ComputedCost
 
 _DATA = _prices.vendor("openai")
 
-#: Where every number in this module was read, and when. Edit the file's tables from this page, and
+#: Where every number in this module's tables was read, and when. Edit the file's tables from this page, and
 #: move the date with them.
 SOURCE = _prices.source(_DATA)
 
