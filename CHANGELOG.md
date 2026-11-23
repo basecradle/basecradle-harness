@@ -7,6 +7,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.212.0] - 2026-11-23
+
+### Added: the MemPalace adapter answers to a second name, `mempalace-previous` (issue #1010)
+
+The memory redesign (basecradle#966) will give the name `mempalace` to a new adapter and keep the one the fleet runs today selectable by another name, so each agent can be moved one at a time and set back. This release adds that second name and changes nothing else.
+
+- **`HARNESS_MEMORY_PROVIDER=mempalace-previous` selects exactly what `mempalace` selects**: the same adapter class, the same palace, the same `mempalace` extra, the same `memory_search` tool. Case-insensitive, like every built-in name. `basecradle-harness-resolve --memory-provider` takes it too.
+- **Nothing anyone reads changes.** The harness reports the provider it bound, read off the class, so an agent on either name reports `mempalace`: `--resolved-config`'s `memory_provider`, `basecradle-harness-resolve`'s `memory.provider`, and the `provider=mempalace` field on every `memory` log line. The palace commands (`basecradle-harness-palace-check`, `-scrub-palace`, `-prune-palace`) never read the setting, so they behave the same under either name.
+- **The one wording change** is in the refusal of a value that is neither a built-in name nor an import path, which now lists `mempalace-previous` among the built-ins.
+- Every test that selects MemPalace by value runs under both names.
+
 ## [0.211.0] - 2026-11-23
 
 ### Added: one definition of a secret, applied to every text the harness writes: logs, memory and tool captures (issue #999)

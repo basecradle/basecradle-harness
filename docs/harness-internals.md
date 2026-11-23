@@ -173,7 +173,8 @@ reference adapter to prove it end-to-end, **without changing the default's behav
   the incoming text is the retrieval query. **A hook failure degrades gracefully and never
   breaks the wake** (the dashboard-fetch invariant). Hooks are a wake-mode property: the
   poll-loop `TimelineAgent` keeps the memory tool but does not fire them.
-- **Provider selection.** `HARNESS_MEMORY_PROVIDER` — `sqlite` (default), `mempalace`, or a
+- **Provider selection.** `HARNESS_MEMORY_PROVIDER` — `sqlite` (default), `mempalace`
+  (or its second name `mempalace-previous`, the same adapter, issue #1010), or a
   dotted `module:Class` path to any custom `MemoryProvider`. One provider per agent. Memory
   graduated from a tool plugin (`_defaults/tools/memory.py` removed) to its own subsystem;
   its tools fold into the resolved set (deduped by name), so the brief manifest is unchanged.

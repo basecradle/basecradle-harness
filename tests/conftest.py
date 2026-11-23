@@ -172,6 +172,20 @@ def mail_tool(name: str) -> dict:
     return next(tool for tool in MAIL_SERVER_TOOLS["tools"] if tool["name"] == name)
 
 
+#: Every ``HARNESS_MEMORY_PROVIDER`` value that selects today's MemPalace adapter (issue #1010).
+#: Written out, not read from `_memory_provider`, so the contract is pinned here: a test that
+#: selects MemPalace by value takes `mempalace_selector` and runs once under each name, which is
+#: the proof the second name behaves identically. `test_memory_provider.py` checks this tuple
+#: against the module's own set, so a third name cannot land without its paired runs.
+MEMPALACE_SELECTORS = ("mempalace", "mempalace-previous")
+
+
+@pytest.fixture(params=MEMPALACE_SELECTORS)
+def mempalace_selector(request) -> str:
+    """One name that selects the MemPalace adapter; the test runs once per name."""
+    return request.param
+
+
 @pytest.fixture
 def fake_mempalace(monkeypatch):
     """Install fake ``mempalace.convo_miner`` / ``.searcher`` / ``.palace`` / ``.normalize``.

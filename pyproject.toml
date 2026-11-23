@@ -95,7 +95,8 @@ google-genai = ["google-genai>=2.28.0,<4"]
 anthropic = ["anthropic>=2.3.0,<3"]
 # The MemPalace memory provider (a reference `MemoryProvider`): a local-first OSS memory
 # system (ChromaDB + SQLite). Kept out of the base install so the core stays light — the
-# adapter imports it lazily and is only used when HARNESS_MEMORY_PROVIDER=mempalace.
+# adapter imports it lazily and is only used when HARNESS_MEMORY_PROVIDER=mempalace (or its
+# second name, mempalace-previous).
 #
 # The optional **LLM reranker** (issue #464) needs the `openrouter` extra above *as well* —
 # `pip install 'basecradle-harness[openai,mempalace,openrouter]'`. Deliberately not folded in

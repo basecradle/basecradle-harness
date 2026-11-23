@@ -181,6 +181,13 @@ class SqliteMemoryProvider(MemoryProvider):
 _PROVIDER_VAR = "HARNESS_MEMORY_PROVIDER"
 _SQLITE = "sqlite"
 _MEMPALACE = "mempalace"
+# The same MemPalace adapter under a second name (issue #1010). The memory redesign
+# (basecradle#966) gives `mempalace` to a new adapter and keeps today's selectable as
+# `mempalace-previous`, so each agent moves one at a time and can be set back. Until the new
+# adapter lands the two names select one class: same palace, same extra, same tools, and the same
+# bound name (`describe_memory_provider` reads the class, so both report `mempalace`).
+_MEMPALACE_PREVIOUS = "mempalace-previous"
+_MEMPALACE_SELECTORS = frozenset({_MEMPALACE, _MEMPALACE_PREVIOUS})
 
 # The MemPalace adapter's class, by import path — so `describe_memory_provider` can *name* a
 # bound MemPalace provider without importing the optional-extra module to do it.
@@ -205,7 +212,7 @@ def memory_provider_from_env(home: str | os.PathLike[str] | None = None) -> Memo
     The selector, case-insensitive:
 
     - unset or ``sqlite`` → `SqliteMemoryProvider` (the default — host-local, private).
-    - ``mempalace`` → the optional reference adapter
+    - ``mempalace`` or ``mempalace-previous`` → the optional reference adapter
       (`basecradle_harness._mempalace.MemPalaceMemoryProvider`), which requires the
       ``mempalace`` extra (``pip install basecradle-harness[mempalace]``). A clear
       error names the extra if it is not installed.
@@ -224,9 +231,9 @@ def memory_provider_named(
 ) -> MemoryProvider:
     """Build a memory provider from an explicit selector — `memory_provider_from_env` minus the env.
 
-    The same three-way rule (``sqlite`` / ``mempalace`` / a dotted ``module:Class`` path), with the
-    selector supplied by the caller instead of read from ``HARNESS_MEMORY_PROVIDER``. ``None`` or
-    empty means the default, exactly as an unset var does.
+    The same three-way rule (``sqlite`` / ``mempalace`` or ``mempalace-previous`` / a dotted
+    ``module:Class`` path), with the selector supplied by the caller instead of read from
+    ``HARNESS_MEMORY_PROVIDER``. ``None`` or empty means the default, exactly as an unset var does.
 
     It exists so the deterministic off-box resolver (`_resolve.resolve_stems`) can answer *which
     tools a given memory backend contributes* by asking the provider itself — the memory tool is
@@ -242,7 +249,7 @@ def memory_provider_named(
     lowered = raw.lower()
     if lowered == _SQLITE:
         return SqliteMemoryProvider(_store_path(home))
-    if lowered == _MEMPALACE:
+    if lowered in _MEMPALACE_SELECTORS:
         from basecradle_harness._mempalace import MemPalaceMemoryProvider
 
         return MemPalaceMemoryProvider(palace_path=_palace_path(home))
@@ -258,7 +265,8 @@ def describe_memory_provider(provider: MemoryProvider) -> tuple[str, str | None]
     a dotted path naming a built-in class would report as "custom" when it is not.
 
     - **name** — ``sqlite`` or ``mempalace`` for the built-ins (whichever alias *or* dotted
-      path selected them: the class is the truth, so both spellings normalize to the alias),
+      path selected them: the class is the truth, so every spelling normalizes to the alias, and
+      ``mempalace-previous`` reports ``mempalace``),
       else ``module:Class`` — the import path of the custom provider actually bound. A
       *subclass* of a built-in is a custom provider and reports its own path, not the alias.
     - **version** — the installed version of the **backing distribution** the harness pins for
@@ -361,7 +369,7 @@ def _load_custom_provider(path: str) -> MemoryProvider:
     if not module_name or not attr:
         raise ValueError(
             f"{_PROVIDER_VAR}={path!r} is not a known provider or a 'module:Class' path. "
-            f"Use 'sqlite', 'mempalace', or a dotted import path."
+            f"Use 'sqlite', 'mempalace', 'mempalace-previous', or a dotted import path."
         )
     try:
         module = importlib.import_module(module_name)

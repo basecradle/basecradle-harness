@@ -30,12 +30,14 @@ from basecradle_harness import (
     SqliteMemoryProvider,
     SqliteMemoryStore,
     WakeAgent,
+    _memory_provider,
     memory_provider_from_env,
 )
 from basecradle_harness._context import Compactor, ContextBudget
-from basecradle_harness._memory_provider import describe_memory_provider
+from basecradle_harness._memory_provider import describe_memory_provider, memory_provider_named
 from basecradle_harness._mempalace import MemPalaceMemoryProvider
 from basecradle_harness._messages import Message
+from tests.conftest import MEMPALACE_SELECTORS
 
 # --- the default SQLite provider: tools + store, no-op hooks ------------------
 
@@ -103,10 +105,12 @@ def test_from_env_home_points_the_store_at_the_agent_home(monkeypatch, tmp_path)
     assert provider.store.path == tmp_path / "memory.db"
 
 
-def test_from_env_home_points_the_palace_at_the_agent_home(monkeypatch, tmp_path):
+def test_from_env_home_points_the_palace_at_the_agent_home(
+    monkeypatch, tmp_path, mempalace_selector
+):
     """The MemPalace palace is per-agent, beside the SQLite default — the isolation that keeps two
     agents on one box from sharing a mind."""
-    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
     monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
 
     assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "mempalace"
@@ -118,17 +122,19 @@ def test_from_env_home_points_the_palace_at_the_agent_home(monkeypatch, tmp_path
 # any exported var split the two halves again, silently, with the publication unable to say so.
 
 
-def test_palace_path_prefers_mempalaces_own_env_var(monkeypatch, tmp_path):
-    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+def test_palace_path_prefers_mempalaces_own_env_var(monkeypatch, tmp_path, mempalace_selector):
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
     monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "elsewhere"))
 
     assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "elsewhere"
 
 
-def test_palace_path_honors_the_legacy_spelling_and_the_order_between_them(monkeypatch, tmp_path):
+def test_palace_path_honors_the_legacy_spelling_and_the_order_between_them(
+    monkeypatch, tmp_path, mempalace_selector
+):
     """Upstream reads ``MEMPALACE_PALACE_PATH`` *or* ``MEMPAL_PALACE_PATH``, in that order — and a
     set-but-**empty** first var falls through to the second rather than winning as "set"."""
-    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
     monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
     monkeypatch.setenv("MEMPAL_PALACE_PATH", str(tmp_path / "legacy"))
 
@@ -138,12 +144,49 @@ def test_palace_path_honors_the_legacy_spelling_and_the_order_between_them(monke
     assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "current"
 
 
-def test_both_palace_path_vars_empty_falls_back_to_the_agent_home(monkeypatch, tmp_path):
-    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+def test_both_palace_path_vars_empty_falls_back_to_the_agent_home(
+    monkeypatch, tmp_path, mempalace_selector
+):
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
     monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
     monkeypatch.setenv("MEMPAL_PALACE_PATH", "")
 
     assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "mempalace"
+
+
+def test_both_mempalace_names_bind_the_one_adapter_identically(
+    monkeypatch, tmp_path, mempalace_selector
+):
+    """`mempalace-previous` is a second name for today's adapter, nothing more (issue #1010).
+
+    The memory redesign (basecradle#966) will give `mempalace` to a new adapter; until it lands,
+    either name binds the same class over the same palace, contributes the same tools, and reports
+    the same bound name. The bound name staying `mempalace` is what keeps every line and report
+    the NOC reads unchanged. Case-insensitive like every built-in selector.
+    """
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+    monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+
+    for spelling in (mempalace_selector, mempalace_selector.upper()):
+        monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", spelling)
+        provider = memory_provider_from_env(home=tmp_path)
+
+        assert type(provider) is MemPalaceMemoryProvider
+        assert provider.palace_path == tmp_path / "mempalace"
+        assert [tool.name for tool in provider.tools()] == ["memory_search"]
+        assert describe_memory_provider(provider) == ("mempalace", None)
+        assert type(memory_provider_named(spelling, tmp_path)) is MemPalaceMemoryProvider
+
+
+def test_the_paired_selector_list_is_the_modules_own():
+    """Every name the module accepts for MemPalace runs the paired tests (`conftest`)."""
+    assert set(MEMPALACE_SELECTORS) == _memory_provider._MEMPALACE_SELECTORS
+
+
+def test_an_unknown_value_is_told_every_built_in_name(monkeypatch):
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "nodots")
+    with pytest.raises(ValueError, match="'mempalace', 'mempalace-previous'"):
+        memory_provider_from_env()
 
 
 def test_from_env_loads_a_custom_provider_by_dotted_path(monkeypatch):

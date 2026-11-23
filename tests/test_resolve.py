@@ -142,7 +142,7 @@ def test_matches_resolved_config_for_a_pruned_overlay(monkeypatch, tmp_path):
 # --- purity -------------------------------------------------------------------
 
 
-def test_reads_no_environment_and_writes_nothing(monkeypatch, tmp_path):
+def test_reads_no_environment_and_writes_nothing(monkeypatch, tmp_path, mempalace_selector):
     """Deterministic: a hostile environment cannot move the answer, and nothing is created.
 
     Every axis is an argument, so the env vars a wake reads — provider, sdk, surface, profile,
@@ -157,7 +157,7 @@ def test_reads_no_environment_and_writes_nothing(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_SDK", "openrouter")
     monkeypatch.setenv("AI_SDK_SURFACE", "chat")
     monkeypatch.setenv("HARNESS_PROFILE", "unlocked")
-    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
     monkeypatch.delenv("AI_API_KEY", raising=False)
 
     report = resolve_stems(provider="xai", sdk="xai-sdk", opt_in="xai_search,shell")
@@ -660,6 +660,24 @@ def test_every_shipped_stem_appears_in_the_map():
     assert report["memory"]["tools"] == ["memory"]  # …and is reported on its own axis
     for entry in report["stems"].values():
         assert entry["status"] in {"active", "inactive", "excluded"}
+
+
+def test_either_mempalace_name_resolves_the_same_memory_axis(capsys, mempalace_selector):
+    """`--memory-provider mempalace-previous` resolves exactly what `mempalace` does (issue #1010):
+    the adapter's `memory_search` in place of `memory`, reported under the bound name
+    `mempalace`, through the library call and the command line alike."""
+    report = resolve_stems(provider="openai", memory_provider=mempalace_selector)
+
+    assert report["memory"] == {
+        "provider": "mempalace",
+        "provider_version": None,
+        "tools": ["memory_search"],
+    }
+    assert "memory_search" in report["tools"]
+    assert "memory" not in report["tools"]
+
+    assert main(["--provider", "openai", "--memory-provider", mempalace_selector]) == 0
+    assert json.loads(capsys.readouterr().out) == report
 
 
 @pytest.mark.parametrize(

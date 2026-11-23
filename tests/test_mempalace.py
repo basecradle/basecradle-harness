@@ -1434,9 +1434,13 @@ def _cli_default_palace(home: Path, *, palace_flag: str | None = None) -> str:
     return os.path.expanduser(stored or str(home / ".mempalace" / "palace"))
 
 
-def _bind(monkeypatch, agent_home: Path) -> MemPalaceMemoryProvider:
-    """Bind the MemPalace provider the way a wake does — from the environment, nothing passed."""
-    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+def _bind(monkeypatch, agent_home: Path, selector: str) -> MemPalaceMemoryProvider:
+    """Bind the MemPalace provider the way a wake does — from the environment, nothing passed.
+
+    ``selector`` is the test's `mempalace_selector`, so every publication test runs under both
+    names that select the adapter (issue #1010).
+    """
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", selector)
     monkeypatch.setenv("HARNESS_HOME", str(agent_home))
     return memory_provider_from_env()
 
@@ -1444,14 +1448,16 @@ def _bind(monkeypatch, agent_home: Path) -> MemPalaceMemoryProvider:
 # --- the join itself ----------------------------------------------------------
 
 
-def test_publishing_points_the_bare_cli_at_the_live_palace(home, monkeypatch, tmp_path):
+def test_publishing_points_the_bare_cli_at_the_live_palace(
+    home, monkeypatch, tmp_path, mempalace_selector
+):
     """The bug, inverted: with no flags and no env, the CLI now resolves the agent's own palace.
 
     Before the publication the CLI answered ``~/.mempalace/palace`` — a directory the agent had
     never written — and said so ("No palace found at …"). The assertion is the acceptance check
     on @briggs's box, off-box.
     """
-    provider = _bind(monkeypatch, tmp_path / "agent")
+    provider = _bind(monkeypatch, tmp_path / "agent", mempalace_selector)
 
     _publish_palace_binding(provider)
 
@@ -1459,11 +1465,13 @@ def test_publishing_points_the_bare_cli_at_the_live_palace(home, monkeypatch, tm
     assert _cli_default_palace(home) != str(home / ".mempalace" / "palace")
 
 
-def test_the_published_value_is_exactly_what_the_adapter_bound(home, monkeypatch, tmp_path):
+def test_the_published_value_is_exactly_what_the_adapter_bound(
+    home, monkeypatch, tmp_path, mempalace_selector
+):
     """The drift test the design owes: a published path that is not `_palace_path(HARNESS_HOME)`
     is the very split this closes, wearing a fix's clothes."""
     agent_home = tmp_path / "agent"
-    provider = _bind(monkeypatch, agent_home)
+    provider = _bind(monkeypatch, agent_home, mempalace_selector)
 
     _publish_palace_binding(provider)
 
@@ -1471,22 +1479,26 @@ def test_the_published_value_is_exactly_what_the_adapter_bound(home, monkeypatch
     assert published == str(_palace_path(agent_home)) == str(provider.palace_path)
 
 
-def test_the_publication_follows_a_moved_harness_home(home, monkeypatch, tmp_path):
+def test_the_publication_follows_a_moved_harness_home(
+    home, monkeypatch, tmp_path, mempalace_selector
+):
     """It is written from the *live* binding on every bind, so it cannot go stale.
 
     This is what separates it from the hand-written `config.json` the issue warned about: a second
     source of truth is right until `HARNESS_HOME` moves and the file does not. Here the next bind
     rewrites it, and the CLI follows the agent rather than a memory of where it used to live.
     """
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "first"))
+    _publish_palace_binding(_bind(monkeypatch, tmp_path / "first", mempalace_selector))
     assert _cli_default_palace(home) == str(tmp_path / "first" / "mempalace")
 
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "second"))
+    _publish_palace_binding(_bind(monkeypatch, tmp_path / "second", mempalace_selector))
 
     assert _cli_default_palace(home) == str(tmp_path / "second" / "mempalace")
 
 
-def test_the_cli_and_the_adapter_are_one_mind_not_two(fake_mempalace, home, monkeypatch, tmp_path):
+def test_the_cli_and_the_adapter_are_one_mind_not_two(
+    fake_mempalace, home, monkeypatch, tmp_path, mempalace_selector
+):
     """What `observe` mines into is exactly what a bare CLI command now reads.
 
     The acceptance check "after a wake observes a new exchange, bare `mempalace status` sees the
@@ -1494,7 +1506,7 @@ def test_the_cli_and_the_adapter_are_one_mind_not_two(fake_mempalace, home, monk
     halves. A second `chroma.sqlite3` anywhere is the failure this forbids.
     """
     convo_miner, _ = fake_mempalace
-    provider = _bind(monkeypatch, tmp_path / "agent")
+    provider = _bind(monkeypatch, tmp_path / "agent", mempalace_selector)
     _publish_palace_binding(provider)
 
     provider.observe(MemoryExchange(user="Where do I live?", assistant="Dallas.", scope=_scope()))
@@ -1507,13 +1519,15 @@ def test_the_cli_and_the_adapter_are_one_mind_not_two(fake_mempalace, home, monk
 # --- what it must not disturb -------------------------------------------------
 
 
-def test_publishing_never_creates_a_palace_at_the_upstream_default(home, monkeypatch, tmp_path):
+def test_publishing_never_creates_a_palace_at_the_upstream_default(
+    home, monkeypatch, tmp_path, mempalace_selector
+):
     """It writes one small JSON file — it never runs `init`/`mine`, so no second palace appears.
 
     Two palaces would be strictly worse than the bug: the CLI and the harness would each be right
     about a different mind, and neither would say so.
     """
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent"))
+    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent", mempalace_selector))
 
     assert not (home / ".mempalace" / "palace").exists()
     assert list((home / ".mempalace").iterdir()) == [home / ".mempalace" / "config.json"]
@@ -1531,13 +1545,15 @@ def test_a_non_mempalace_agent_publishes_nothing(home, tmp_path):
     assert _cli_default_palace(home) == str(home / ".mempalace" / "palace")
 
 
-def test_the_read_only_introspection_path_publishes_nothing(home, monkeypatch, tmp_path):
+def test_the_read_only_introspection_path_publishes_nothing(
+    home, monkeypatch, tmp_path, mempalace_selector
+):
     """`_resolve_tools` is shared with `--resolved-config`, which must not write anywhere.
 
     The publication lives one level up, in `_resolve_tools_and_provider` — the "an agent is being
     built to act" seam — so introspecting a live agent over SSH stays side-effect-free.
     """
-    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
     monkeypatch.setenv("HARNESS_HOME", str(tmp_path / "agent"))
 
     _resolve_tools("openai", "openai", "responses")
@@ -1545,7 +1561,9 @@ def test_the_read_only_introspection_path_publishes_nothing(home, monkeypatch, t
     assert not (home / ".mempalace").exists()
 
 
-def test_the_operators_other_settings_survive_the_publication(home, monkeypatch, tmp_path):
+def test_the_operators_other_settings_survive_the_publication(
+    home, monkeypatch, tmp_path, mempalace_selector
+):
     """`config.json` is upstream's file, and some of its keys are load-bearing for the *data*.
 
     `embedding_model` in particular: ChromaDB refuses reads when the persisted embedding function
@@ -1565,7 +1583,7 @@ def test_the_operators_other_settings_survive_the_publication(home, monkeypatch,
         encoding="utf-8",
     )
 
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent"))
+    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent", mempalace_selector))
 
     written = json.loads(config_file.read_text())
     assert written["palace_path"] == str(tmp_path / "agent" / "mempalace")
@@ -1575,7 +1593,9 @@ def test_the_operators_other_settings_survive_the_publication(home, monkeypatch,
 
 
 @pytest.mark.parametrize("body", ["{not json at all", '["a", "list"]'])
-def test_an_unreadable_config_is_left_completely_alone(home, monkeypatch, tmp_path, body):
+def test_an_unreadable_config_is_left_completely_alone(
+    home, monkeypatch, tmp_path, body, mempalace_selector
+):
     """A file only its author can fix is not ours to overwrite.
 
     Upstream ignores such a file too, so the CLI is already on its default and the operator has a
@@ -1585,16 +1605,18 @@ def test_an_unreadable_config_is_left_completely_alone(home, monkeypatch, tmp_pa
     config_file.parent.mkdir()
     config_file.write_text(body, encoding="utf-8")
 
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent"))
+    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent", mempalace_selector))
 
     assert config_file.read_text() == body
 
 
-def test_an_already_correct_binding_is_not_rewritten(home, monkeypatch, tmp_path):
+def test_an_already_correct_binding_is_not_rewritten(
+    home, monkeypatch, tmp_path, mempalace_selector
+):
     """Publishing runs on every bind, so the steady state must be a pure read."""
     from basecradle_harness._mempalace import publish_palace_binding
 
-    provider = _bind(monkeypatch, tmp_path / "agent")
+    provider = _bind(monkeypatch, tmp_path / "agent", mempalace_selector)
     assert publish_palace_binding(provider.palace_path) is not None  # first bind writes
 
     assert publish_palace_binding(provider.palace_path) is None  # every bind after does not
@@ -1613,14 +1635,16 @@ def test_an_operators_tilde_written_path_already_counts_as_correct(home, monkeyp
     assert json.loads(config_file.read_text())["palace_path"] == "~/agent/mempalace"
 
 
-def test_the_published_file_is_owner_only_and_leaves_no_temp_behind(home, monkeypatch, tmp_path):
+def test_the_published_file_is_owner_only_and_leaves_no_temp_behind(
+    home, monkeypatch, tmp_path, mempalace_selector
+):
     """A `config.json` can carry an embeddings API key, so the published copy is never briefly
     world-readable — `os.open` with the mode, not a chmod after the fact.
 
     Asserted as "no group or other bits" rather than an exact mode, because the umask masks both
     the `mkdir` and the `os.open`: what must hold on any box is that nobody else can read it.
     """
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent"))
+    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent", mempalace_selector))
 
     config_dir = home / ".mempalace"
     assert stat.S_IMODE((config_dir / "config.json").stat().st_mode) & 0o077 == 0
@@ -1628,7 +1652,7 @@ def test_the_published_file_is_owner_only_and_leaves_no_temp_behind(home, monkey
     assert [p.name for p in config_dir.iterdir()] == ["config.json"]  # no stray temp file
 
 
-def test_a_real_filesystem_obstruction_is_survived(home, monkeypatch, tmp_path):
+def test_a_real_filesystem_obstruction_is_survived(home, monkeypatch, tmp_path, mempalace_selector):
     """`~/.mempalace` occupied by a regular file — a genuine OS failure, not a stubbed raise.
 
     The read fails with `NotADirectoryError`, which reads as "unusable" and stops the publication
@@ -1636,12 +1660,16 @@ def test_a_real_filesystem_obstruction_is_survived(home, monkeypatch, tmp_path):
     """
     (home / ".mempalace").write_text("not a directory", encoding="utf-8")
 
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent"))  # must not raise
+    _publish_palace_binding(
+        _bind(monkeypatch, tmp_path / "agent", mempalace_selector)
+    )  # must not raise
 
     assert (home / ".mempalace").read_text() == "not a directory"
 
 
-def test_a_publication_failure_never_breaks_the_bind(home, monkeypatch, tmp_path, caplog):
+def test_a_publication_failure_never_breaks_the_bind(
+    home, monkeypatch, tmp_path, caplog, mempalace_selector
+):
     """It is an operator convenience: a read-only home or a full disk costs the convenience, never
     the wake. Its absence is not silent either — the CLI names the path it looked at."""
     monkeypatch.setattr(
@@ -1649,7 +1677,9 @@ def test_a_publication_failure_never_breaks_the_bind(home, monkeypatch, tmp_path
         lambda _path: (_ for _ in ()).throw(PermissionError("read-only home")),
     )
 
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent"))  # must not raise
+    _publish_palace_binding(
+        _bind(monkeypatch, tmp_path / "agent", mempalace_selector)
+    )  # must not raise
 
     assert "mempalace CLI config" in caplog.text
 
@@ -1657,14 +1687,16 @@ def test_a_publication_failure_never_breaks_the_bind(home, monkeypatch, tmp_path
 # --- precedence: the publication is the *default*, and only that ---------------
 
 
-def test_an_explicit_palace_flag_still_wins(home, monkeypatch, tmp_path):
+def test_an_explicit_palace_flag_still_wins(home, monkeypatch, tmp_path, mempalace_selector):
     """`--palace` outranks everything, upstream and here — the publication only moves the default."""
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent"))
+    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent", mempalace_selector))
 
     assert _cli_default_palace(home, palace_flag="/tmp/other") == "/tmp/other"
 
 
-def test_mempalaces_own_env_var_wins_for_both_halves(home, monkeypatch, tmp_path):
+def test_mempalaces_own_env_var_wins_for_both_halves(
+    home, monkeypatch, tmp_path, mempalace_selector
+):
     """`MEMPALACE_PALACE_PATH` outranks the published file for the CLI — so the adapter reads it
     too, or the two would be looking at different minds again with the publication unable to say so.
 
@@ -1672,7 +1704,7 @@ def test_mempalaces_own_env_var_wins_for_both_halves(home, monkeypatch, tmp_path
     split in the other direction. Reading the same var, in upstream's own order, closes it.
     """
     elsewhere = tmp_path / "elsewhere"
-    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent"))
+    _publish_palace_binding(_bind(monkeypatch, tmp_path / "agent", mempalace_selector))
     monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(elsewhere))
 
     provider = memory_provider_from_env()

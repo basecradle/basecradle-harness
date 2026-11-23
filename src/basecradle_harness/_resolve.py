@@ -256,9 +256,10 @@ def resolve_stems(
             powerful stem named here is thereby granted). ``None`` means the full shipped default
             set — which is what a fresh install lays down. Use it to model a **pruned** agent,
             whose operator deleted defaults from its overlay.
-        memory_provider: ``HARNESS_MEMORY_PROVIDER`` — ``sqlite`` (default), ``mempalace``, or a
-            ``module:Class`` path. Its tools are part of the resolved set (they are why a pin says
-            ``memory``) but come from no stem, so the backend is an input here.
+        memory_provider: ``HARNESS_MEMORY_PROVIDER`` — ``sqlite`` (default), ``mempalace``,
+            ``mempalace-previous`` (the same adapter), or a ``module:Class`` path. Its tools are
+            part of the resolved set (they are why a pin says ``memory``) but come from no stem,
+            so the backend is an input here.
         assume_credentials: When ``True`` (the default), every credential an activation requirement
             reads (``AI_API_KEY``, ``NTFY_DM_TOKEN``, …) is **assumed present**, and the output says
             so — ``credentials.assumed`` names them and every conditional resolved name carries an
@@ -629,8 +630,9 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="NAME",
         help=(
-            "HARNESS_MEMORY_PROVIDER — sqlite (default), mempalace, or a module:Class path. Its "
-            "tools are part of the resolved set but come from no stem, so it is an input here."
+            "HARNESS_MEMORY_PROVIDER — sqlite (default), mempalace, mempalace-previous (the same "
+            "adapter), or a module:Class path. Its tools are part of the resolved set but come "
+            "from no stem, so it is an input here."
         ),
     )
     credentials = parser.add_mutually_exclusive_group()
