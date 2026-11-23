@@ -3,7 +3,7 @@
 The NOC's log-store canary pages on a credential-named ``KEY=VALUE`` whatever the value is, and a
 tool failure whose ``error=`` quotes ``export SOME_TOKEN=<value>`` reached the line as written:
 the scrub knew an ``api_key=`` assignment, a bearer token, four query parameters and an
-``x-api-key`` header, and no other assignment. So `_observability.scrub` — and with it `kv`, the
+``x-api-key`` header, and no other assignment. So `_redaction.scrub` — and with it `kv`, the
 `ScrubbingFormatter` every entrypoint's handler renders through, `last_word`, and the provider
 error relayed by `_report.verbatim` — redacts the value of every credential-named assignment.
 
@@ -29,23 +29,25 @@ import pytest
 
 from basecradle_harness._engine import Engine
 from basecradle_harness._observability import (
+    MAX_VALUE,
+    _flatten,
+    kv,
+    last_word,
+    log_handler,
+    scrub_line,
+)
+from basecradle_harness._redaction import (
     _BREAK_CHARS,
     CANARY_VALUE_FLOOR,
     CANARY_VALUE_STOPS,
     CREDENTIAL_NAME,
     CREDENTIAL_TAIL,
     CREDENTIAL_WORDS,
-    MAX_VALUE,
     REDACTED_VALUE,
-    _flatten,
     _value_end,
     bounded,
-    kv,
-    last_word,
-    log_handler,
     redact_credentials,
     scrub,
-    scrub_line,
 )
 from basecradle_harness._report import verbatim
 from basecradle_harness._tools import Tool, ToolRegistry

@@ -158,14 +158,8 @@ import time
 
 from basecradle_harness._breaker import breaker_tripped_line
 from basecradle_harness._key_spend import key_spend_error_line, key_spend_line
-from basecradle_harness._observability import (
-    LOG_FORMAT,
-    agent_slug,
-    bounded,
-    install_log_handler,
-    last_word,
-    scrub,
-)
+from basecradle_harness._observability import LOG_FORMAT, agent_slug, install_log_handler, last_word
+from basecradle_harness._redaction import bounded, scrub
 from basecradle_harness._report import (
     PROBE_SOURCE,
     billing_onset_line,

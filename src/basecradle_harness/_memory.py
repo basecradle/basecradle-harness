@@ -49,7 +49,8 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from basecradle_harness._observability import tool_failed
+from basecradle_harness._observability import REDACTED_FACT, log_redacted, tool_failed
+from basecradle_harness._redaction import scrub, scrub_counted
 from basecradle_harness._tools import Tool
 
 # Where the store lives when no explicit path is given: under the agent's home
@@ -86,6 +87,20 @@ _MIGRATIONS: dict[int, str] = {
 SEARCH_LIMIT = 20
 
 
+#: What the model is told when the key it named a fact by holds a secret (issue #999).
+KEY_REFUSAL = (
+    "Error: that key holds a secret, so the fact was not stored. Name the fact without the "
+    "secret; a secret belongs where your instructions say secrets belong, never in memory."
+)
+
+#: What the model is told when a fact it stored lost secrets to the redaction (issue #999): how
+#: many, and where a secret belongs instead. Never which: the count is all it learns.
+REDACTED_NOTE = (
+    "{count} secret(s) in it were redacted before it was stored: keep a secret where your "
+    "instructions say secrets belong, never in memory."
+)
+
+
 class SqliteMemoryStore:
     """The five durable memory ops over one SQLite file — the engine behind the tool.
 
@@ -116,6 +131,15 @@ class SqliteMemoryStore:
     # --- the five ops --------------------------------------------------------
 
     def write(self, key: str, value: str) -> str:
+        # Redacted before it is stored (issue #999): a secret in a fact goes, its marker stays, and
+        # the fact is kept. A key is the fact's name, so one holding a secret is refused rather than
+        # redacted: two keys redacted alike would overwrite each other, and a row stored before
+        # this rule could no longer be read by its own name. A fact that cannot be redacted raises
+        # here, before anything is written.
+        if scrub(key) != key:
+            return tool_failed(KEY_REFUSAL, reason="invalid_arguments")
+        value, count = scrub_counted(value)
+        log_redacted(REDACTED_FACT, count)
         now = _now()
         conn = self._connect()
         # Upsert: a new key is inserted with both timestamps; an existing key keeps
@@ -130,6 +154,8 @@ class SqliteMemoryStore:
             (key, value, now, now),
         )
         conn.commit()
+        if count:
+            return f"Remembered {key!r}. " + REDACTED_NOTE.format(count=count)
         return f"Remembered {key!r}."
 
     def read(self, key: str) -> str:

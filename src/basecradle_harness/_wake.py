@@ -220,21 +220,22 @@ from basecradle_harness._observability import (
     COST_BASIS_COMPUTED,
     GREEN,
     RED,
+    REDACTED_EXCHANGE,
     YELLOW,
-    bounded,
     delivery_id,
     describe_provider,
     head,
     in_wake,
     kv,
     last_word,
+    log_redacted,
     log_unspoken,
-    scrub,
 )
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._plugins import ResolvedTools
 from basecradle_harness._probe import verify_marked
 from basecradle_harness._provider import Provider
+from basecradle_harness._redaction import bounded, scrub, scrub_counted
 from basecradle_harness._report import (
     BILLING,
     OUTAGE,
@@ -3384,6 +3385,25 @@ class WakeAgent:
             # Mining an empty exchange writes a drawer that can only ever dilute retrieval.
             return
         try:
+            # The one exception to filing verbatim (issue #999): every secret goes, its marker
+            # stays, and the rest is filed. Before any provider sees the exchange, so before it is
+            # split into drawers or written under `conversations/`.
+            user, from_user = scrub_counted(user)
+            assistant, from_assistant = scrub_counted(assistant)
+        except Exception:  # noqa: BLE001 - an exchange that cannot be redacted is never filed
+            _log.warning(
+                "memory %s",
+                kv(
+                    op="observe",
+                    result="skipped",
+                    reason="redaction_failed",
+                    timeline=self.timeline_uuid,
+                ),
+                exc_info=True,
+            )
+            return
+        log_redacted(REDACTED_EXCHANGE, from_user + from_assistant, timeline=self.timeline_uuid)
+        try:
             self.memory_provider.observe(
                 MemoryExchange(
                     user=user,
@@ -5482,12 +5502,14 @@ def _carries(content: str | None, rendered: str) -> bool:
     """
     if not content:
         return False
-    if content == rendered:
-        return True
-    return (
-        content.startswith(f"{rendered}\n")
-        or content.endswith(f"\n{rendered}")
-        or f"\n{rendered}\n" in content
+    # The transcript is persisted redacted (issue #999), so a turn on disk carries the redacted
+    # rendering of a message whose live rendering still holds a secret: both are the same block.
+    return any(
+        content == block
+        or content.startswith(f"{block}\n")
+        or content.endswith(f"\n{block}")
+        or f"\n{block}\n" in content
+        for block in {rendered, scrub(rendered)}
     )
 
 

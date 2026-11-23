@@ -553,6 +553,22 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   operator's MCP tokens. `_secret.Secret` has no `__dict__`, renders `[REDACTED]`, refuses pickle,
   and is revealed only on the line that sends it. **A new attribute holding a credential needs a
   `Secret` and a row in `tests/test_secret.py`'s `HOLDERS`**, or it is the same leak again.
+- **What a secret is has one definition, and every text the harness writes goes through it**
+  (issue #999, @origin, 2026-11-23). `_redaction` is the one module and
+  `data/secret-shapes.json` the one public file (`docs/secret-shapes.md`): a shape is spelled
+  there and nowhere else, so a second copy of a pattern, or a hand-rolled `text.replace(key, …)`,
+  is the defect (`test_redaction.py` scans the package for one). Two halves run together in
+  `scrub`: the agent's configured secrets by value (credential-named environment variables and
+  every credential `Secret` alive, at least 20 characters for a bare match) and the shapes. It is
+  applied to log lines, to an exchange before it is filed into memory (the one exception to filing
+  verbatim, `@briggs`'s rule: the marker stays, the rest is filed, and an exchange the redaction
+  cannot run on is not filed at all), to the session transcript **where it is recorded**
+  (`_session._payload`, on the way out and before the caps, because the file is rewritten from the
+  turn on every save; an interrupted create's replayable arguments are the one exception, kept
+  whole as recovery evidence), to a fact the memory tool stores, and to the text files a
+  stdio MCP call wrote in `.playwright-mcp/` or named (`_mcp`, never an image, never a secret
+  store). **A new place the harness writes text down applies it, or it is an unredacted copy.**
+  Images are out of scope by founder decision, and nothing already filed is rewritten.
 - **MCP is safe-by-default.** `mcp/` ships **empty** and the locked `Policy` denies shell/exec, so
   a fresh install is safe by default. Loading an MCP server — **or** a drop-in `tools/` tool
   that needs a policy-denied capability — is the operator *knowingly leaving the safe zone*, so the

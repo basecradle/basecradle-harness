@@ -77,7 +77,8 @@ from basecradle_harness._exceptions import (
     ProviderPayloadTooLargeError,
 )
 from basecradle_harness._media import _detail_from_body
-from basecradle_harness._observability import RED, YELLOW, Rendered, bounded, head, kv, scrub
+from basecradle_harness._observability import RED, YELLOW, Rendered, head, kv
+from basecradle_harness._redaction import bounded, scrub
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -164,7 +165,7 @@ def verbatim(exc: BaseException) -> str:
     softened, never translated — the human decides what to do from the real message.
 
     **Every credential shape is scrubbed out of it, here, at the one place it is dug out** (issue
-    #791): a span `_observability.scrub` matches becomes ``[redacted]``, the value of a
+    #791): a span `_redaction.scrub` matches becomes ``[redacted]``, the value of a
     credential-named assignment becomes ``'<a redacted value>'`` with its name kept, taken whole as
     the shell would read it (issue #918), and every other character stays as the vendor wrote it. The text is posted to a timeline peers read (`report_body`, the
     stall note through `stall_detail`) and persisted as a claim's reason, so scrubbing it at the
@@ -218,7 +219,8 @@ def stall_detail(error: BaseException) -> str:
     the text stays in the log where it belongs.
     """
     if isinstance(error, ProviderError):
-        detail = bounded(verbatim(error).strip(), STALL_DETAIL_CAP) or type(error).__name__
+        # Scrubbed before it is cut, and before it is kept on the claim as the note's words.
+        detail = bounded(scrub(verbatim(error)).strip(), STALL_DETAIL_CAP) or type(error).__name__
         return f"last error: {detail}"
     return f"last error: an internal fault ({type(error).__name__}); the details are in its log"
 

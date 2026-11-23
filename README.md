@@ -2465,6 +2465,17 @@ prices = json.loads(path.read_text(encoding="utf-8"))
 
 The file is the harness's own source, so it holds exactly the prices that release logs. Its format, its fields and the stability promise (a field is added, never renamed or repurposed, without a `format_version` change) are in [`docs/prices.md`](docs/prices.md) ([#997](https://github.com/basecradle/basecradle-harness/issues/997)).
 
+## What the harness redacts — the public secret-shapes file
+
+The harness blanks secrets from every text it writes down: its log lines, each timeline's session transcript (on every save, so a value typed through a tool call never reaches the file), what it files into the agent's memory (an exchange it mines, a fact the memory tool stores; a fact whose key holds a secret is refused), and the text files a tool saves under a stdio MCP server's working directory (every text file in `.playwright-mcp/`, and every text file a call named, that the call wrote; images are never opened). One definition decides what a secret is, in two halves ([#999](https://github.com/basecradle/basecradle-harness/issues/999)):
+
+- **By value:** the agent's own configured secrets — the value of every environment variable whose name names a credential (`BASECRADLE_TOKEN`, `AI_API_KEY`, `NTFY_DM_TOKEN`, …) and of every credential the harness holds under such a name, at least 20 characters long. This half needs no pattern, so it catches a vendor nobody has listed.
+- **By shape:** the vendor key prefixes, a credential-named assignment, a bearer header, a key in a query or an `api_key=`, an `x-api-key` header, a credential-named JSON member, and a heartbeat URL.
+
+The secret is replaced with `[redacted]` (or, after a credential's name, `'<a redacted value>'`) and the rest of the text is kept: a redacted exchange is still remembered, without the secret. Nothing already in memory is rewritten. A key that is neither one of the agent's configured secrets nor one of the shapes is caught by neither, which is why the agent is told only that a secret kept anywhere but where secrets belong *may* be redacted. The agent's config home, `~/.config`, `~/vault`, `~/wallets`, `~/.ssh` and `~/.gnupg` are never read for redaction or changed.
+
+The shapes are **public data**, one JSON file every release carries at `basecradle_harness/data/secret-shapes.json`, read the same way as the prices file above; its format and stability promise are in [`docs/secret-shapes.md`](docs/secret-shapes.md). Each redaction outside the log writes one `secrets redacted` line (`docs/telemetry.md`).
+
 ## Add your own provider
 
 A provider is **any object with a `chat(messages, tools=None) -> Message` method**. There is nothing to inherit; implement that one method and you have a new brain.

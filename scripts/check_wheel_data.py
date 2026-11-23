@@ -22,7 +22,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 #: Every data file the package publishes, by its path inside the wheel. Its source is the same path
 #: under ``src/``.
-PUBLISHED = ("basecradle_harness/data/prices.json",)
+PUBLISHED = (
+    "basecradle_harness/data/prices.json",
+    "basecradle_harness/data/secret-shapes.json",
+)
 
 
 def check(wheel: Path, root: Path = ROOT) -> list[str]:

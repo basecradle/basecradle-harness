@@ -322,19 +322,22 @@ def test_the_check_publishes_the_prices_file():
 
 
 def test_a_wheel_carrying_the_file_passes(tmp_path):
-    wheel = _wheel(tmp_path, {"basecradle_harness/data/prices.json": FILE.read_bytes()})
+    members = {path: (ROOT / "src" / path).read_bytes() for path in check_wheel_data.PUBLISHED}
+    wheel = _wheel(tmp_path, members)
     assert check_wheel_data.check(wheel) == []
 
 
 def test_a_wheel_without_the_file_fails(tmp_path):
     wheel = _wheel(tmp_path, {"basecradle_harness/_prices.py": b""})
     assert check_wheel_data.check(wheel) == [
-        f"{wheel.name} carries no basecradle_harness/data/prices.json"
+        f"{wheel.name} carries no {path}" for path in check_wheel_data.PUBLISHED
     ]
 
 
 def test_a_wheel_carrying_other_bytes_fails(tmp_path):
-    wheel = _wheel(tmp_path, {"basecradle_harness/data/prices.json": FILE.read_bytes() + b" "})
+    members = {path: (ROOT / "src" / path).read_bytes() for path in check_wheel_data.PUBLISHED}
+    members["basecradle_harness/data/prices.json"] += b" "
+    wheel = _wheel(tmp_path, members)
     (error,) = check_wheel_data.check(wheel)
     assert "differs from src/basecradle_harness/data/prices.json" in error
 

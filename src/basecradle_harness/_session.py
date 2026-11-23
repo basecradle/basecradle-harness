@@ -84,7 +84,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -97,6 +98,13 @@ from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._idempotency import create_kind
 from basecradle_harness._messages import ImageContent, Message, ToolCall
+from basecradle_harness._redaction import (
+    REDACTED,
+    configured_values,
+    names_a_secret_field,
+    scrub,
+    stable_cut,
+)
 from basecradle_harness._stop import WakeStopped
 
 _log = logging.getLogger("basecradle_harness")
@@ -214,6 +222,9 @@ class Session:
         #: per process: two `Harness` instances over one home hold two `Session`s on the same path
         #: in the same process, and they must not share a temp file.
         self._token = uuid4().hex[:8]
+        #: What each text this session last saved redacted to (issue #999), so a save rescans only
+        #: what changed since the one before: every step of a turn saves the whole transcript.
+        self._redactions = _RedactionMemo()
         #: The index in `history` of the user turn of the exchange in progress (or the last one
         #: that ran). With `_convo`/`_adopted` it answers `turn_work` — what *this* turn has
         #: produced — which is what the idempotency minter counts its ordinal off (`_idempotency`).
@@ -524,7 +535,8 @@ class Session:
             self._span = (at, len(work))
             if turn is not None:
                 turn.images = []
-            _cap_tool_results(self.history)
+            with self._redactions.use() as redact:
+                _cap_tool_results(self.history, redact)
             self._convo = None  # the work is adopted; nothing is in flight
             self._persist(masking=failing)
         return reply
@@ -779,7 +791,8 @@ class Session:
         # Cap on the way in as well as on the way out, so a transcript written *before* the
         # cap existed heals on the next wake instead of taxing the agent forever. Idempotent:
         # an already-capped result is under the cap and passes through untouched.
-        _cap_tool_results(history)
+        with self._redactions.use() as redact:
+            _cap_tool_results(history, redact)
         # A transcript written by a wake that was *killed* can end mid-tool-chain, with a call
         # issued and its result never recorded. Give every such call a result before anyone can
         # send this list to a provider — see `heal_interrupted_calls` for why that is not
@@ -877,7 +890,8 @@ class Session:
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = _payload(self.history if messages is None else messages)
+        with self._redactions.use(saving=True) as redact:
+            payload = _payload(self.history if messages is None else messages, redact)
         temp = self._temp(self.path)
         try:
             with open(temp, "w") as handle:
@@ -898,7 +912,52 @@ class Session:
         return path.with_suffix(f"{path.suffix}.{os.getpid()}-{self._token}.tmp")
 
 
-def _payload(messages: list[Message]) -> str:
+class _RedactionMemo:
+    """The redacted form of each text one `Session` saved last, keyed on the text's identity.
+
+    Redaction is a pure function of a text and the agent's configured secrets, and a turn saves the
+    whole transcript on every step, so without this a 5 MB tool result was rescanned (about 90 ms
+    per MB) on every save of the turn that returned it. A hit needs the very same string object, so
+    a changed text is a new object and a miss; a change in the configured secrets clears it; and
+    each save keeps only the texts it used, so it never holds more than the transcript does. It
+    holds what `history` already holds, and shows none of it: no ``__dict__``, a fixed ``repr``,
+    no pickling, as `Secret` does.
+    """
+
+    __slots__ = ("_entries", "_fresh", "_values")
+
+    def __init__(self) -> None:
+        self._values: tuple[str, ...] | None = None
+        self._entries: dict[int, tuple[str, str]] = {}
+        self._fresh: dict[int, tuple[str, str]] = {}
+
+    def __repr__(self) -> str:
+        return "_RedactionMemo([REDACTED])"
+
+    def __reduce__(self) -> Any:
+        raise TypeError("A redaction memo holds credentials and cannot be serialized.")
+
+    @contextmanager
+    def use(self, *, saving: bool = False) -> Iterator[Callable[[str], str]]:
+        """The memo's redaction, for one save (`saving`, after which it keeps only what that save
+        used and what was redacted since the last one) or for the cap at a turn's end."""
+        values = tuple(configured_values())
+        if values != self._values:
+            self._values, self._entries, self._fresh = values, {}, {}
+        try:
+            yield self._redact
+        finally:
+            if saving:
+                self._entries, self._fresh = self._fresh, {}
+
+    def _redact(self, text: str) -> str:
+        hit = self._fresh.get(id(text)) or self._entries.get(id(text))
+        redacted = hit[1] if hit is not None and hit[0] is text else scrub(text)
+        self._fresh[id(text)] = (text, redacted)
+        return redacted
+
+
+def _payload(messages: list[Message], redact: Callable[[str], str] = scrub) -> str:
     """The JSON a transcript persists as — **bounded on the way out, never in place**.
 
     Persisting once per turn could bound the *live* list, because by then the model had finished
@@ -918,21 +977,50 @@ def _payload(messages: list[Message]) -> str:
     reference, so a cap written in place would reach into the call the engine is about to dispatch —
     and, worse, into the arguments a resume replays a create from. The capped copy goes into the
     payload and nowhere else.
+
+    **Every secret is blanked here, on the way out, before any cap cuts it** (issue #999). The file
+    is rewritten from `history` on every save, so a value blanked anywhere else (in the file after
+    it is written, in the live list) comes back on the next save, or is taken from a turn the model
+    is still in. So each text a turn persists goes through `_redaction.scrub` before it is bounded:
+    a cut first could leave half a secret no rule matches. The model keeps reading the value for the
+    rest of the turn and wake that saw it; every later wake loads the redacted form. Two things are
+    deliberately not passed through it, both recovery evidence: an `INTERRUPTED` result, which is read
+    by exact match (every other sentinel a later wake reads, `STOPPED` and the stop and truncation
+    notes, holds no secret, and `test_redaction.py` pins that the redaction leaves each byte for byte),
+    and the arguments of a call `_replayable` keeps whole, because the recovery re-issues that create under the key its dead wake minted,
+    from exactly those bytes. That exception is bounded as the cap's is: one dead turn's creates,
+    until the re-issue writes a real result and the next save redacts them.
+
+    The caps stay a fixed point with the redaction in front of them: a cut never splits a marker
+    or leaves a value open for the next save's scrub to complete (`_redaction.stable_cut`), and an
+    excerpt that would not read back as itself falls to the floor. The server-tool record is
+    redacted where it is bounded, at arrival (`_server_tools._capped`), never here.
+
+    **A replayed ``[redacted]`` is not refused** the way an elision marker is (`_elision`): it is a
+    stand-in for content the reader no longer has, but it is also an ordinary word a model writes
+    on purpose, and refusing every call that carries it would refuse legitimate speech. A model that
+    types it back types a placeholder, never the secret; that is the price, and it is stated here.
     """
-    capped = _capped_results(messages)
+    capped = _capped_results(messages, redact)
     payload: list[dict] = []
     for index, message in enumerate(messages):
         data = message.to_dict()
         data.pop("images", None)  # a viewed image is seen once; base64 never lands in a transcript
         if index in capped:
             data["content"] = capped[index]
+        elif isinstance(message.content, str) and not _is_interrupted(message):
+            data["content"] = redact(message.content)
         if message.tool_calls:
-            data["tool_calls"] = _calls_payload(message.tool_calls, _results(messages, index))
+            data["tool_calls"] = _calls_payload(
+                message.tool_calls, _results(messages, index), redact
+            )
         payload.append(data)
     return json.dumps(payload, indent=2)
 
 
-def _calls_payload(calls: list[ToolCall], results: dict[str, Message]) -> list[dict]:
+def _calls_payload(
+    calls: list[ToolCall], results: dict[str, Message], redact: Callable[[str], str] = scrub
+) -> list[dict]:
     """The `tool_calls` a turn persists — **the step's calls share one argument budget** (issue #304).
 
     The same unit change the results got, for the same reason: `max_steps` bounds the model's calls,
@@ -951,7 +1039,7 @@ def _calls_payload(calls: list[ToolCall], results: dict[str, Message]) -> list[d
         index for index, call in enumerate(calls) if not _replayable(call, results.get(call.id))
     ]
     fitted = _fill(
-        [calls[index].arguments for index in bounded],
+        [_redacted(calls[index].arguments, redact) for index in bounded],
         TOOL_ARGS_CAP,
         size=_json_size,
         elide=_cap_arguments,
@@ -961,6 +1049,26 @@ def _calls_payload(calls: list[ToolCall], results: dict[str, Message]) -> list[d
         {"id": call.id, "name": call.name, "arguments": capped.get(index, call.arguments)}
         for index, call in enumerate(calls)
     ]
+
+
+def _redacted(value: Any, redact: Callable[[str], str] = scrub) -> Any:
+    """`value` (a call's arguments) with every string in it, at any depth, through `scrub` — a copy,
+    so the live arguments the engine dispatches are never touched (issue #999). A string held under
+    a field whose name names a secret (`names_a_secret_field`: ``password``, ``x-api-key`` in a
+    ``headers`` map, ``GH_TOKEN`` in an ``env`` map) is blanked whole, because scrubbing it alone
+    loses the name that made it one. The names themselves are kept."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {
+            key: REDACTED
+            if isinstance(item, str) and item and isinstance(key, str) and names_a_secret_field(key)
+            else _redacted(item, redact)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redacted(item, redact) for item in value]
+    return value
 
 
 def _results(messages: list[Message], assistant: int) -> dict[str, Message]:
@@ -1126,7 +1234,7 @@ def _run_end(history: list[Message], assistant: int) -> int:
     return index
 
 
-def _cap_tool_results(history: list[Message]) -> None:
+def _cap_tool_results(history: list[Message], redact: Callable[[str], str] = scrub) -> None:
     """Elide the over-long tool results in place, so the transcript stays bounded (issue #275).
 
     Only `tool` turns are touched, and only their `content` — the `tool_call_id` that pairs a
@@ -1141,11 +1249,13 @@ def _cap_tool_results(history: list[Message]) -> None:
     It reads its answer from `_capped_results`, the same function `_payload` writes the disk from, so
     the live transcript and the file can never disagree about what a step's results cost.
     """
-    for index, content in _capped_results(history).items():
+    for index, content in _capped_results(history, redact).items():
         history[index].content = content
 
 
-def _capped_results(messages: list[Message]) -> dict[int, str]:
+def _capped_results(
+    messages: list[Message], redact: Callable[[str], str] = scrub
+) -> dict[int, str]:
     """Each tool result's persisted content, by index — **one step's results share one cap** (#304).
 
     The unit is the step, not the call, and that is the whole fix. A model may emit several tool calls
@@ -1182,16 +1292,19 @@ def _capped_results(messages: list[Message]) -> dict[int, str]:
             i
             for i in range(index + 1, _run_end(messages, index))
             if messages[i].role == "tool"
+            and isinstance(messages[i].content, str)
             and messages[i].content
             and not _is_interrupted(messages[i])
         ]
-        results = [messages[i].content or "" for i in step]
+        results = [redact(messages[i].content or "") for i in step]  # redacted before cut, #999
         capped.update(zip(step, _fill(results, TOOL_RESULT_CAP, size=len, elide=_elide)))
     for index, message in enumerate(messages):
-        if index in capped or message.role != "tool" or not message.content:
+        if index in capped or message.role != "tool" or not isinstance(message.content, str):
+            continue
+        if not message.content:
             continue
         if not _is_interrupted(message):
-            capped[index] = _elide(message.content, TOOL_RESULT_CAP)
+            capped[index] = _elide(redact(message.content), TOOL_RESULT_CAP)
     return capped
 
 
@@ -1268,8 +1381,11 @@ def _elide(text: str, budget: int) -> str:
     room = min(room, _ELISION_HEAD + _ELISION_TAIL)  # a share may shrink the excerpt, never grow it
     tail = room * _ELISION_TAIL // (_ELISION_HEAD + _ELISION_TAIL)
     head = room - tail
-    cut = len(text) - head - tail
-    return text[:head] + result_marker(cut, len(text)) + (text[-tail:] if tail else "")
+    end, start = stable_cut(text, head, len(text) - tail)
+    excerpt = text[:end] + result_marker(start - end, len(text)) + text[start:]
+    # Measured as well as computed: an excerpt the next save's scrub would not read back as itself
+    # is not a fixed point, and the floor is (issue #999).
+    return excerpt if scrub(excerpt) == excerpt else gone(len(text))
 
 
 def _cap_arguments(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
@@ -1370,9 +1486,14 @@ def _elide_argument(value: Any, budget: int) -> Any:
         elided = gone(size)  # no room for an excerpt worth reading; the floor is all that fits
         return elided if _json_size(elided) < size else value
     tail_room = min(room // 5, _ARG_ELISION_TAIL)
-    head = _within(value, room - tail_room)
-    tail = _within(value, tail_room, from_end=True)
-    elided = head + marker + tail
+    end, start = stable_cut(
+        value,
+        len(_within(value, room - tail_room)),
+        len(value) - len(_within(value, tail_room, from_end=True)),
+    )
+    elided = value[:end] + marker + value[start:]
+    if scrub(elided) != elided:  # not a fixed point under the next save's scrub (issue #999)
+        elided = gone(size)
     return elided if _json_size(elided) < size else value
 
 

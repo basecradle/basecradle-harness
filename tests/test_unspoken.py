@@ -422,7 +422,7 @@ def _model_facing_strings():
     other surface — the brief, the nudges, the guidance the engine feeds back — where the word
     would be a lie the model then reasons from.
     """
-    from basecradle_harness import _arguments, _brain_check, _mempalace, _session
+    from basecradle_harness import _arguments, _brain_check, _memory, _mempalace, _session
     from basecradle_harness._brief import (
         render_brain,
         render_budget,
@@ -515,6 +515,9 @@ def _model_facing_strings():
         "recall heading": _mempalace._INJECTED_HEADING,
         "recall reading guide": _mempalace._READING_GUIDE,
         "memory_search description": _mempalace.MemPalaceSearchTool.description,
+        # Issue #999: what the model is told when a fact it stored lost a secret.
+        "redacted fact note": _memory.REDACTED_NOTE.format(count=1),
+        "secret key refusal": _memory.KEY_REFUSAL,
         # Issue #848: what the model reads about the refuseless balance tool.
         "refuseless_account_balance description": RefuselessAccountBalanceTool.description,
         "refuseless_account_balance note": _shipped_note("refuseless_account_balance.py"),

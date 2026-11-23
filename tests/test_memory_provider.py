@@ -1000,3 +1000,55 @@ def test_a_compaction_touches_no_memory_surface(platform, tmp_path):
 
     assert "WORK DONE" in history[0].content  # the summary landed in the transcript…
     assert touched == []  # …and nowhere else
+
+
+# --- an exchange is filed with its secrets blanked (issue #999) ------------------------------------
+
+#: A fabricated secret of no listed shape, configured for the agent: only the value half catches it.
+_CONFIGURED_SECRET = "Pz4Wq8Lm2Xv7Tn9Rb5Kc3Hd6Jf1Gs0Ya"
+#: A fabricated GitHub token: the shape half catches it.
+_SHAPED_SECRET = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+
+def test_an_exchange_is_filed_with_its_secrets_blanked_and_the_rest_kept(
+    platform, tmp_path, monkeypatch, caplog
+):
+    """`@briggs`'s rule: blank the value, leave the definition's own marker, file the rest — before
+    any provider sees the exchange, so before it is split into drawers or written as a file."""
+    monkeypatch.setenv("FAL_KEY", _CONFIGURED_SECRET)
+    body = f"Use {_CONFIGURED_SECRET} for fal and {_SHAPED_SECRET} for GitHub, then report back."
+    _serve_messages(platform, {"messages": [_message(uuid=M0, body=body)], "next_cursor": None})
+    provider = RecordingProvider()
+    agent = _wake(tmp_path, provider)
+
+    with caplog.at_level("INFO", logger="basecradle_harness"):
+        agent.wake()
+
+    (exchange,) = provider.observed
+    assert _CONFIGURED_SECRET not in exchange.user and _SHAPED_SECRET not in exchange.user
+    assert "Use [redacted] for fal and [redacted] for GitHub, then report back." in exchange.user
+    assert exchange.assistant == "Hello, John."  # the rest of the exchange is filed as it was
+    assert f"secrets redacted kind=exchange count=2 timeline={TIMELINE_UUID}" in caplog.text
+    assert _CONFIGURED_SECRET not in caplog.text  # the count never carries the text
+
+
+def test_an_exchange_the_redaction_cannot_run_on_is_never_filed(
+    platform, tmp_path, monkeypatch, caplog
+):
+    """If the scrub cannot run, nothing is written: the raw exchange is never filed instead."""
+    _serve_messages(
+        platform, {"messages": [_message(uuid=M0, body="Remember this.")], "next_cursor": None}
+    )
+
+    def broken(text):
+        raise RuntimeError("the redaction failed")
+
+    monkeypatch.setattr("basecradle_harness._wake.scrub_counted", broken)
+    provider = RecordingProvider()
+    agent = _wake(tmp_path, provider)
+
+    with caplog.at_level("INFO", logger="basecradle_harness"):
+        agent.wake()
+
+    assert provider.observed == []
+    assert "memory op=observe result=skipped reason=redaction_failed" in caplog.text

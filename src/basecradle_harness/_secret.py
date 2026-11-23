@@ -23,11 +23,21 @@ What it does not do, stated: a credential a **vendor SDK** keeps on its own clie
 ``_client``; reimplementing vendor clients is not this module's job. An adapter that wants that
 object out of every representation of itself holds it in a `Sealed` — the Google adapter's
 service-account credential and the Anthropic adapter's SDK client do.
+
+**Every credential held here is known by value** (issue #999): a `Secret` built as a credential
+(the default) is listed by `known_secrets` for as long as something holds it, so the one redaction
+every text the harness writes goes through (`_redaction`) blanks its value wherever it appears. The
+list holds the `Secret` objects themselves, weakly, never their values, so it adds no plain copy of
+a credential and keeps none alive. A value wrapped only to keep it out of a representation, not
+because it is a credential (an MCP server's ``env`` entry whose name names none), says so with
+``credential=False`` and is not listed.
 """
 
 from __future__ import annotations
 
 import hmac
+import threading
+import weakref
 from typing import Any
 
 _REDACTED = "[REDACTED]"
@@ -43,10 +53,13 @@ class Secret:
     'sk-example'
     """
 
-    __slots__ = ("_value",)
+    __slots__ = ("__weakref__", "_value")
 
-    def __init__(self, value: str) -> None:
+    def __init__(self, value: str, *, credential: bool = True) -> None:
         self._value = value
+        if credential and value:
+            with _HELD_LOCK:
+                _HELD[id(self)] = self
 
     def reveal(self) -> str:
         """The credential itself — for the call that sends it, and nothing else."""
@@ -112,6 +125,24 @@ class Sealed:
 
     def __deepcopy__(self, memo: dict[int, Any]) -> Sealed:
         return self
+
+
+#: Every credential `Secret` alive in this process, by `id`, held weakly: an entry goes when its
+#: `Secret` does. Keyed by `id` because a `Secret` is unhashable on purpose (its hash would be one
+#: more thing derived from the value).
+_HELD: weakref.WeakValueDictionary[int, Secret] = weakref.WeakValueDictionary()
+
+#: Held while `_HELD` is written or read, so a `Secret` built on one thread never changes the
+#: mapping under a snapshot another thread is taking (a log line, a memory write).
+_HELD_LOCK = threading.Lock()
+
+
+def known_secrets() -> list[str]:
+    """The value of every credential `Secret` alive in this process (`_redaction.configured_values`
+    reads them, so a credential the harness holds is blanked wherever it would be written)."""
+    with _HELD_LOCK:
+        held = list(_HELD.values())
+    return [secret.reveal() for secret in held]
 
 
 def secret(value: str | None) -> Secret | None:
