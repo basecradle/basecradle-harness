@@ -5502,12 +5502,14 @@ def _carries(content: str | None, rendered: str) -> bool:
     """
     if not content:
         return False
-    if content == rendered:
-        return True
-    return (
-        content.startswith(f"{rendered}\n")
-        or content.endswith(f"\n{rendered}")
-        or f"\n{rendered}\n" in content
+    # The transcript is persisted redacted (issue #999), so a turn on disk carries the redacted
+    # rendering of a message whose live rendering still holds a secret: both are the same block.
+    return any(
+        content == block
+        or content.startswith(f"{block}\n")
+        or content.endswith(f"\n{block}")
+        or f"\n{block}\n" in content
+        for block in {rendered, scrub(rendered)}
     )
 
 

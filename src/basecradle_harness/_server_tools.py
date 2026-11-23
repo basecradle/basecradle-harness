@@ -58,6 +58,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from basecradle_harness._messages import Message, ServerToolRecord, ServerToolUse
+from basecradle_harness._redaction import scrub, stable_cut
 
 #: The most uses one turn's record lists by name; any beyond are counted, not listed.
 MAX_LISTED = 4
@@ -200,9 +201,14 @@ def bound(found: ServerToolRecord | None) -> ServerToolRecord | None:
 
 
 def _capped(use: ServerToolUse) -> ServerToolUse:
+    """One use, redacted and then bounded (issue #999). Redacted here, at arrival and before the
+    cut, because this is the one record bounded at arrival and never again: redacted later, a
+    marker longer than the value it replaced would carry the record past its cap. Each cut ends
+    where the next scrub reads the head back as itself (`stable_cut`), so `bound` stays a fixed
+    point."""
     name = _cut(_one_line(use.name), NAME_CAP) or "server_tool"
-    failed = _cut(_one_line(use.failed), FAILURE_CAP)
-    return ServerToolUse(name=name, input=_cut_quoted(_one_line(use.input)), failed=failed)
+    failed = _cut(scrub(_one_line(use.failed)), FAILURE_CAP)
+    return ServerToolUse(name=name, input=_cut_quoted(scrub(_one_line(use.input))), failed=failed)
 
 
 def _one_line(text: str) -> str:
@@ -220,11 +226,13 @@ def _cut_quoted(text: str) -> str:
     cut = text[: INPUT_CAP - len(_ELLIPSIS)]
     while len(_quoted(cut + _ELLIPSIS)) - 2 > INPUT_CAP:
         cut = cut[:-1]
-    return cut + _ELLIPSIS
+    return text[: stable_cut(text, len(cut), len(text))[0]] + _ELLIPSIS
 
 
 def _cut(text: str, cap: int) -> str:
-    return text if len(text) <= cap else text[: cap - len(_ELLIPSIS)] + _ELLIPSIS
+    if len(text) <= cap:
+        return text
+    return text[: stable_cut(text, cap - len(_ELLIPSIS), len(text))[0]] + _ELLIPSIS
 
 
 def mark_failed(message: Message, index: int, reason: str) -> bool:
@@ -239,7 +247,7 @@ def mark_failed(message: Message, index: int, reason: str) -> bool:
     if found is None or not 0 <= index < len(found.uses):
         return False
     use = found.uses[index]
-    failed = _cut(_one_line(reason), FAILURE_CAP) or "failed"
+    failed = _cut(scrub(_one_line(reason)), FAILURE_CAP) or "failed"
     found.uses[index] = ServerToolUse(name=use.name, input=use.input, failed=failed)
     return True
 

@@ -1230,6 +1230,42 @@ def names_a_credential(name: str) -> bool:
     return _WHOLE_CREDENTIAL_NAME.fullmatch(name.upper().replace("-", "_")) is not None
 
 
+#: Every literal label name the file lists for a value that is a secret by its name alone: the JSON
+#: members and the headers (lower-cased, as they are matched in any case).
+_SECRET_FIELDS = frozenset(
+    name.lower() for section in ("json_members", "headers") for name in _section(section)["names"]
+)
+
+
+def names_a_secret_field(name: str) -> bool:
+    """Whether a structured field called `name` (a tool call's argument, a nested map's key) holds
+    a secret by its name alone: a credential's name (`names_a_credential`), or one of the file's
+    JSON-member or header names, in any case (``password``, ``client_secret``, ``x-api-key``)."""
+    return names_a_credential(name) or name.lower() in _SECRET_FIELDS
+
+
+def stable_cut(text: str, head: int, tail: int) -> tuple[int, int]:
+    """Where an excerpt of `text` kept as ``text[:head] + <marker> + text[tail:]`` may end its head
+    and start its tail so that `scrub` reads it back as itself (issue #999).
+
+    A persisted excerpt is scrubbed again on every save, so a cut that leaves a value open makes the
+    next save read the marker as that value and grow the excerpt past its share: the cap's fixed
+    point gone, and a marker naming a size no longer true. So the head backs off before every value
+    or label the cut reaches, as `bounded`'s cut does (`_whole_values`), and neither end splits a
+    redaction marker. It does not back out of a token run as `bounded` does: that guards a
+    length-gated rule shown a cut key, and the text here is already redacted, so the backoff would
+    only empty the head of a long word. The result never lengthens the excerpt."""
+    head = _whole_values(text, head)[0]
+    for marker in (REDACTED_VALUE, REDACTED):
+        start = text.rfind(marker, max(0, head - len(marker) + 1), head + len(marker) - 1)
+        if start != -1 and start < head < start + len(marker):
+            head = start
+        start = text.rfind(marker, max(0, tail - len(marker) + 1), tail + len(marker) - 1)
+        if start != -1 and start < tail < start + len(marker):
+            tail = start + len(marker)
+    return head, max(head, tail)
+
+
 def configured_values() -> list[str]:
     """The agent's own configured secrets, by value, longest first: every environment variable
     whose name names a credential (`names_a_credential`), and every credential the process holds as

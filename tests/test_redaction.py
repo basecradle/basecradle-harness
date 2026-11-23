@@ -569,3 +569,145 @@ def test_the_redaction_memo_shows_nothing_it_holds(tmp_path, monkeypatch):
     assert not hasattr(memo, "__dict__")
     with pytest.raises(TypeError):
         pickle.dumps(memo)
+
+
+# --- the second review's cases (issue #999) -----------------------------------------------------
+
+import random  # noqa: E402
+
+from basecradle_harness._messages import ServerToolRecord, ServerToolUse  # noqa: E402
+from basecradle_harness._server_tools import bound  # noqa: E402
+
+_DENSE = [
+    "GH_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+    "OPENAI_API_KEY=sk-proj-Z9y8X7w6V5u4T3s2",
+    'export DB_PASSWORD="hunter2-correct-horse"',
+    "url=https://h.example/v1?api_key=K9xQ2mV7pL4wZ8nR3tY6",
+    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig",
+    '{"password":"Pw-4Kd9-Lm2x","x-api-key":"Ab9Cd8Ef7"}',
+    "plain words about the weather and nothing else",
+    "https://uptime.example.com/api/v1/heartbeat/H8k2Lm9Qx",
+]
+
+
+def _dense(rng, lines):
+    return "\n".join(rng.choice(_DENSE) for _ in range(lines))
+
+
+def _resaved(messages):
+    """The transcript a later wake writes back: loaded from the file, then saved again."""
+    once = _payload(messages)
+    return once, _payload([Message.from_dict(d) for d in json.loads(once)])
+
+
+@pytest.mark.parametrize("fan_out", [1, 3, 10, 30])
+def test_a_redacted_capped_transcript_is_a_fixed_point(fan_out):
+    """Re-saving a transcript the harness wrote changes nothing: no cut leaves a value open for the
+    next save's scrub to complete, so no excerpt grows past its share and no marker names a size
+    that is no longer true (the cap's fixed point, held with the redaction in front of it)."""
+    rng = random.Random(fan_out)
+    for _ in range(40):
+        calls = [
+            ToolCall(
+                id=f"c{n}", name="shell", arguments={"command": _dense(rng, rng.randint(1, 400))}
+            )
+            for n in range(fan_out)
+        ]
+        messages = [Message.user("run them"), Message.assistant(tool_calls=calls)]
+        messages += [
+            Message(role="tool", content=_dense(rng, rng.randint(1, 600)), tool_call_id=f"c{n}")
+            for n in range(fan_out)
+        ]
+        once, twice = _resaved(messages)
+        assert once == twice
+
+
+def test_a_secret_under_a_credential_named_field_is_redacted_at_any_depth(tmp_path):
+    call = ToolCall(
+        id="c1",
+        name="http",
+        arguments={
+            "password": "Hunter2-correct-horse",
+            "headers": {"x-api-key": "abc123def456ghi", "Accept": "application/json"},
+            "env": {"GH_TOKEN": "plainvalue123456", "LOG_LEVEL": "debug"},
+        },
+    )
+    messages = [
+        Message.user("call it"),
+        Message.assistant(tool_calls=[call]),
+        Message(role="tool", content="200 OK", tool_call_id="c1"),
+    ]
+    (stored,) = [c for m in json.loads(_payload(messages)) for c in m.get("tool_calls", [])]
+    assert stored["arguments"] == {
+        "password": REDACTED,
+        "headers": {"x-api-key": REDACTED, "Accept": "application/json"},
+        "env": {"GH_TOKEN": REDACTED, "LOG_LEVEL": "debug"},
+    }
+
+
+def test_a_server_tools_input_is_redacted_where_it_is_bounded():
+    """Bounded once, at arrival, and never again, so it is redacted there: later, a marker longer
+    than its value would carry the record past its cap."""
+    found = bound(
+        ServerToolRecord(
+            uses=[
+                ServerToolUse(
+                    "web_fetch", "https://api.test/v1?api_key=abcdef1234567890 then " + "x " * 400
+                )
+            ]
+        )
+    )
+    (use,) = found.uses
+    assert "abcdef1234567890" not in use.input and REDACTED in use.input
+    assert bound(found) == found  # still a fixed point
+
+
+def test_a_tool_result_that_is_not_text_never_fails_the_load(tmp_path):
+    path = tmp_path / "timeline.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "name": "x", "arguments": {}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": ["a", "list"]},
+            ]
+        )
+    )
+    session = Session("timeline:x", Harness(_Scripted()).engine, path=path)
+    assert session.history[2].content == ["a", "list"]
+
+
+def test_a_legacy_turn_is_still_found_by_its_redacted_rendering(monkeypatch):
+    """A pre-#297 turn carries no uuids and is matched by its rendered text, which the transcript
+    now holds redacted."""
+    from basecradle_harness._wake import _carries
+
+    monkeypatch.setenv("VENDOR_PASSWORD", _PASSWORD)
+    rendered = f"[2026-06-04T00:00:00.000Z] john: the password is {_PASSWORD}"
+    assert _carries(f"earlier\n{scrub(rendered)}", rendered)
+
+
+@pytest.mark.parametrize("share", [4096, 1200, 400])
+def test_a_redacted_excerpt_degrades_and_never_collapses(share):
+    """The fixed point is held by where the cut falls (`stable_cut`: never inside a marker, never
+    leaving a value open), not by the floor the measured check falls back to: an excerpt of dense,
+    already-redacted credential text keeps its head and tail at every share with room for one."""
+    from basecradle_harness._elision import gone
+    from basecradle_harness._session import _elide
+
+    rng = random.Random(share)
+    for _ in range(200):
+        text = scrub(_dense(rng, rng.randint(80, 600)))
+        excerpt = _elide(text, share)
+        assert excerpt != gone(len(text))
+        assert scrub(excerpt) == excerpt
+
+
+def test_a_cut_never_splits_a_marker():
+    text = "x" * 3000 + "GH_TOKEN='<a redacted value>' and [redacted] " + "y" * 3000
+    for cut in range(3000, 3050):
+        head, tail = _redaction.stable_cut(text, cut, cut)
+        for marker in (REDACTED_VALUE, REDACTED):
+            for at in (head, tail):
+                start = text.find(marker)
+                assert not start < at < start + len(marker)
