@@ -378,25 +378,32 @@ class MemPalaceMemoryProvider(MemoryProvider):
         """Write ``text`` to ``path`` and file it as drawers, all of it or none of it.
 
         Each drawer goes through ``file_conversation_exchange``, MemPalace's canonical write path
-        for live agents, which writes the metadata the convo miner writes. Three more fields are
-        stamped through its ``extra_metadata``, because they are what MemPalace's miner reads to
-        decide a file is already filed, and a file it thinks unfiled it files again, through the
-        very chunker this path exists to avoid:
+        for live agents, which writes the metadata the convo miner writes. More fields are stamped
+        through its ``extra_metadata``, because they are what MemPalace's miner reads to decide a
+        file is already filed (a file it thinks unfiled it files again, through the very chunker
+        this path exists to avoid), or what the palace check reads to prove a moved file:
 
         - ``source_mtime`` — the file's own, so a ``mempalace mine`` of the directory (and the
           palace check's dry run of one) skips it by path (``prefetch_mined_set``);
         - ``chunk_total`` — how many drawers the exchange took, so a filing cut short is never
           read as complete;
-        - ``content_hash`` — computed exactly as the miner computes it (`content_hashes`), so a
-          moved home's files are recognised by content and registered, never filed again
-          (issue #606). On every drawer: ``file_conversation_exchange`` stamps each one chunk 0,
-          and a chunk 0 with no hash is what the palace check counts as unrecognisable;
+        - ``content_hash`` — computed exactly as the miner computes it (`content_hashes`). Before
+          MemPalace 3.12 the miner recognises a moved home's files by it and registers them,
+          never filing them again (issue #606); from 3.12, which recognises a file by its path
+          alone and stamps no hash itself, it is what proves a moved file is the same file before
+          the palace check records it at its new path (`--relocate-source-file`, issue #989). On
+          every drawer: ``file_conversation_exchange`` stamps each one chunk 0, and a chunk 0
+          with no hash is what the palace check counts as unrecognisable;
         - ``convo_chunker_version`` — the installed MemPalace's own constant (`chunker_version`),
           where it defines one (3.11 and later). MemPalace's miner reads an exchange drawer
           without it as filed by an older chunker, so it is no longer filed (issue #751). 3.11's
           ``file_conversation_exchange`` stamps the same value itself, and its value wins
           (``setdefault``). The harness stamps it too, so a drawer it files is current whatever
-          upstream's write path does.
+          upstream's write path does;
+        - ``id_source_file`` (`ID_SOURCE_FILE`) — the path the drawer's id is derived from, which
+          is ``source_file`` as filed. A move rewrites ``source_file`` and never this, so the id
+          recipe that proves the drawer is the observe's still holds after it (`filed_by_observe`,
+          issue #989). MemPalace does not read it.
 
         Under MemPalace's own per-file lock (``mine_lock``), the one a concurrent ``mempalace
         mine`` takes for this file before it re-checks whether it is filed. If anything raises
@@ -426,6 +433,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
                     "source_mtime": os.path.getmtime(path),
                     "chunk_total": len(pieces),
                     "content_hash": ",".join(content_hashes(path)),
+                    ID_SOURCE_FILE: str(path),
                 }
                 version = chunker_version()
                 if version is not None:
@@ -1199,6 +1207,23 @@ def _unfile(collection, source_file: str) -> bool:
 #: recognisably the observe's (`filed_by_observe`).
 OBSERVE_STAMP = ("source_mtime", "chunk_total", "content_hash")
 
+#: The field holding the path an observe drawer's id was derived from (issue #989). `_file` stamps
+#: it as the drawer's ``source_file``; the palace check's relocate writes it, as the old path, on a
+#: drawer filed before the stamp existed, the one time it moves that drawer; nothing ever rewrites
+#: it. Not in `OBSERVE_STAMP`, because a drawer filed before it is the observe's all the same.
+ID_SOURCE_FILE = "id_source_file"
+
+
+def recognises_content() -> bool:
+    """Whether the installed MemPalace's miner recognises a moved file by its content hash.
+
+    Before 3.12 it does: a file at a new path whose content hash is filed in the mining wing is
+    registered and never filed again (``prefetch_content_hashes``). 3.12 removed that on purpose
+    (MemPalace#2800: a conversation is filed under every file that holds it), so a file is filed
+    once it is at a path no drawer records. Read off the library, never off a version number.
+    """
+    return hasattr(_import("palace"), "prefetch_content_hashes")
+
 
 def chunker_version() -> int | None:
     """The installed MemPalace's ``CONVO_CHUNKER_VERSION``, or ``None`` before it defined one (3.11).
@@ -1218,7 +1243,12 @@ def filed_by_observe(drawer_id: str, meta: dict, document: str) -> bool:
     - the drawer is in the observe's wing and is not a registry row;
     - it carries every field of `OBSERVE_STAMP`;
     - and its id is the one ``file_conversation_exchange`` derives from the drawer's own wing,
-      room, ``source_file``, ``filed_at`` and text (``ids.make_exchange_drawer_id``).
+      room, the path it was filed under, ``filed_at`` and text (``ids.make_exchange_drawer_id``).
+
+    The path it was filed under is `ID_SOURCE_FILE` when the drawer carries it, and its
+    ``source_file`` otherwise: a drawer filed before that stamp has never been moved by the
+    harness, because the move that rewrites its ``source_file`` writes the stamp too (issue #989).
+    A stamp, once there, is the only path read, so a moved drawer is never judged by its new one.
 
     A drawer MemPalace's miner filed (the observe's path before 0.164.0) has an id derived from
     its chunk index instead (``make_convo_drawer_id``), so it never matches. The two recipes hash
@@ -1228,11 +1258,12 @@ def filed_by_observe(drawer_id: str, meta: dict, document: str) -> bool:
         return False
     if any(meta.get(key) is None for key in OBSERVE_STAMP):
         return False
+    filed_under = meta.get(ID_SOURCE_FILE)
     try:
         derived = _import("ids").make_exchange_drawer_id(
             str(meta.get("wing")),
             str(meta.get("room")),
-            str(meta.get("source_file")),
+            str(filed_under if filed_under is not None else meta.get("source_file")),
             str(meta.get("filed_at")),
             document or "",
         )
@@ -1247,8 +1278,11 @@ def content_hashes(path: Path) -> list[str]:
     """The content hash of each conversation in a file, exactly as MemPalace's miner computes them.
 
     SHA-256 of each stripped conversation ``normalize_conversations`` reads out of the file. What
-    the miner looks a moved file's content up by (``prefetch_content_hashes``), so `_file` stamps
-    it on every drawer and the palace check compares against it (issue #606).
+    the miner before 3.12 looks a moved file's content up by (``prefetch_content_hashes``), and
+    what the palace check proves a moved file by, so `_file` stamps it on every drawer (issues
+    #606, #989). Measured stable across 3.11.0 and 3.12.0, whose normalization changed, for the
+    observe's files (a misspelt user turn included): a hash stamped under one proves the file
+    under the other.
     """
     conversations = [c for c in _import("normalize").normalize_conversations(str(path)) if c]
     return [hashlib.sha256(c.strip().encode("utf-8")).hexdigest() for c in conversations]
