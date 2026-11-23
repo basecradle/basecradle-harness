@@ -33,7 +33,11 @@ from basecradle_harness._memory_provider import MemoryExchange, MemoryScope  # n
 from basecradle_harness._mempalace import (  # noqa: E402
     _REGISTRY_ROOM,
     EXCHANGE_PIECE_CHARS,
+    ID_SOURCE_FILE,
     MemPalaceMemoryProvider,
+    content_hashes,
+    filed_by_observe,
+    recognises_content,
 )
 
 TIMELINE = "019a3b2c-4d5e-7f60-8a1b-2c3d4e5f6a7b"
@@ -97,7 +101,8 @@ def test_mempalaces_own_miner_files_nothing_the_observe_filed(tmp_path):
     assert len(before) > 3  # the runbook took more than one drawer
     assert all(len(text) <= EXCHANGE_PIECE_CHARS for text, _ in before)
 
-    assert _palace_check.forecast(palace, provider.agent) is None  # nothing new, nothing moved
+    predicted = _palace_check.forecast(palace, provider.agent)
+    assert predicted is not None and predicted.new == [] and predicted.recognised == 3
     with contextlib.redirect_stdout(io.StringIO()):
         convo_miner.mine_convos(
             str(palace / "conversations"),
@@ -137,25 +142,133 @@ def test_a_filing_short_of_its_drawers_is_never_read_as_filed(tmp_path):
     assert predicted is not None and len(predicted.new) == 1
 
 
-def test_a_moved_home_is_recognised_by_content_and_never_filed_again(tmp_path):
-    """Every drawer records its absolute path, so after a move only the content hash recognises it.
+#: The hand-named file a practice move filed twice (basecradle-noc#899): written into
+#: ``conversations/`` by hand, not by the observe, and mined on its own into a wing of its own, as
+#: `@rowan`'s restored charter was. A mine of the directory after a move filed its five drawers a
+#: second time, in ``conversations``.
+HAND = "restored-charter-principles.md"
+HAND_WING = "restored_charter"
+HAND_TEXT = "\n\n".join(
+    f"> [2026-07-0{n}T09:00:00Z] john: principle {n} of the charter, kept by hand.\n"
+    + f"Principle {n}: "
+    + "the agent keeps what it was told and says where it was told it. " * 6
+    for n in range(1, 6)
+)
+
+
+def _mine_one(path: Path, palace: Path, wing: str) -> None:
+    with contextlib.redirect_stdout(io.StringIO()):
+        convo_miner.mine_convos(
+            str(path), str(palace), wing=wing, agent="nova", extract_mode="exchange"
+        )
+
+
+def _hash_as_mined_before_3_12(palace: Path, path: Path) -> None:
+    """Stamp ``content_hash`` on the file's chunk 0 the way MemPalace's miner did from 3.7 to 3.11.
+
+    From 3.12 the miner stamps none, so a file it mines there has nothing to prove it after a move.
+    Every miner-filed drawer on the fleet was filed before 3.12 and carries one: this gives the
+    test's file the shape the fleet's has. A no-op where the installed miner stamped it itself.
+    """
+    collection = mp.get_collection(str(palace))
+    found = collection.get(where={"source_file": str(path.resolve())}, include=["metadatas"])
+    for drawer_id, meta in zip(found["ids"], found["metadatas"]):
+        if meta.get("chunk_index") == 0 and not meta.get("content_hash"):
+            collection.update(
+                ids=[drawer_id],
+                metadatas=[{**meta, "content_hash": ",".join(content_hashes(path))}],
+            )
+
+
+def _all_rows(palace: Path) -> dict[str, tuple[str, dict]]:
+    collection = mp.get_collection(str(palace), create=False, read_only=True)
+    page = collection.get(include=["documents", "metadatas"])
+    return dict(zip(page["ids"], zip(page["documents"], page["metadatas"])))
+
+
+def test_a_moved_home_is_recognised_and_never_filed_again(tmp_path, capsys):
+    """After a move, the forecast lists no exchange as new, and a mine files nothing again.
+
+    The acceptance test of issue #989 (`@briggs`'s rule, point 5). Every drawer records its absolute
+    path, so after a move a path no longer finds it. Before MemPalace 3.12 the miner recognises
+    each file by its content hash, and the hand-named file in its own wing by the registry row
+    ``--register-off-wing`` writes for it (#613). From 3.12 the miner recognises a file by its
+    path alone, so ``--relocate-source-file`` records each one at its new path first, with the
+    agent's wakes held, after proving it is the same file (#989). Both run here, as the NOC's
+    rename flow runs them; each is a no-op where the other is the remedy.
+
+    Then a real mine: no drawer is added, none is deleted, and none of them changes but for what
+    the relocation wrote. A registry row a pre-3.12 mine writes is never served as a memory.
 
     Both exchanges are longer than the miner's 30-character floor: MemPalace 3.9 and 3.10 skip a
     shorter file without a line (a real mine registers it, filing no drawer), so it would be
     counted as neither.
     """
-    old = tmp_path / "olduser" / "palace"
+    previous = tmp_path / "olduser" / "harness"
+    old = previous / "mempalace"
     provider = MemPalaceMemoryProvider(old, agent="nova")
     _observe(provider, BRIEF, "Got it.")
     _observe(provider, "Where do I live these days?", "You live in Dallas, Texas.")
-    new = tmp_path / "newuser" / "palace"
-    new.parent.mkdir()
-    shutil.move(str(old), str(new))
+    hand = old / "conversations" / HAND
+    hand.write_text(HAND_TEXT, encoding="utf-8")
+    _mine_one(hand, old, HAND_WING)
+    _hash_as_mined_before_3_12(old, hand)
+    home = tmp_path / "newuser" / "harness"
+    home.mkdir(parents=True)
+    shutil.move(str(old), str(home / "mempalace"))
+    new = home / "mempalace"
+    before = _all_rows(new)
+    real = {i for i, (_, meta) in before.items() if meta.get("room") != _REGISTRY_ROOM}
+    assert len(real) > 3  # the hand-named file took several drawers
+
+    for flags in (
+        ["--relocate-source-file", "--previous-home", str(previous)],
+        ["--register-off-wing"],
+    ):
+        capsys.readouterr()
+        code = _palace_check.main([str(home), *flags])
+        out = capsys.readouterr().out
+        assert code == 0, out  # a read-back FAIL exits 1 before the report
+        assert "  left alone:" not in out and "refused" not in out, out
 
     predicted = _palace_check.forecast(new, provider.agent)
-
     assert predicted is not None
-    assert predicted.new == [] and predicted.duplicate == 2  # one registry row each, no drawer
+    assert predicted.new == [] and predicted.recognised == 3
+
+    moved = _all_rows(new)
+    _mine(new)
+    after = _all_rows(new)
+    assert {i: after[i] for i in real} == {
+        i: moved[i] for i in real
+    }  # nothing changed, nothing gone
+    added = set(after) - set(moved)
+    assert all(after[i][1].get("room") == _REGISTRY_ROOM for i in added)  # no new drawer
+    if not recognises_content():
+        # Recorded here by the relocation, every one of them, and still provably the observe's.
+        here = (new / "conversations").resolve()
+        assert {Path(str(after[i][1]["source_file"])).parent for i in real} == {here}
+        ours = {i for i in real if filed_by_observe(i, after[i][1], after[i][0])}
+        assert len(ours) == 2
+        assert {Path(str(after[i][1][ID_SOURCE_FILE])).parent for i in ours} == {
+            (old / "conversations").resolve()
+        }
+    else:
+        assert {i: after[i] for i in real} == {i: before[i] for i in real}  # nothing to relocate
+    hits = MemPalaceMemoryProvider(new, agent="nova").search("newuser charter principle", 10)
+    assert hits and not any(str(hit.get("text")).startswith("[registry]") for hit in hits)
+    _mine(new)  # and a second mine files nothing either
+    assert _all_rows(new) == after
+
+
+def _mine(palace: Path) -> None:
+    with contextlib.redirect_stdout(io.StringIO()):
+        convo_miner.mine_convos(
+            str(palace / "conversations"),
+            str(palace),
+            wing="conversations",
+            agent="nova",
+            extract_mode="exchange",
+        )
 
 
 # --- a fact late in a long message (issue #741, the capital's measurement) -----------------

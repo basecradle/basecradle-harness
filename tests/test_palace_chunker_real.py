@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import re
 import shutil
 from pathlib import Path
@@ -41,18 +42,27 @@ from basecradle_harness import _palace_check  # noqa: E402
 from basecradle_harness._memory_provider import MemoryExchange, MemoryScope  # noqa: E402
 from basecradle_harness._mempalace import (  # noqa: E402
     _REGISTRY_ROOM,
+    ID_SOURCE_FILE,
     MemPalaceMemoryProvider,
     _exchange_markdown,
     chunker_version,
+    content_hashes,
     filed_by_observe,
+    recognises_content,
 )
 
 TIMELINE = "019a3b2c-4d5e-7f60-8a1b-2c3d4e5f6a7b"
 SCOPE = MemoryScope(agent="019a3b2c-4d5e-7f60-8a1b-000000000001", timeline=TIMELINE)
 VERSION = getattr(mp, "CONVO_CHUNKER_VERSION", None)
+NORMALIZE = getattr(mp, "NORMALIZE_VERSION", None)
+#: Whether this MemPalace recognises a moved file by its content hash (before 3.12, issue #989).
+BY_CONTENT = recognises_content()
 
 needs_version = pytest.mark.skipif(
     VERSION is None, reason="this MemPalace defines no convo_chunker_version (before 3.11)"
+)
+by_path = pytest.mark.skipif(
+    BY_CONTENT, reason="this MemPalace recognises a moved file by its content (before 3.12)"
 )
 
 #: Two files MemPalace's miner filed, the observe's path before 0.164.0.
@@ -105,14 +115,39 @@ def _build(palace: Path) -> MemPalaceMemoryProvider:
         exchange = MemoryExchange(user=user, assistant=reply, scope=SCOPE)
         (convos / name).write_text(_exchange_markdown(exchange), encoding="utf-8")
     _mine(palace)
+    _hash_as_mined_before_3_12(palace)
     provider = MemPalaceMemoryProvider(palace, agent="nova")
     for user, reply in OBSERVED:
         _quiet(provider.observe, MemoryExchange(user=user, assistant=reply, scope=SCOPE))
     return provider
 
 
-def _age(palace: Path) -> None:
+def _hash_as_mined_before_3_12(palace: Path) -> None:
+    """Stamp ``content_hash`` on each miner-filed chunk 0 the way MemPalace's miner did, 3.7 to 3.11.
+
+    From 3.12 the miner stamps none, so a file it mines there has nothing to prove it after a move.
+    Every miner-filed drawer on the fleet was filed before 3.12 and carries one: this gives the
+    test's miner files the shape the fleet's have. A no-op where the installed miner stamped it.
+    """
+    collection = mp.get_collection(str(palace))
+    page = collection.get(include=["metadatas"])
+    for drawer_id, meta in zip(page["ids"], page["metadatas"]):
+        source = Path(str(meta.get("source_file")))
+        if meta.get("room") == _REGISTRY_ROOM or meta.get("chunk_index") != 0:
+            continue
+        if not meta.get("content_hash") and source.is_file():
+            collection.update(
+                ids=[drawer_id],
+                metadatas=[{**meta, "content_hash": ",".join(content_hashes(source))}],
+            )
+
+
+def _age(palace: Path, *, drop=("convo_chunker_version", ID_SOURCE_FILE), set_=None) -> None:
     """Rewrite every row without ``convo_chunker_version``, the field 3.10 never wrote.
+
+    And without `ID_SOURCE_FILE`, which no drawer filed before 0.212.0 carries, so a moved observe
+    drawer is the shape every fleet palace holds. ``set_`` writes fields too: ``normalize_version``
+    2 makes a drawer the shape 3.11 left, which 3.12 reads as unfiled (issue #989).
 
     Delete and add again rather than update, because an update merges metadata and cannot drop a
     key. Embeddings, documents and every other field go back as they were.
@@ -120,7 +155,7 @@ def _age(palace: Path) -> None:
     collection = mp.get_collection(str(palace))
     page = collection.get(include=["documents", "metadatas", "embeddings"])
     metas = [
-        {k: v for k, v in (meta or {}).items() if k != "convo_chunker_version"}
+        {**{k: v for k, v in (meta or {}).items() if k not in drop}, **(set_ or {})}
         for meta in page["metadatas"]
     ]
     collection.delete(ids=list(page["ids"]))
@@ -139,6 +174,16 @@ def _drawers(palace: Path) -> dict[str, tuple[str, dict]]:
         drawer_id: (text, meta or {})
         for drawer_id, text, meta in zip(page["ids"], page["documents"], page["metadatas"])
     }
+
+
+def _register_here(palace: Path) -> None:
+    """A registry row at this location for every conversation file: what a mine before 3.12 wrote
+    for a moved file it recognised by its content, written directly so every MemPalace holds it."""
+    collection = mp.get_collection(str(palace))
+    for path in sorted((palace / "conversations").glob("*.md")):
+        convo_miner._register_file(
+            collection, str(path.resolve()), "conversations", "nova", "exchange"
+        )
 
 
 def _census(palace: Path) -> _palace_check.Census:
@@ -209,7 +254,7 @@ def test_the_observes_drawers_are_told_from_the_miners_by_their_id(palace, tmp_p
     _build(palace)
     moved = tmp_path / "moved" / "mempalace"
     shutil.copytree(palace, moved)
-    _mine(moved)  # writes the registry rows a move leaves, so they are in the census too
+    _register_here(moved)  # the registry rows a pre-3.12 mine left after a move, in the census too
 
     drawers = _drawers(moved)
     by_file: dict[str, set[bool]] = {}
@@ -242,7 +287,7 @@ def test_a_stale_registry_row_does_not_make_the_observes_file_the_miners(palace,
     _build(palace)
     moved = tmp_path / "moved" / "mempalace"
     shutil.copytree(palace, moved)
-    _mine(moved)  # a registry row at the new path for every file
+    _register_here(moved)  # a registry row at the new path for every file
     _age(moved)
 
     found = _census(moved)
@@ -271,7 +316,7 @@ def test_an_aged_palace_reports_its_version_stale_files_in_place(palace, capsys)
     ) in out
     assert _palace_check.STALE_CONSEQUENCE in out
     assert (
-        f"next observe (dry run): 0 files -> registry sentinel, "
+        f"next observe (dry run): 0 files -> recognised, "
         f"{len(OBSERVED) + len(MINED)} files -> mined as new drawers"
     ) in out
     reasons = [line for line in out.splitlines() if line.strip().startswith("reason:")]
@@ -330,7 +375,12 @@ def test_the_stamp_makes_the_observes_drawers_current_and_touches_nothing_else(p
 def test_after_a_move_the_stamped_observe_files_are_recognised_and_the_miners_are_not(
     palace, tmp_path, capsys
 ):
-    """The rename's case: the observe's files register by content, no drawer filed for them."""
+    """The rename's case, before any relocation: what a mine would do to a moved palace now.
+
+    Before 3.12 the observe's files register by content, no drawer filed for them, and the miner's
+    version-stale ones are filed again. From 3.12, which recognises a file by its path alone,
+    every one of them is filed again, and the reason names the step that records it here.
+    """
     _build(palace)
     _age(palace)
     _report(capsys, palace, "--stamp-chunker-version")
@@ -339,14 +389,23 @@ def test_after_a_move_the_stamped_observe_files_are_recognised_and_the_miners_ar
 
     out = _report(capsys, moved)
 
-    assert (
-        f"next observe (dry run): {len(OBSERVED)} files -> registry sentinel, "
-        f"{len(MINED)} files -> mined as new drawers"
-    ) in out
     reasons = [line for line in out.splitlines() if line.strip().startswith("reason:")]
-    assert len(reasons) == len(MINED)
-    assert all("beside its old drawers, which it keeps" in r for r in reasons)
-    assert all("left to MemPalace" in r for r in reasons)
+    if BY_CONTENT:
+        assert (
+            f"next observe (dry run): {len(OBSERVED)} files -> recognised, "
+            f"{len(MINED)} files -> mined as new drawers"
+        ) in out
+        assert len(reasons) == len(MINED)
+        assert all("beside its old drawers, which it keeps" in r for r in reasons)
+        assert all("left to MemPalace" in r for r in reasons)
+        return
+    assert (
+        f"next observe (dry run): 0 files -> recognised, "
+        f"{len(OBSERVED) + len(MINED)} files -> mined as new drawers"
+    ) in out
+    assert len(reasons) == len(OBSERVED) + len(MINED)
+    assert all("filed only at another location" in r for r in reasons)
+    assert all("--relocate-source-file records a file moved" in r for r in reasons)
 
 
 @needs_version
@@ -400,6 +459,7 @@ def moved(tmp_path, palace) -> Path:
     )
     (old_palace / "conversations" / LONG).write_text(_exchange_markdown(exchange), encoding="utf-8")
     _mine(old_palace)
+    _hash_as_mined_before_3_12(old_palace)
     palace.parent.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(previous), str(palace.parent))
     collection = mp.get_collection(str(palace))
@@ -446,7 +506,12 @@ def _planned(palace: Path) -> int:
 
 @needs_version
 def test_a_relocated_palace_is_re_mined_in_place_with_no_duplicate(moved, palace, capsys):
-    """The issue's definition of done, on a real palace: drawers = planned, duplicates 0."""
+    """The issue's definition of done, on a real palace: drawers = planned, duplicates 0.
+
+    Before 3.12 the miner's version-stale files are relocated and the observe's stamped ones stay
+    where they are, recognised by their content. From 3.12 (issue #989) the observe's are
+    relocated too, each keeping the path its id was derived from, and the mine skips them.
+    """
     _report(capsys, palace, "--stamp-chunker-version")
     aged = _drawers(palace)
     mined = _mined_ids(palace)
@@ -454,28 +519,36 @@ def test_a_relocated_palace_is_re_mined_in_place_with_no_duplicate(moved, palace
     observed = {i for i in aged if i not in mined and aged[i][1].get("room") != _REGISTRY_ROOM}
     assert mined and observed
     recall = _recall(MemPalaceMemoryProvider(palace, agent="nova"))
+    moving, files = (mined, 3) if BY_CONTENT else (mined | observed, 3 + len(OBSERVED))
+    staying = len(mined) + len(observed) - len(moving)
 
     dry = _relocate(capsys, palace, moved, "--dry-run")
     assert _drawers(palace) == aged  # a dry run writes nothing
     assert (
-        f"relocate source_file (dry run): drawers to relocate {len(mined)} in 3 files, "
-        f"files left alone 0, drawers left at another location {len(observed)}"
+        f"relocate source_file (dry run): drawers to relocate {len(moving)} in {files} files, "
+        f"files left alone 0, drawers left at another location {staying}"
     ) in dry
 
     out = _relocate(capsys, palace, moved)
     assert (
-        f"relocate source_file: WROTE to this palace: drawers relocated {len(mined)} in 3 files, "
-        f"files left alone 0, drawers left at another location {len(observed)}"
+        f"relocate source_file: WROTE to this palace: drawers relocated {len(moving)} in "
+        f"{files} files, files left alone 0, drawers left at another location {staying}"
     ) in out
 
     relocated = _drawers(palace)
     assert set(relocated) == set(aged)  # nothing is deleted, nothing is added
     for drawer_id, (text, meta) in aged.items():
-        if drawer_id in mined:
-            name = Path(str(meta["source_file"])).name
-            assert relocated[drawer_id] == (text, {**meta, "source_file": f"{here}/{name}"})
-        else:
-            assert relocated[drawer_id] == (text, meta)  # registry rows and the observe's
+        if drawer_id not in moving:
+            assert relocated[drawer_id] == (
+                text,
+                meta,
+            )  # registry rows, and before 3.12 the observe's
+            continue
+        new = {**meta, "source_file": f"{here}/{Path(str(meta['source_file'])).name}"}
+        if drawer_id in observed:
+            new[ID_SOURCE_FILE] = meta["source_file"]  # the path its id was derived from
+            assert filed_by_observe(drawer_id, new, text)
+        assert relocated[drawer_id] == (text, new)
     assert _recall(MemPalaceMemoryProvider(palace, agent="nova")) == recall
 
     again = _relocate(capsys, palace, moved)
@@ -576,6 +649,13 @@ def _gone_here(palace, moved):
 
 
 ALONE = "not every drawer is stale by its chunker version alone, the class this relocates"
+NO_HASH = (
+    "its drawers carry no content hash (MemPalace's miner stamped one from 3.7 until 3.12), so "
+    "nothing proves it"
+)
+by_content = pytest.mark.skipif(
+    not BY_CONTENT, reason="from 3.12 a current or normalize-stale miner file is relocated"
+)
 
 
 @needs_version
@@ -583,12 +663,17 @@ ALONE = "not every drawer is stale by its chunker version alone, the class this 
     ("mutate", "reason"),
     [
         (_still_exists, "its recorded path still exists, so it was not moved"),
-        (_other_wing, "it has drawers in wing conversations, notes, not only 'conversations'"),
+        (
+            _other_wing,
+            "it has drawers in wing conversations, notes, not only 'conversations'"
+            if BY_CONTENT
+            else "it has drawers in wing conversations, notes, not in one wing",
+        ),
         (_also_here, "it has drawers recorded somewhere other than the previous home"),
         (_third_location, "it has drawers recorded somewhere other than the previous home"),
-        (_one_current, ALONE),
-        (_all_old_normalize, ALONE),
-        (_no_hash, "its drawers carry no content hash (filed before MemPalace 3.7)"),
+        pytest.param(_one_current, ALONE, marks=by_content),
+        pytest.param(_all_old_normalize, ALONE, marks=by_content),
+        (_no_hash, NO_HASH),
         (_changed_here, "its content hash is not the one its drawers record"),
         (_gone_here, "no such file at this location, so a mine never reads it"),
     ],
@@ -603,8 +688,10 @@ def test_a_file_that_cannot_prove_it_moved_is_left_alone_whole(
 
     out = _relocate(capsys, palace, moved)
 
+    # From 3.12 the observe's stamped files are relocated beside the miner's (issue #989).
+    files = len(MINED) if BY_CONTENT else len(MINED) + len(OBSERVED)
     assert f"  left alone: {LONG}: {reason}" in out
-    assert "drawers relocated" in out and f"in {len(MINED)} files, files left alone 1" in out
+    assert "drawers relocated" in out and f"in {files} files, files left alone 1" in out
     after = _drawers(palace)
     for drawer_id, (_, meta) in before.items():
         if Path(str(meta.get("source_file"))).name == LONG:
@@ -612,10 +699,12 @@ def test_a_file_that_cannot_prove_it_moved_is_left_alone_whole(
 
 
 @needs_version
-def test_an_observe_filed_file_is_left_alone_because_its_id_is_derived_from_the_path(
-    moved, palace, capsys
-):
-    """Unstamped here, so the observe's drawers are version-stale and reach the check."""
+def test_an_observe_file_under_an_older_chunker_is_left_alone_until_stamped(moved, palace, capsys):
+    """Unstamped here, so the observe's drawers are version-stale and reach the check.
+
+    Relocated, a mine would cut them again through MemPalace's chunker. Once stamped, before 3.12
+    they are recognised by their content where they are; from 3.12 they are relocated.
+    """
     before = _drawers(palace)
     ours = _ours(palace)
     assert ours
@@ -625,9 +714,11 @@ def test_an_observe_filed_file_is_left_alone_because_its_id_is_derived_from_the_
     names = {Path(str(before[i][1]["source_file"])).name for i in ours}
     for name in names:
         assert (
-            f"  left alone: {name}: the observe filed it; --stamp-chunker-version makes it current"
+            f"  left alone: {name}: the observe filed it under an older chunker; "
+            "--stamp-chunker-version makes it current"
         ) in out
     assert _ours(palace) == ours  # the id recipe still holds of every one of them
+    assert {i: _drawers(palace)[i] for i in ours} == {i: before[i] for i in ours}
 
 
 @needs_version
@@ -707,3 +798,189 @@ def test_without_a_chunker_version_there_is_nothing_to_relocate(palace, tmp_path
     out = _relocate(capsys, palace, tmp_path / "old" / "harness")
 
     assert "nothing to relocate: MemPalace" in out
+
+
+# ---------------------------------------------------------------------------------------------
+# MemPalace 3.12: a file is recognised by its path alone (issue #989)
+# ---------------------------------------------------------------------------------------------
+
+
+def _move_home(tmp_path: Path, home: Path, to: str, *, keep_mtimes: bool = True) -> Path:
+    """Move a ``HARNESS_HOME`` to ``<tmp>/<to>/harness`` and return the new home.
+
+    A rename keeps every file's mtime. ``keep_mtimes=False`` copies every file afresh and removes
+    the old home, the way a move across filesystems does, so every file's mtime changes.
+    """
+    new = tmp_path / to / "harness"
+    new.parent.mkdir(parents=True)
+    if keep_mtimes:
+        shutil.move(str(home), str(new))
+    else:
+        shutil.copytree(home, new, copy_function=shutil.copy)
+        shutil.rmtree(home)
+    return new
+
+
+def _observed_names(palace: Path) -> set[str]:
+    rows = _drawers(palace)
+    return {Path(str(rows[i][1]["source_file"])).name for i in _ours(palace)}
+
+
+@by_path
+@needs_version
+def test_a_moved_observe_file_is_recorded_here_and_stays_provably_the_observes(tmp_path, capsys):
+    """`@briggs`'s rule, points 2 and 3: ``source_file`` moves, the id's own path never does.
+
+    The drawers are filed before the stamp existed, as every fleet drawer is, and the move changes
+    every file's mtime. After the relocation each observe drawer names its new path, keeps the old
+    one as the path its id was derived from, still proves itself the observe's, and carries the
+    file's mtime today, so a mine skips it. A second move rewrites ``source_file`` again and never
+    the stamp. No drawer is added or deleted by either mine.
+    """
+    first = tmp_path / "first" / "harness"
+    _build(first / "mempalace")
+    _age(first / "mempalace", drop=(ID_SOURCE_FILE,))
+    filed_under = (first / "mempalace" / "conversations").resolve()
+    ours = _ours(first / "mempalace")
+    assert len(ours) > len(OBSERVED)  # the runbook took more than one drawer
+    second = _move_home(tmp_path, first, "second", keep_mtimes=False)
+    palace = second / "mempalace"
+    here = (palace / "conversations").resolve()
+    stale_mtimes = {
+        i: meta["source_mtime"] for i, (_, meta) in _drawers(palace).items() if i in ours
+    }
+    assert all(  # the copy moved every file's mtime, so the alignment is what is under test
+        abs(mtime - os.path.getmtime(here / Path(str(_drawers(palace)[i][1]["source_file"])).name))
+        >= 0.001
+        for i, mtime in stale_mtimes.items()
+    )
+
+    out = _relocate(capsys, palace, first)
+
+    assert "files left alone 0, drawers left at another location 0" in out
+    rows = _drawers(palace)
+    for drawer_id in ours:
+        text, meta = rows[drawer_id]
+        path = here / Path(str(meta["source_file"])).name
+        assert meta["source_file"] == str(path)
+        assert meta[ID_SOURCE_FILE] == str(filed_under / path.name)
+        assert abs(meta["source_mtime"] - os.path.getmtime(path)) < 0.001  # the move changed it
+        assert filed_by_observe(drawer_id, meta, text)
+    _mine(palace)
+    assert _drawers(palace) == rows  # every file recognised: nothing added, deleted or changed
+
+    third = _move_home(tmp_path, second, "third")
+    _relocate(capsys, third / "mempalace", second)
+
+    again = _drawers(third / "mempalace")
+    assert {i: again[i][1][ID_SOURCE_FILE] for i in ours} == {
+        i: rows[i][1][ID_SOURCE_FILE] for i in ours
+    }
+    assert _ours(third / "mempalace") == ours
+    _mine(third / "mempalace")
+    assert _drawers(third / "mempalace") == again
+
+
+@by_path
+@needs_version
+def test_a_palace_filed_before_3_12_is_named_normalize_stale_and_its_observe_files_kept(
+    tmp_path, capsys
+):
+    """3.12 raised ``normalize_version`` to 3, and every drawer filed before it is at 2 (#1001).
+
+    In place, the report names every file as normalize-stale and the forecast files each again.
+    After a move, the relocation records the miner's files here (a mine then re-files them in
+    place, upstream's own migration) and leaves the observe's alone, saying why: relocated, a mine
+    would re-chunk them rather than file them twice, and making them current is not decided.
+    """
+    first = tmp_path / "first" / "harness"
+    _build(first / "mempalace")
+    _age(first / "mempalace", drop=(ID_SOURCE_FILE,), set_={"normalize_version": NORMALIZE - 1})
+    files = len(OBSERVED) + len(MINED)
+
+    out = _report(capsys, first / "mempalace")
+
+    assert (
+        f"conversation files normalize-stale: {files} (observe-filed {len(OBSERVED)}, miner-filed "
+        f"{len(MINED)}), normalize_version older than MemPalace's {NORMALIZE}"
+    ) in out
+    assert _palace_check.NORMALIZE_CONSEQUENCE in out
+    assert f"0 files -> recognised, {files} files -> mined as new drawers" in out
+    reasons = [line for line in out.splitlines() if line.strip().startswith("reason:")]
+    assert all("normalize-stale" in r and "deletes its drawers here" in r for r in reasons)
+    assert sum("this harness has no step that makes it current" in r for r in reasons) == len(
+        OBSERVED
+    )
+    assert sum("left to MemPalace" in r for r in reasons) == len(MINED)
+
+    second = _move_home(tmp_path, first, "second")
+    palace = second / "mempalace"
+    before = _drawers(palace)
+    ours = _ours(palace)
+    names = _observed_names(palace)
+
+    out = _relocate(capsys, palace, first)
+
+    for name in names:
+        assert (
+            f"  left alone: {name}: the observe filed it at normalize_version {NORMALIZE - 1}, "
+            f"older than MemPalace's {NORMALIZE}"
+        ) in out
+    mined = len([i for i in before if i not in ours])
+    assert (
+        f"drawers relocated {mined} in {len(MINED)} files, files left alone {len(OBSERVED)}"
+    ) in out
+    assert {i: _drawers(palace)[i] for i in ours} == {i: before[i] for i in ours}
+    reasons = [
+        line for line in _report(capsys, palace).splitlines() if line.strip().startswith("reason:")
+    ]
+    assert sum(
+        "--relocate-source-file leaves it alone: the observe filed it" in r for r in reasons
+    ) == len(OBSERVED)
+
+
+def _one_not_the_observes(palace: Path) -> None:
+    rows = _drawers(palace)
+    drawer_id = next(i for i in _ours(palace) if (rows[i][1].get("chunk_total") or 0) > 1)
+    meta = rows[drawer_id][1]
+    mp.get_collection(str(palace)).update(
+        ids=[drawer_id], metadatas=[{**meta, "filed_at": "2026-01-01T00:00:00"}]
+    )
+
+
+def _one_drawer_gone(palace: Path) -> None:
+    rows = _drawers(palace)
+    drawer_id = next(i for i in _ours(palace) if (rows[i][1].get("chunk_total") or 0) > 1)
+    mp.get_collection(str(palace)).delete(ids=[drawer_id])
+
+
+@by_path
+@needs_version
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (
+            _one_not_the_observes,
+            "it has drawers the observe filed and drawers MemPalace's miner filed",
+        ),
+        (_one_drawer_gone, "its drawers are not one complete filing, so a mine files it again"),
+    ],
+)
+def test_an_observe_file_that_is_not_one_current_filing_is_left_alone(
+    tmp_path, capsys, mutate, reason
+):
+    first = tmp_path / "first" / "harness"
+    _build(first / "mempalace")
+    second = _move_home(tmp_path, first, "second")
+    palace = second / "mempalace"
+    mutate(palace)
+    before = _drawers(palace)
+
+    out = _relocate(capsys, palace, first)
+
+    (line,) = [line for line in out.splitlines() if line.startswith("  left alone: ")]
+    assert reason in line
+    name = line.split(": ", 2)[1]
+    assert {i: row for i, row in _drawers(palace).items() if name in row[1]["source_file"]} == {
+        i: row for i, row in before.items() if name in row[1]["source_file"]
+    }
