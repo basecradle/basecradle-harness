@@ -113,6 +113,9 @@ _PROVIDER_LABELS = {
     "anthropic": "Anthropic",
     "refuseless": "Refuseless",
     "mempalace": "MemPalace",
+    # Today's adapter under its second name (issue #1010), labelled apart so a by-Provider chart
+    # shows an agent's move between the two names rather than folding them into one bar.
+    "mempalace-previous": "MemPalace Previous",
 }
 
 

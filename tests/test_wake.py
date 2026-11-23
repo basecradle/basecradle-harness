@@ -2597,18 +2597,21 @@ def test_resolved_config_reports_the_default_memory_provider_so_a_silent_fallbac
     assert report["memory_provider_version"] is None
 
 
-def test_resolved_config_reports_a_bound_mempalace_provider(wake_env, monkeypatch):
+def test_resolved_config_reports_a_bound_mempalace_provider(
+    wake_env, monkeypatch, mempalace_selector
+):
     """Env var set → the *bound* provider is reported, read off the object `_resolve_tools`
     actually built (not a re-read of the var — the `--resolved-config` env-gap class,
     basecradle-noc#62). The version is `None` here because MemPalace is an optional extra this
     suite never installs — which is exactly the off-box defect signal it exists to give: bound to
     a palace whose package is absent (binding is lazy), so the agent loses its memory at the first
     wake while every other signal reads green."""
-    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
 
     report = resolved_config()
 
-    assert report["memory_provider"] == "mempalace"
+    # Each name reports itself, so the NOC reads an agent's move off this field (issue #1010).
+    assert report["memory_provider"] == mempalace_selector
     assert report["memory_provider_version"] is None
     # The provider's own tools fold into the resolved set, so a MemPalace agent carries its
     # read-only `memory_search` (issue #267) and *not* the SQLite `memory` tool. The tool axis

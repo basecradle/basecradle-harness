@@ -6184,7 +6184,8 @@ def resolved_config() -> dict[str, object]:
       under ``"locked"`` the same tool appears in ``skipped``. Without it no automated surface
       could confirm a shell-class enablement's profile actually landed.
     - ``memory_provider`` — the **bound** memory backend (issue #269): ``sqlite`` (the default),
-      ``mempalace``, or the ``module:Class`` path of a custom provider — read off the provider
+      ``mempalace`` or ``mempalace-previous`` (one adapter, reporting the name it was selected by,
+      issue #1010), or the ``module:Class`` path of a custom provider — read off the provider
       object `memory_provider_from_env` actually returned, **not** a re-read of
       ``HARNESS_MEMORY_PROVIDER`` (`describe_memory_provider`). Only the harness knows which store
       it binds (installed ≠ bound), and without this field the memory axis is invisible off-box: a
@@ -6196,8 +6197,8 @@ def resolved_config() -> dict[str, object]:
       ``sqlite`` store, which ships *inside* the harness (stdlib ``sqlite3``) and so has no
       separate pin — its version is ``harness_version`` above — and ``None`` for a custom
       provider, whose distribution the harness cannot honestly name (see
-      `describe_memory_provider`). ``mempalace`` with ``None`` is a **defect signal**, not a
-      shrug: bound (binding is lazy) while its extra is not installed.
+      `describe_memory_provider`). ``mempalace`` (or ``mempalace-previous``) with ``None`` is a
+      **defect signal**, not a shrug: bound (binding is lazy) while its extra is not installed.
     - ``tools`` — the resolved active **function** tool names, sorted.
     - ``builtins`` — the resolved active server-side **built-in** wire names, sorted (e.g. the
       Responses ``web_search``); a live capability the tool-set axis must count.

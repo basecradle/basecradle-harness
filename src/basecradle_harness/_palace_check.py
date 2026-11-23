@@ -119,7 +119,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from basecradle_harness._memory_provider import MemoryExchange, MemoryScope, _palace_path
+from basecradle_harness._memory_provider import (
+    MemoryExchange,
+    MemoryScope,
+    _palace_path,
+    configured_mempalace_name,
+)
 from basecradle_harness._mempalace import (
     _CONVERSATIONS_WING,
     _REGISTRY_ROOM,
@@ -1594,7 +1599,7 @@ def main(argv: list[str] | None = None) -> int:
     level = logging.WARNING if args.sample else logging.INFO
     logging.basicConfig(level=level, handlers=[log_handler("%(message)s", sys.stderr)])
     try:
-        provider = MemPalaceMemoryProvider(palace)
+        provider = MemPalaceMemoryProvider(palace, name=configured_mempalace_name())
         if args.relocate_source_file:
             code = relocate_source_file(palace, home, args.previous_home, dry_run=args.dry_run)
             if code:

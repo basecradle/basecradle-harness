@@ -55,6 +55,7 @@ from basecradle_harness._describer import Describer
 from basecradle_harness._engine import _REASONS, Engine, _reason
 from basecradle_harness._exceptions import ProviderResponseError, ProviderServerError
 from basecradle_harness._mcp import _sanitize, mcp_tool_name
+from basecradle_harness._memory_provider import _MEMPALACE_SELECTORS
 from basecradle_harness._observability import (
     _VERDICT_VALUES,
     BLUE,
@@ -2206,7 +2207,7 @@ def written_providers(source: Path = SRC) -> dict[str, str]:
     Three kinds of site, and together they are where a slug enters a line. A ``provider=`` keyword
     on any call (`kv`, `metered`, an emitter), a module-level ``PROVIDER`` constant (each native
     adapter's own), and a class-level ``provider = "…"`` — each resolved through the module's own
-    string constants and then the package's, because a slug is often imported (``_MEMPALACE``).
+    string constants and then the package's, because a slug may be imported from another module.
     An expression that resolves to no literal (``self.provider``, a variable) carries a value read
     from configuration, which `KNOWN_PROVIDERS` and the rendered lines cover.
     """
@@ -2254,6 +2255,10 @@ def emittable() -> dict[str, str]:
     found = {provider: "KNOWN_PROVIDERS" for provider in KNOWN_PROVIDERS}
     # The bookends' stand-in for a third-party adapter that names no vendor, built at run time.
     found[describe_provider(object())[0]] = "describe_provider, a third-party adapter"
+    # The MemPalace adapter's `provider=` is the name it was selected by, read from configuration
+    # like a brain's vendor (issue #1010), so its names come from the set the selection reads.
+    for name in _MEMPALACE_SELECTORS:
+        found.setdefault(name, "_memory_provider._MEMPALACE_SELECTORS")
     for slug, where in written_providers().items():
         found.setdefault(slug, where)
     return found
@@ -2274,8 +2279,21 @@ def test_the_provider_scan_finds_every_kind_of_site():
 
     assert {"openai", "xai"} <= written.keys()  # `metered(provider="…")` literals
     assert {"anthropic", "google", "openrouter"} <= written.keys()  # module-level `PROVIDER`
-    assert "mempalace" in written  # `kv(provider=_MEMPALACE)`, imported from another module
+    # An imported constant, the third kind, has no real instance since issue #1010 made the
+    # MemPalace adapter write the name it was selected by; the synthetic test below proves it.
     assert "log_grammar_probe" in written  # `PROVIDER = REASON`, an alias
+
+
+def test_the_provider_scan_resolves_a_slug_imported_from_another_module(tmp_path):
+    """The third kind of site, kept proven after its last real instance left (issue #1010): a
+    ``provider=`` naming a constant another module defines, the shape `_MEMPALACE` once had."""
+    (tmp_path / "_names.py").write_text('_VENDOR = "acme"\n', encoding="utf-8")
+    (tmp_path / "_writer.py").write_text(
+        "from _names import _VENDOR\n\n\ndef emit():\n    kv(provider=_VENDOR)\n",
+        encoding="utf-8",
+    )
+
+    assert written_providers(tmp_path) == {"acme": "_writer.py:5"}
 
 
 def test_every_provider_the_harness_can_write_has_a_display_name(emittable, rendered):
