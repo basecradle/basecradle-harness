@@ -24,6 +24,10 @@ MemPalace 3.12 removed cross-file content-hash dedup on purpose ([MemPalace#2800
 
 MemPalace 3.12 also raised `NORMALIZE_VERSION` from 2 to 3, so every drawer filed before it is unfiled to a mine, the observe's included, moved or not. Measured: three observe drawers filed under 3.11.0, one mine in place under 3.12.0, seven drawers and none of the three kept. The report gives this class its own line, in the version-stale line's grammar and printed on every MemPalace: `conversation files normalize-stale: <n> (observe-filed <a>, miner-filed <b>), <why>`. It triggers the forecast, so no rename gate reads a palace a mine would rebuild as one it would not. Nothing in this release writes `normalize_version`: whether the observe's drawers may be stamped current is a decision of its own, [issue #1001](https://github.com/basecradle/basecradle-harness/issues/1001).
 
+### Fixed: `--pool-diagnosis` rebuilds MemPalace 3.12's search, so its verdicts hold there (issue #989)
+
+The mode rebuilds MemPalace's search to say where a drawer below the returned ones ranked, and checks every rebuild against the real search. On 3.12 the rebuild stopped matching wherever the search repeats itself wider, so those probes read `unknown`. 3.12 renamed the test that decides the repeat, and the test now also fires when the vector half skipped bookkeeping rows. The vector half itself now skips the rows MemPalace calls bookkeeping (its registry rows), and hands the merge every distance it measured. The rebuild now does each of these, read off the library, and matches the search again on 3.9, 3.11 and 3.12. Because 3.12 never returns the registry rows it skips, no `sentinels` verdict can name them there, so the line counts them on the vector half instead. The replay of the merge follows 3.12's too: it skips bookkeeping hits, reuses the distances the vector half measured, and keeps a hit whose embedding cannot be loaded, so `dropped` cannot occur on 3.12.
+
 ## [0.211.0] - 2026-11-23
 
 ### Added: one definition of a secret, applied to every text the harness writes: logs, memory and tool captures (issue #999)
