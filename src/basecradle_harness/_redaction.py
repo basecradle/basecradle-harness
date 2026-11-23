@@ -996,9 +996,10 @@ def scrub_counted(text: str) -> tuple[str, int]:
             if not marked or (grown := _past_marker(text, end)) == end:
                 break
             end = grown  # what a second reading of the marker would take, and the spans it meets
-        out += [text[pos:start], REDACTED_VALUE if marked else REDACTED]
+        marker = REDACTED_VALUE if marked else REDACTED
+        out += [text[pos:start], marker]
+        count += text[start:end] != marker  # a marker already there is no new redaction
         pos = end
-        count += 1
     out.append(text[pos:])
     return "".join(out), count
 
@@ -1236,13 +1237,11 @@ def configured_values() -> list[str]:
 
     Read on every call, never cached: the environment can change under a running process, and a
     cache of these values would be one more place a credential sits in plain text."""
-    values = {
-        value
-        for name, value in os.environ.items()
-        if len(value) >= CONFIGURED_VALUE_FLOOR and names_a_credential(name)
-    }
-    values.update(value for value in known_secrets() if len(value) >= CONFIGURED_VALUE_FLOOR)
-    return sorted(values, key=len, reverse=True)
+    candidates = [value for name, value in os.environ.items() if names_a_credential(name)]
+    candidates.extend(known_secrets())
+    # Stripped, as a vendor echoes a key: an ``agent.env`` value can carry a trailing newline.
+    values = {value.strip() for value in candidates}
+    return sorted((v for v in values if len(v) >= CONFIGURED_VALUE_FLOOR), key=len, reverse=True)
 
 
 def _value_spans(text: str) -> list[tuple[int, int]]:
@@ -1321,6 +1320,8 @@ def redact_file(path: Path) -> int | str:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             return "it is not a regular file"
+        if info.st_nlink > 1:  # rewritten in place, it would change every other name it has
+            return "it has another hard link"
         if info.st_size > MAX_FILE_BYTES:
             return f"it is larger than {MAX_FILE_BYTES} bytes"
         with open(fd, "r+b", closefd=False) as handle:

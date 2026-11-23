@@ -1730,3 +1730,22 @@ def test_a_capture_the_call_did_not_write_is_left_alone(capturing_tool):
     earlier.write_text(f"kept {_CAPTURE_SECRET}\n")
     tool.run()
     assert earlier.read_text() == f"kept {_CAPTURE_SECRET}\n"
+
+
+def test_a_directory_the_call_made_a_link_never_carries_the_rewrite_out(tmp_path, monkeypatch):
+    """A named path whose directory did not exist before the call, and that the call made a
+    symlink into a secret store, is resolved again after the call and refused."""
+    from basecradle_harness._mcp import _redact_written
+
+    root = (tmp_path / "work").resolve()
+    root.mkdir()
+    store = tmp_path / "home" / ".config" / "basecradle"
+    store.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("FAL_KEY", _CAPTURE_SECRET)
+    named = root / "out" / "mcp.json"
+    before = {named: None}  # stamped before the call: `out` did not exist yet
+    (root / "out").symlink_to(store)
+    (store / "mcp.json").write_text(f'{{"env": {{"FAL_KEY": "{_CAPTURE_SECRET}"}}}}')
+    _redact_written(root, before)
+    assert (store / "mcp.json").read_text() == f'{{"env": {{"FAL_KEY": "{_CAPTURE_SECRET}"}}}}'

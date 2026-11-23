@@ -138,8 +138,8 @@ Each holds `names`: literal label names, matched in any case.
 |---|---|---|
 | A log line | As it is written. | Every line the harness logs through its handler. |
 | An exchange filed into memory | Before any memory provider sees it, so before it is split into drawers or written as a file. | Every exchange the wake files (`_wake.WakeAgent._observe`). An exchange the redaction cannot run on is not filed at all. |
-| A fact the memory tool stores | Before it is written. | The SQLite store's key and value. |
-| A text file a tool saved | After the call that wrote it. | Under a stdio MCP server's working directory: every text file in `.playwright-mcp/`, and every text file the call's own arguments named, that the call wrote. Only files with a text format's suffix are opened, so an image is never read. Nothing in the agent's config home, `~/.config`, `~/vault`, `~/wallets`, `~/.ssh` or `~/.gnupg` is ever read for redaction or changed. |
+| A fact the memory tool stores | Before it is written. | The SQLite store's value. A write whose key holds a secret is refused, because two keys redacted alike would overwrite each other. |
+| A text file a tool saved | After the call that wrote it. | Under a stdio MCP server's working directory: every text file in `.playwright-mcp/`, and every text file the call's own arguments named, that the call wrote. Only files with a text format's suffix are opened, so an image is never read. A path that runs through a link once the call has run, and a file with another hard link, are refused. Nothing in the agent's config home, `~/.config`, `~/vault`, `~/wallets`, `~/.ssh` or `~/.gnupg` is ever read for redaction or changed. |
 
 Each redaction outside the log is counted on one INFO line, `secrets redacted kind=<exchange|fact|capture> count=<n>` (`docs/telemetry.md`), and never carries the text.
 

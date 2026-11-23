@@ -1291,6 +1291,11 @@ def _redact_written(root: Path, before: Mapping[Path, _Stamp | None]) -> None:
         stamp = _stamp(path)
         if stamp is None or stamp == before.get(path) or not stat.S_ISREG(stamp[0]):
             continue
+        # Resolved again now the call has run: a directory it made a symlink would otherwise
+        # carry the rewrite out of `root` or into a secret store under the name it had before.
+        if _resolve(root, str(path)) != path:
+            _log.warning("MCP tool capture %r was not redacted: its path is a link.", str(path))
+            continue
         if not _inside(path, root) or any(_inside(path, store) for store in stores):
             continue
         label = str(Path(*path.parts[len(root.parts) :]))

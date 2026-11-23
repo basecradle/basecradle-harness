@@ -36,6 +36,7 @@ because it is a credential (an MCP server's ``env`` entry whose name names none)
 from __future__ import annotations
 
 import hmac
+import threading
 import weakref
 from typing import Any
 
@@ -57,7 +58,8 @@ class Secret:
     def __init__(self, value: str, *, credential: bool = True) -> None:
         self._value = value
         if credential and value:
-            _HELD[id(self)] = self
+            with _HELD_LOCK:
+                _HELD[id(self)] = self
 
     def reveal(self) -> str:
         """The credential itself — for the call that sends it, and nothing else."""
@@ -130,11 +132,17 @@ class Sealed:
 #: more thing derived from the value).
 _HELD: weakref.WeakValueDictionary[int, Secret] = weakref.WeakValueDictionary()
 
+#: Held while `_HELD` is written or read, so a `Secret` built on one thread never changes the
+#: mapping under a snapshot another thread is taking (a log line, a memory write).
+_HELD_LOCK = threading.Lock()
+
 
 def known_secrets() -> list[str]:
     """The value of every credential `Secret` alive in this process (`_redaction.configured_values`
     reads them, so a credential the harness holds is blanked wherever it would be written)."""
-    return [held.reveal() for held in list(_HELD.values())]
+    with _HELD_LOCK:
+        held = list(_HELD.values())
+    return [secret.reveal() for secret in held]
 
 
 def secret(value: str | None) -> Secret | None:

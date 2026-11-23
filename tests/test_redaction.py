@@ -384,3 +384,49 @@ def test_a_fact_that_cannot_be_redacted_is_never_written(tmp_path, monkeypatch):
         assert store.list() == "kept"
     finally:
         store.close()
+
+
+# --- the review's cases (issue #999) -------------------------------------------------------------
+
+
+def test_a_configured_value_is_matched_as_a_vendor_echoes_it(monkeypatch):
+    """An ``agent.env`` value can carry a trailing newline; the vendor echoes the bare key."""
+    monkeypatch.setenv("AI_API_KEY", SHAPELESS + "\n")
+    assert scrub(f"key {SHAPELESS} refused") == f"key {REDACTED} refused"
+
+
+def test_a_marker_already_in_the_text_is_not_counted_again():
+    for text in ("OPENAI_API_KEY='<a redacted value>'", '{"password":"[redacted]"}'):
+        assert scrub_counted(text) == (text, 0)
+
+
+def test_a_hard_linked_file_is_never_rewritten(tmp_path, monkeypatch):
+    """Rewritten in place, a file with another name would change that one too (an `agent.env`)."""
+    monkeypatch.setenv("AI_API_KEY", SHAPELESS)
+    store = tmp_path / "agent.env"
+    store.write_text(f"AI_API_KEY={SHAPELESS}\n")
+    capture = tmp_path / "capture.txt"
+    os.link(store, capture)
+    assert redact_file(capture) == "it has another hard link"
+    assert store.read_text() == f"AI_API_KEY={SHAPELESS}\n"
+
+
+def test_a_key_holding_a_secret_is_refused_and_an_old_row_stays_reachable(tmp_path):
+    """Redacted alike, two keys would overwrite each other, and a row stored before the rule
+    could not be read by its own name: so a write is refused, and read and delete take the key
+    as written."""
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    try:
+        conn = store._connect()
+        conn.execute(
+            "INSERT INTO memories (key, value, created_at, updated_at) VALUES (?, ?, '', '')",
+            ("deploy sk-abcdefgh12345", "old"),
+        )
+        conn.commit()
+        reply = store.write("gh sk-aaaaaaaa11", "A")
+        assert reply.startswith("Error: that key holds a secret")
+        assert store.list() == "deploy sk-abcdefgh12345"
+        assert store.read("deploy sk-abcdefgh12345") == "old"
+        assert store.delete("deploy sk-abcdefgh12345").startswith("Forgot")
+    finally:
+        store.close()

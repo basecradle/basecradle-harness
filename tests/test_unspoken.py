@@ -517,6 +517,7 @@ def _model_facing_strings():
         "memory_search description": _mempalace.MemPalaceSearchTool.description,
         # Issue #999: what the model is told when a fact it stored lost a secret.
         "redacted fact note": _memory.REDACTED_NOTE.format(count=1),
+        "secret key refusal": _memory.KEY_REFUSAL,
         # Issue #848: what the model reads about the refuseless balance tool.
         "refuseless_account_balance description": RefuselessAccountBalanceTool.description,
         "refuseless_account_balance note": _shipped_note("refuseless_account_balance.py"),
