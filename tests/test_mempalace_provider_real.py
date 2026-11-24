@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import subprocess
 import sys
 import time
@@ -183,8 +184,9 @@ def test_an_old_name_drawer_is_seen_by_already_filed_and_labelled_correctly_at_r
     assert _rows(palace) == before
     assert provider.records.read(TIMELINE, ITEMS[0]) is None
     (hit,) = provider.search("what is my dog called", 1)
-    assert render_hits([hit], here=TIMELINE).startswith("- (filed ")
-    assert "· this timeline) " in render_hits([hit], here=TIMELINE)
+    # The timeline is read off the old file's name. The filing time rides only where the installed
+    # MemPalace returns `filed_at` with a hit (3.10 and later; 3.9.0, the floor, does not).
+    assert re.match(r"- \((filed [^)]* · )?this timeline\) > \[", render_hits([hit], here=TIMELINE))
 
 
 # --- the door rule ------------------------------------------------------------------------------------
