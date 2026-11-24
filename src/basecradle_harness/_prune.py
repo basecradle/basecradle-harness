@@ -76,6 +76,17 @@ in the same half is an *exception*, reported with its group and never removed wi
 - ``--restore <name>`` puts back exactly the files and drawers of a backup that are absent (drawers
   with their embeddings, files with their bytes and mtime, so no later mine re-files them), leaves
   what is present untouched and reports it, is safe to run twice, and never removes the backup.
+- **Which memories it reads depends on the agent's adapter** (issue #1011, read from
+  ``HARNESS_MEMORY_PROVIDER``). Under ``mempalace-previous`` it reads exactly what it always has
+  (`PreviousView`): exchange files in ``<palace>/conversations/``, and a drawer filed under any
+  other name — the new adapter's ``basecradle:<timeline>:<item>:<piece>`` included — is counted as
+  ``elsewhere`` and never deleted. Under ``mempalace`` (`NamedView`) the unit is still the exchange,
+  now read from either adapter's record: an exchange the new adapter filed is judged from its record
+  (outside the palace, `_exchange_records`) and removed with every drawer named under it; an old
+  exchange file is found in the palace's ``conversations`` directory or in the archive old files are
+  moved to (``--archive``, else ``HARNESS_MEMPALACE_ARCHIVE``), and found in neither, its drawers
+  are held. The selection rule is the same under both, so `RULE` is too: a plan entry one view
+  cannot place is skipped as ``outside_conversations`` by the other, never applied.
 - **One store per run, as the agent, between wakes.** ``--palace`` names one store; a run as root,
   or by a user who does not own the palace, is refused. The tool takes no lock of its own, for the
   scrub's reason: the wake-lock belongs to whatever launches wakes.
@@ -100,7 +111,16 @@ from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 
+from basecradle_harness._exchange_records import (
+    Record,
+    RecordStore,
+    archive_dir,
+    exchange_text,
+    records_dir,
+)
+from basecradle_harness._memory_provider import _MEMPALACE_PREVIOUS, configured_mempalace_name
 from basecradle_harness._mempalace import _CONVERSATIONS_WING, _QUOTE, _REGISTRY_ROOM, _import
+from basecradle_harness._near_copy import NEAR_COPY, jaccard, words
 from basecradle_harness._observability import GREEN, RED, YELLOW, head, kv, last_word, log_handler
 from basecradle_harness._scrub import _file_of, open_palace, resolve_palace
 from basecradle_harness._version import __version__
@@ -114,10 +134,6 @@ PROG = "basecradle-harness-prune-palace"
 #: can never be applied by a build that selects differently. Bumped whenever `candidate`,
 #: `normalize`, `near`, `groups` or `_residue` changes what they select.
 RULE = 1
-
-#: Symmetric Jaccard on distinct normalised words at or above which two halves are near-copies.
-#: Not lowered (issue #973): a lower bar starts grouping different jobs that share a vocabulary.
-NEAR_COPY = 0.8
 
 #: The fewest members a group has: its anchor and five others. A smaller repeated set stays.
 FLOOR = 6
@@ -231,41 +247,10 @@ def _due(value: str) -> datetime | None:
 
 # --- normalising and comparing ------------------------------------------------------------------
 
-#: What `normalize` turns into placeholders, in order: uuids, timestamps, dates, clock times, then
-#: bare numbers. The placeholders cannot be spelled by `\w`, so no ordinary word becomes one.
-_NORMALIZERS = (
-    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), " ⟨uuid⟩ "),
-    (
-        re.compile(
-            r"\b\d{4}-\d{2}-\d{2}[t ]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+-]\d{2}:?\d{2})?\b"
-        ),
-        " ⟨time⟩ ",
-    ),
-    (re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b"), " ⟨date⟩ "),
-    (re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]\.?m\.?)?(?![\w:])"), " ⟨time⟩ "),
-    (re.compile(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w])"), " ⟨n⟩ "),
-)
-_WORD = re.compile(r"⟨(?:uuid|time|date|n)⟩|\w+")
+#: `normalize`, `words`, `jaccard` and `NEAR_COPY` live in `_near_copy`, the one measure this tool and
+#: the MemPalace adapter's door rule both read (issue #1011). The three this module calls are imported
+#: above under their own names.
 _RAW_WORD = re.compile(r"\w+")
-
-
-def normalize(text: str) -> str:
-    """``text`` lowercased, with uuids, timestamps, dates and bare numbers made placeholders."""
-    text = text.lower()
-    for pattern, placeholder in _NORMALIZERS:
-        text = pattern.sub(placeholder, text)
-    return text
-
-
-def words(text: str) -> frozenset[str]:
-    """The distinct words of ``text`` after `normalize`: placeholders and every ordinary word."""
-    return frozenset(_WORD.findall(normalize(text)))
-
-
-def jaccard(left: frozenset[str], right: frozenset[str]) -> float:
-    """Symmetric overlap: shared words over all words. Two empty halves are identical."""
-    union = left | right
-    return len(left & right) / len(union) if union else 1.0
 
 
 # --- one exchange -------------------------------------------------------------------------------
@@ -308,10 +293,12 @@ SECOND_SPEAKER = "second_speaker"
 BAD_DUE = "bad_due"
 
 
-def candidate(name: str, path: Path, text: str) -> Exchange | str:
+def candidate(name: str, path: Path, text: str, sha256: str | None = None) -> Exchange | str:
     """The exchange as a candidate, or the name of the rule it fails (rules 1 and 2).
 
-    Rule 3 is a statement about a group, so it is `groups`' to decide.
+    Rule 3 is a statement about a group, so it is `groups`' to decide. ``sha256`` is the hash of the
+    file the exchange was read from, when that file is not ``text`` itself (a record, issue #1011);
+    an exchange file's own is its text's.
     """
     incoming, reply = split(text)
     if not incoming:
@@ -328,7 +315,7 @@ def candidate(name: str, path: Path, text: str) -> Exchange | str:
     return Exchange(
         name=name,
         path=path,
-        sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        sha256=sha256 or hashlib.sha256(text.encode("utf-8")).hexdigest(),
         due=due,
         instruction=instruction,
         reply=reply,
@@ -614,13 +601,17 @@ class Survey:
     unread: int = 0
 
 
-def _drawers_by_file(collection, conversations: Path) -> tuple[dict[str, list[tuple]], int, int]:
+def _drawers_by_file(
+    collection, conversations: Path, key=None
+) -> tuple[dict[str, list[tuple]], int, int]:
     """Every real drawer as ``file -> [(id, document)]``, the drawer total, and those with no file.
 
     Keyed by `_scrub._file_of`, so a drawer filed under a home the palace has since moved from
     belongs to the file where it is now (issue #606). MemPalace's registry rows are bookkeeping and
-    take no part, as in the scrub.
+    take no part, as in the scrub. ``key`` is the view's (`NamedView.key`); by default the previous
+    adapter's reading, `_scrub._file_of`.
     """
+    key = key or (lambda source: _file_of(source, conversations))
     by_file: dict[str, list[tuple]] = {}
     total = no_source = 0
     offset = 0
@@ -637,7 +628,7 @@ def _drawers_by_file(collection, conversations: Path) -> tuple[dict[str, list[tu
                 continue
             total += 1
             document = documents[index] if index < len(documents) else None
-            file = _file_of(meta.get("source_file") or None, conversations)
+            file = key(meta.get("source_file") or None)
             if file is None:
                 no_source += 1
                 continue
@@ -657,42 +648,164 @@ def _pieces_of(text: str, drawers: list[tuple]) -> bool:
     return all(set(_RAW_WORD.findall(document.lower())) <= held for _, document in drawers)
 
 
-def survey(collection, palace: Path) -> Survey:
+class PreviousView:
+    """What the tool reads under ``mempalace-previous``: exactly what it always has.
+
+    Exchange files in ``<palace>/conversations/``, and drawers keyed to them by `_scrub._file_of`. A
+    drawer under any other name, the new adapter's included, is keyed to a file the survey never
+    reads, so it is counted as ``elsewhere`` and never deleted (issue #1011's guard, by structure).
+    """
+
+    @property
+    def yes(self) -> tuple[str, ...]:
+        """What the report tells the agent a yes does (`REPORT_YES`)."""
+        return REPORT_YES
+
+    def __init__(self, palace: Path) -> None:
+        self.palace = palace
+        self.conversations = palace / _CONVERSATIONS_WING
+
+    def key(self, source: str | None) -> str | None:
+        return _file_of(source, self.conversations)
+
+    def folders(self) -> list[Path]:
+        return [self.conversations]
+
+    def records(self):
+        return iter(())
+
+    def locate(self, path: Path) -> str | None:
+        """The drawer key of an exchange file the plan names, or ``None`` when it is not one here."""
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return None
+        if resolved.parent != self.conversations.resolve():
+            return None
+        return str(self.conversations / path.name)
+
+    def text(self, path: Path, data: bytes) -> str:
+        return data.decode("utf-8")
+
+    def restore_target(self, entry: dict) -> Path:
+        return self.conversations / Path(entry["path"]).name
+
+
+class NamedView(PreviousView):
+    """What the tool reads under ``mempalace`` (issue #1011): both adapters' memories.
+
+    An exchange the new adapter filed is read from its record (`_exchange_records.RecordStore`), keyed
+    by the record's path, and its drawers by the name they are filed under. An old exchange file is
+    read in the palace's ``conversations`` directory and in the archive; an old drawer is keyed to its
+    file where that file is now, and to the palace's own path when it is in neither, so the survey
+    never reads it and it is counted as ``elsewhere``: held, never deleted because a file is missing.
+    """
+
+    @property
+    def yes(self) -> tuple[str, ...]:
+        """What a yes does here: `NAMED_REPORT_YES`, the charter line on deleting a memory."""
+        return NAMED_REPORT_YES
+
+    def __init__(self, palace: Path, store: RecordStore, archive: Path | None = None) -> None:
+        super().__init__(palace)
+        self.store = store
+        self.archive = archive
+
+    def key(self, source: str | None) -> str | None:
+        path = self.store.path_of(source) if source else None
+        if path is not None:
+            return str(path)
+        if source and Path(source).parent.name == _CONVERSATIONS_WING:
+            name = Path(source).name
+            here = self.conversations / name
+            if self.archive is not None and not here.exists() and (self.archive / name).exists():
+                return str(self.archive / name)
+            return str(here)
+        return super().key(source)
+
+    def folders(self) -> list[Path]:
+        return [self.conversations] + ([self.archive] if self.archive is not None else [])
+
+    def records(self):
+        return self.store.records()
+
+    def locate(self, path: Path) -> str | None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return None
+        if self.archive is not None and resolved.parent == self.archive.resolve():
+            return str(self.archive / path.name)
+        if resolved.parent.parent == self.store.root.resolve() and path.suffix == ".json":
+            return str(self.store.root / resolved.parent.name / path.name)
+        return super().locate(path)
+
+    def text(self, path: Path, data: bytes) -> str:
+        if self.locate(path) and path.suffix == ".json":
+            return exchange_text(Record.from_bytes(data))
+        return super().text(path, data)
+
+    def restore_target(self, entry: dict) -> Path:
+        key = self.locate(Path(entry["path"]))
+        return Path(key) if key is not None else super().restore_target(entry)
+
+
+def survey(collection, palace: Path, view: PreviousView | None = None) -> Survey:
     """Read the store and its exchange files; judge each file by rules 1 and 2. Writes nothing."""
+    view = view or PreviousView(palace)
     conversations = palace / _CONVERSATIONS_WING
-    by_file, total, no_source = _drawers_by_file(collection, conversations)
+    by_file, total, no_source = _drawers_by_file(collection, conversations, view.key)
     found = Survey(palace=palace, drawers=total, no_source=no_source)
     seen: set[str] = set()
-    paths = sorted(conversations.iterdir()) if conversations.is_dir() else []
-    for path in paths:
-        key = str(conversations / path.name)
-        if path.is_symlink() or not path.is_file() or path.suffix != ".md":
-            found.unread += 1
+    for folder in view.folders():
+        paths = sorted(folder.iterdir()) if folder.is_dir() else []
+        for path in paths:
+            key = str(folder / path.name)
+            if path.is_symlink() or not path.is_file() or path.suffix != ".md":
+                found.unread += 1
+                seen.add(key)
+                continue
             seen.add(key)
-            continue
+            drawers = by_file.get(key)
+            if not drawers:
+                found.unfiled += 1
+                continue
+            try:
+                # Bytes, decoded by hand: `read_text` translates ``\r\n``, so the hash it gave would
+                # never match the bytes `_ready` hashes at the apply.
+                text = path.read_bytes().decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                found.unread += 1
+                continue
+            _judge(found, path, text, drawers)
+    for path, data in view.records():
+        key = str(path)
         seen.add(key)
         drawers = by_file.get(key)
-        if not drawers:
+        if not drawers or view.store.is_unfiled(path.parent.name, path.stem):
             found.unfiled += 1
             continue
         try:
-            # Bytes, decoded by hand: `read_text` translates ``\r\n``, so the hash it gave would
-            # never match the bytes `_ready` hashes at the apply.
-            text = path.read_bytes().decode("utf-8")
-        except (OSError, UnicodeDecodeError):
+            text = exchange_text(Record.from_bytes(data))
+        except ValueError:
             found.unread += 1
             continue
-        found.exchanges += 1
-        if not _pieces_of(text, drawers):
-            found.foreign += 1
-            continue
-        judged = candidate(path.name, path, text)
-        if isinstance(judged, str):
-            found.excluded[judged] += 1
-        else:
-            found.candidates.append(judged)
+        _judge(found, path, text, drawers, hashlib.sha256(data).hexdigest())
     found.elsewhere = sum(len(d) for file, d in by_file.items() if file not in seen)
     return found
+
+
+def _judge(found: Survey, path: Path, text: str, drawers: list, sha256: str | None = None) -> None:
+    """Count one exchange and judge it by rules 1 and 2 (`candidate`)."""
+    found.exchanges += 1
+    if not _pieces_of(text, drawers):
+        found.foreign += 1
+        return
+    judged = candidate(path.name, path, text, sha256)
+    if isinstance(judged, str):
+        found.excluded[judged] += 1
+    else:
+        found.candidates.append(judged)
 
 
 # --- the plan -----------------------------------------------------------------------------------
@@ -873,6 +986,19 @@ REPORT_YES = (
     ),
 )
 
+#: What a yes does under ``mempalace`` (`NamedView`): the same, but for how a memory is deleted, which
+#: is the charter line issue #1011 set. An exchange the new adapter filed is its record and its
+#: drawers; an old one is its exchange file and its drawers.
+NAMED_REPORT_YES = (
+    REPORT_YES[0],
+    (
+        "- A yes removes the group's copies, each one whole: its record and every drawer filed from "
+        "it. Deleting a memory means deleting the record and the drawer, or the next rebuild files it "
+        "again."
+    ),
+    *REPORT_YES[2:],
+)
+
 
 def _fence(text: str) -> str:
     """``text`` in a fenced block whose fence no run of backticks inside it can close."""
@@ -892,7 +1018,12 @@ def _when(stamp: datetime) -> str:
 
 
 def render_report(
-    found: Survey, found_groups: list[Group], digest: str, backups: list[str], state: Path
+    found: Survey,
+    found_groups: list[Group],
+    digest: str,
+    backups: list[str],
+    state: Path,
+    yes: tuple[str, ...] = REPORT_YES,
 ) -> str:
     """The report the agent reads before it says yes: every group, one real example, the keeps.
 
@@ -912,7 +1043,7 @@ def render_report(
         "",
         "## What a Yes Does",
         "",
-        *REPORT_YES,
+        *yes,
         "",
     ]
     if found_groups:
@@ -1000,9 +1131,10 @@ class Offer:
     diagnosis: Diagnosis
 
 
-def offer(collection, palace: Path, state: Path) -> Offer:
+def offer(collection, palace: Path, state: Path, view: PreviousView | None = None) -> Offer:
     """Survey the store, group the candidates, and write the report and its plan. No store write."""
-    found = survey(collection, palace)
+    view = view or PreviousView(palace)
+    found = survey(collection, palace, view)
     neighbours = _neighbours(found.candidates)
     found_groups = groups(found.candidates, neighbours)
     plan = plan_of(found, found_groups)
@@ -1012,7 +1144,8 @@ def offer(collection, palace: Path, state: Path) -> Offer:
     backups = _backups(state)
     report = state / REPORT
     _write_private(
-        report, render_report(found, found_groups, digest, backups, state).encode("utf-8")
+        report,
+        render_report(found, found_groups, digest, backups, state, view.yes).encode("utf-8"),
     )
     record = {"hash": digest, "plan": plan}
     _write_private(state / PLAN, json.dumps(record, indent=2, ensure_ascii=False).encode("utf-8"))
@@ -1076,15 +1209,14 @@ def _targets(plan: dict, named: list[str], remove_latest: list[str]) -> list[dic
     return targets
 
 
-def _ready(entry: dict, conversations: Path, by_file: dict) -> tuple[Path, list, bytes] | str:
+def _ready(
+    entry: dict, conversations: Path, by_file: dict, view: PreviousView | None = None
+) -> tuple[Path, list, bytes] | str:
     """The file and drawers of an entry that still matches, or why it is skipped."""
     path = Path(entry["path"])
-    root = conversations.resolve()
-    try:
-        resolved = path.resolve()
-    except OSError:
-        return OUTSIDE
-    if resolved.parent != root:
+    view = view or PreviousView(conversations.parent)
+    key = view.locate(path)
+    if key is None:
         return OUTSIDE
     if not path.exists():
         return GONE
@@ -1097,12 +1229,12 @@ def _ready(entry: dict, conversations: Path, by_file: dict) -> tuple[Path, list,
     if hashlib.sha256(data).hexdigest() != entry["sha256"]:
         return CHANGED
     try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
+        text = view.text(path, data)
+    except (UnicodeDecodeError, ValueError):
         return UNREADABLE
-    if isinstance(candidate(path.name, path, text), str):
+    if isinstance(candidate(path.name, path, text, entry["sha256"]), str):
         return NOT_CANDIDATE  # a plan naming a file the rule never selects is not carried out
-    drawers = by_file.get(str(conversations / path.name), [])
+    drawers = by_file.get(key, [])
     if not _pieces_of(text, drawers):
         return FOREIGN
     return path, drawers, data
@@ -1203,6 +1335,7 @@ def apply(
     named: list[str],
     remove_latest: list[str],
     lock=None,
+    view: PreviousView | None = None,
 ) -> Applied:
     """Carry out a yes against the plan the agent read. Never re-plans.
 
@@ -1219,14 +1352,15 @@ def apply(
     leave those new drawers with no file.
     """
     lock = lock or mine_lock
+    view = view or PreviousView(palace)
     plan = load_plan(state, digest, palace)
     targets = _targets(plan, named, remove_latest)
     conversations = palace / _CONVERSATIONS_WING
-    by_file, _, _ = _drawers_by_file(collection, conversations)
+    by_file, _, _ = _drawers_by_file(collection, conversations, view.key)
     result = Applied()
     ready = []
     for entry in targets:
-        judged = _ready(entry, conversations, by_file)
+        judged = _ready(entry, conversations, by_file, view)
         if isinstance(judged, str):
             result.skipped.append((Path(entry["path"]).name, judged))
         else:
@@ -1295,7 +1429,9 @@ def _backup_dir(state: Path, name: str) -> Path:
     return target
 
 
-def restore(collection, palace: Path, state: Path, name: str, lock=None) -> Restored:
+def restore(
+    collection, palace: Path, state: Path, name: str, lock=None, view: PreviousView | None = None
+) -> Restored:
     """Put back exactly the files and drawers of a backup that are absent from the store.
 
     What is already present is left untouched and reported, so a second run changes nothing. The
@@ -1330,14 +1466,22 @@ def restore(collection, palace: Path, state: Path, name: str, lock=None) -> Rest
     present = set()
     for start in range(0, len(ids), _PAGE):
         present |= set(collection.get(ids=ids[start : start + _PAGE], include=[]).get("ids") or [])
+    view = view or PreviousView(palace)
+    targets = {file: view.restore_target(entry) for file, (entry, _) in files.items()}
     conversations = palace / _CONVERSATIONS_WING
-    if not conversations.is_dir():
+    needs_conversations = not isinstance(view, NamedView) or any(
+        target.parent == conversations for target in targets.values()
+    )
+    if needs_conversations and not conversations.is_dir():
         raise Refused(f"the palace has no conversations directory ({conversations})")
     lock = lock or mine_lock
     result = Restored()
     for file, (entry, data) in files.items():
-        with lock(conversations / file):
-            _restore_file(collection, conversations, file, entry, data, by_file, present, result)
+        target = targets[file]
+        if not target.parent.is_dir():
+            _private_dir(target.parent)  # a record's timeline folder, made again (issue #1011)
+        with lock(target):
+            _restore_file(collection, target.parent, file, entry, data, by_file, present, result)
     return result
 
 
@@ -1523,6 +1667,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--plan", metavar="HASH", help="the plan hash of the report the agent read."
     )
+    parser.add_argument(
+        "--archive",
+        metavar="DIR",
+        help=(
+            "under HARNESS_MEMORY_PROVIDER=mempalace: the directory old exchange files were moved "
+            "to, read after the palace's conversations directory. Defaults to "
+            "HARNESS_MEMPALACE_ARCHIVE. Ignored under mempalace-previous."
+        ),
+    )
     parser.add_argument("--groups", metavar="IDS", help="the comma-separated group ids of the yes.")
     parser.add_argument(
         "--remove-latest",
@@ -1530,6 +1683,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="the groups, among --groups, whose latest copy goes too.",
     )
     return parser
+
+
+def view_for(palace: Path, archive: str | None = None) -> PreviousView:
+    """The view the agent's adapter calls for (issue #1011): `PreviousView` under
+    ``mempalace-previous``, else `NamedView` over this palace's records and the archive."""
+    if configured_mempalace_name() == _MEMPALACE_PREVIOUS:
+        return PreviousView(palace)
+    return NamedView(palace, RecordStore(records_dir(palace)), archive_dir(archive))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1557,8 +1718,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         collection = open_palace(palace)
+        view = view_for(palace, args.archive)
         if args.restore:
-            restored = restore(collection, palace, state, args.restore)
+            restored = restore(collection, palace, state, args.restore, view=view)
             print(f"palace: {palace}")
             print(f"restored: {len(restored.files)} file(s), {restored.drawers} drawer(s)")
             for item in restored.skipped_files[:_SKIPS_SHOWN]:
@@ -1591,6 +1753,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.plan,
                 _ids(args.groups),
                 _ids(args.remove_latest),
+                view=view,
             )
             print(f"palace: {palace}")
             print(f"plan: {args.plan}")
@@ -1613,7 +1776,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
             return 0
-        result = offer(collection, palace, state)
+        result = offer(collection, palace, state, view)
         _print_offer(result)
         _log.info(
             "%s %s",

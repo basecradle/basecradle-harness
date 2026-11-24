@@ -2993,7 +2993,13 @@ class WakeAgent:
             # arriving in items the agent chose not to answer: a peer's birthday mentioned in a
             # message the agent had no reason to reply to must still be recallable, from any
             # timeline, later. The exchange is real whether or not anyone else heard it.
-            self._observe(_dialogue_of(item, kind), narration, marked=self._marked(item, kind))
+            self._observe(
+                _dialogue_of(item, kind),
+                narration,
+                marked=self._marked(item, kind),
+                item=uuid,
+                task_instructions=_instructions_of(item, kind),
+            )
             if truncated_turn:
                 # The turn is unfinished, so it is **not committed** (issue #490): the claim stays
                 # in-flight, the record stops here, and the next wake finishes the turn. It *is*
@@ -3326,7 +3332,14 @@ class WakeAgent:
             _log.warning("Memory provider begin_wake() failed; continuing.", exc_info=True)
 
     def _observe(
-        self, user: str, assistant: str, *, seeded: bool = False, marked: bool = False
+        self,
+        user: str,
+        assistant: str,
+        *,
+        seeded: bool = False,
+        marked: bool = False,
+        item: str | None = None,
+        task_instructions: str | None = None,
     ) -> None:
         """Hand a completed exchange to the memory provider's `observe` hook, guarded.
 
@@ -3350,6 +3363,11 @@ class WakeAgent:
           and deliberately narrow: it catches the one residue closure cannot reach — a model
           quoting its own injected recall back in a reply, which is genuine LLM output on a path
           that is genuinely mined.
+
+        - **The exchange names the item it answered** (``item``, issue #1011): the item's uuid, or a
+          batch's newest message's, so a provider that files under it finds a retry of the same
+          exchange. A task activation's carries its ``task_instructions`` too: the task's own
+          words, already part of ``user``, and redacted here the same way.
 
         - **A marked real wake is not handed to memory at all** (``marked``, issue #950): the NOC's
           own verification wake, recognised by a verified `BCNOC2` marker bound to this timeline and
@@ -3390,6 +3408,8 @@ class WakeAgent:
             # split into drawers or written under `conversations/`.
             user, from_user = scrub_counted(user)
             assistant, from_assistant = scrub_counted(assistant)
+            if task_instructions is not None:
+                task_instructions, _ = scrub_counted(task_instructions)
         except Exception:  # noqa: BLE001 - an exchange that cannot be redacted is never filed
             _log.warning(
                 "memory %s",
@@ -3410,6 +3430,8 @@ class WakeAgent:
                     assistant=assistant,
                     scope=MemoryScope(agent=self.me_uuid, timeline=self.timeline_uuid),
                     seeded=seeded,
+                    item=item,
+                    task_instructions=task_instructions,
                 )
             )
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake; swallow it
@@ -3459,6 +3481,7 @@ class WakeAgent:
                 "",
                 seeded=True,
                 marked=self._marked(message, _MESSAGES),
+                item=_uuid_of(message),
             )
 
     def _seeded_peers(self, seeded: list[object]) -> list[object]:
@@ -3812,6 +3835,7 @@ class WakeAgent:
             _render_batch(batch),
             narration,
             marked=all(self._marked(message, _MESSAGES) for message in batch),
+            item=_uuid_of(batch[-1]),  # a batch is named by its newest message (issue #1011)
         )
         if truncated_turn:
             # The turn is unfinished (issue #490). Flip this batch's `_OURS` entries to `_PENDING`
@@ -4234,6 +4258,8 @@ class WakeAgent:
                 rendered if kind == _MESSAGES else _dialogue_of(item, kind),
                 narration,
                 marked=self._turn_marked(turn, item, kind),
+                item=_turn_item(turn, item, kind),
+                task_instructions=_instructions_of(item, kind),
             )
             if truncated_turn:
                 # The continuation was itself cut off (issue #490). The turn is still unfinished, so
@@ -4488,6 +4514,8 @@ class WakeAgent:
                 rendered if kind == _MESSAGES else _dialogue_of(item, kind),
                 "",
                 marked=self._turn_marked(turn, item, kind),
+                item=_turn_item(turn, item, kind),
+                task_instructions=_instructions_of(item, kind),
             )
         for mate in turn.items:
             if mate != uuid:
@@ -5643,6 +5671,23 @@ def _dialogue_of(item: object, kind: str) -> str:
     if kind == _TASKS:
         return f"{_task_dialogue(item)}\n{item.content.instructions}"
     return _incoming_text(item)
+
+
+def _instructions_of(item: object, kind: str) -> str | None:
+    """A task activation's instructions, for the memory door rule (issue #1011); else ``None``."""
+    return item.content.instructions if kind == _TASKS else None
+
+
+def _turn_item(turn: Message, item: object, kind: str) -> str | None:
+    """The item a recovered turn's exchange is named by (issue #1011).
+
+    A message turn is named by the newest message it carried, as the live batch is
+    (`MemoryExchange.item`); a turn persisted before turns recorded their items, and every other
+    kind, by the item that owns the claim.
+    """
+    if kind == _MESSAGES and turn.items:
+        return turn.items[-1]
+    return _uuid_of(item)
 
 
 def _render_batch(messages: list[object]) -> str:
