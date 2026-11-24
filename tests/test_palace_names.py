@@ -262,3 +262,16 @@ def test_under_mempalace_old_files_are_read_in_the_archive_and_held_when_found_n
     assert len(result.removed) == 5
     assert len(list(archive.iterdir())) == 1
     assert len(store.collection.drawers) == 3  # the kept copy and the two whose files are lost
+
+
+def test_an_exchange_that_becomes_unfiled_between_scan_and_apply_keeps_its_drawers(palace):
+    """Its unit is read again at the apply; one that is no longer provable deletes nothing."""
+    root, collection, store = palace
+    record = _named(collection, store, ITEMS[0], LEGACY_HEADING, "")
+    reader = _scrub.NamedReader(root, store)
+    report = _scrub.scan(collection, root, reader)
+    assert len(report.scrub) == 1
+    store._touch(store._marker(record.timeline, record.id))  # a refile began in between
+
+    assert _scrub.apply(collection, report) == (0, 0)
+    assert collection.drawers and store.read(TIMELINE, ITEMS[0]) is not None

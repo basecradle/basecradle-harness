@@ -491,3 +491,18 @@ def test_a_name_is_parsed_only_in_the_exact_shape_it_is_written():
     ):
         assert parse_name(wrong) is None, wrong
     assert re.fullmatch(NAME, exchange_name("none", M0, 1))
+
+
+def test_a_late_refile_never_moves_the_task_pointer_back(tmp_path):
+    store = RecordStore(tmp_path / "records")
+    older = _exchange_records.new_record(
+        timeline=TIMELINE, item=T0, agent="nova", user="u", assistant="old", task_instructions="i"
+    )
+    newer = _exchange_records.new_record(
+        timeline=TIMELINE, item=T1, agent="nova", user="u", assistant="new", task_instructions="i"
+    )
+    for record in (newer, older):  # the older activation is filed last, by a refile
+        store.write(record)
+        store.remember_task(task_key(TIMELINE, "i"), store.mark_filed(record))
+
+    assert store.last_task_reply(task_key(TIMELINE, "i")).assistant == "new"

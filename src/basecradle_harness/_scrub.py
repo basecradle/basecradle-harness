@@ -417,19 +417,16 @@ def apply(collection, report: Report) -> tuple[int, int]:
     """
     blocked = _blocked(report)
     reader = report.reader
+    # Each finding's unit is read once, here, before anything is removed: a named reader finds an
+    # old file by its presence, so a reading after the unlink would lose it. A unit that is ``None``
+    # now (an exchange whose record gained an unfiled marker since the scan) keeps its drawers too.
+    units = {finding.drawer_id: reader.unit(finding.source_file) for finding in report.scrub}
     removed = 0
-    units = dict.fromkeys(
-        unit
-        for unit in (reader.unit(finding.source_file) for finding in report.scrub)
-        if unit and unit not in blocked
-    )
-    for unit in units:
+    for unit in dict.fromkeys(u for u in units.values() if u is not None and u not in blocked):
         if reader.remove(unit):
             removed += 1
     ids = [
-        finding.drawer_id
-        for finding in report.scrub
-        if reader.unit(finding.source_file) not in blocked
+        drawer_id for drawer_id, unit in units.items() if unit is not None and unit not in blocked
     ]
     for start in range(0, len(ids), _DELETE_BATCH):
         collection.delete(ids=ids[start : start + _DELETE_BATCH])

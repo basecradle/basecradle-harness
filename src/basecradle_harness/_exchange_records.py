@@ -23,6 +23,14 @@ Layout, under ``<palace parent>/<palace name>-records/`` (`records_dir`):
   instructions, normalised as the near-copy measure normalises them (`task_key`), because a
   recurring task on this platform is a new task with the same instructions each time it fires.
 
+**One writer per agent, by the fleet's guarantee, not by a lock here.** The router runs one wake at
+a time per agent, which is what the session transcript already relies on (CLAUDE.md, Delivery
+Guarantee: "the transcript has exactly one writer, and this repo does not enforce it"). A second
+process filing into the same records at once could have its marker resolved by the other's refile.
+A process killed after it wrote a marker and before its record replaced the partial leaves both,
+which the next wake drops: that exchange is lost, exactly as an observe that fails is, and as the
+previous adapter lost one killed between its file and its drawers.
+
 Every write is atomic (a fixed-name ``.<name>.partial`` beside the target, ``fsync``, `os.replace`,
 then the directory ``fsync``) at mode ``0600`` in ``0700`` directories. A write killed partway
 leaves only its partial, which the next write of the same file takes over; the flush removes the one
@@ -317,7 +325,7 @@ class RecordStore:
         try:
             pointer = json.loads(self._task(key).read_text(encoding="utf-8"))
             return self.read(str(pointer["timeline"]), str(pointer["id"]))
-        except (FileNotFoundError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError):
             return None
 
     # --- writing -------------------------------------------------------------------------------
@@ -338,7 +346,15 @@ class RecordStore:
         return filed
 
     def remember_task(self, key: str, record: Record) -> None:
-        """Point the task keyed ``key`` at ``record``, its last filed reply."""
+        """Point the task keyed ``key`` at ``record``, its last filed reply.
+
+        Never backwards: a record filed late (an older activation the next wake refiled) leaves the
+        pointer on a newer one, so the door compares against the latest reply, by when each was
+        recorded.
+        """
+        current = self.last_task_reply(key)
+        if current is not None and current.recorded_at > record.recorded_at:
+            return
         pointer = {"timeline": record.timeline, "id": record.id}
         self._write(self._task(key), (json.dumps(pointer) + "\n").encode("utf-8"))
 

@@ -1469,7 +1469,10 @@ def restore(
     view = view or PreviousView(palace)
     targets = {file: view.restore_target(entry) for file, (entry, _) in files.items()}
     conversations = palace / _CONVERSATIONS_WING
-    if any(t.parent == conversations for t in targets.values()) and not conversations.is_dir():
+    needs_conversations = not isinstance(view, NamedView) or any(
+        target.parent == conversations for target in targets.values()
+    )
+    if needs_conversations and not conversations.is_dir():
         raise Refused(f"the palace has no conversations directory ({conversations})")
     lock = lock or mine_lock
     result = Restored()
