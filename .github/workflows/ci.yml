@@ -103,9 +103,11 @@ jobs:
           while IFS= read -r file; do
             case "$file" in
               uv.lock | pyproject.toml | .github/workflows/ci.yml \
-                | src/basecradle_harness/_mempalace.py | src/basecradle_harness/_palace_*.py \
+                | src/basecradle_harness/_mempalace*.py | src/basecradle_harness/_palace_*.py \
                 | src/basecradle_harness/_memory_provider.py | src/basecradle_harness/_mining.py \
                 | src/basecradle_harness/_rerank.py | src/basecradle_harness/_scrub.py \
+                | src/basecradle_harness/_prune.py | src/basecradle_harness/_exchange_records.py \
+                | src/basecradle_harness/_near_copy.py \
                 | tests/conftest.py | tests/test_*_real.py | scripts/isolated_home.py)
                 run=true
                 ;;

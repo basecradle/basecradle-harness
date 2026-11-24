@@ -30,9 +30,10 @@ partition on. `query` carries the turn's incoming text so a relevance-ranked pro
 (MemPalace) has something to retrieve *against* at Turn-0 time.
 
 Provider selection is config-driven (`memory_provider_from_env`): ``sqlite`` (the
-default), ``mempalace`` (the optional reference adapter, also selected by its second name
-``mempalace-previous``), or a dotted ``module:Class`` path to any custom `MemoryProvider`. One
-provider per agent.
+default), ``mempalace`` (the MemPalace adapter that files each memory under a BaseCradle name and
+keeps its own record, issue #1011), ``mempalace-previous`` (the MemPalace adapter the fleet ran
+before it, kept selectable so each agent moves one at a time and can be set back), or a dotted
+``module:Class`` path to any custom `MemoryProvider`. One provider per agent.
 """
 
 from __future__ import annotations
@@ -87,12 +88,23 @@ class MemoryExchange:
             provider may keep what it files from it out of **this wake's** Turn-0 `context`
             (issue #746) — and must still return it from a deliberate search. A provider that
             ignores the flag behaves exactly as before it existed.
+        item: The uuid of the platform item the exchange answered (issue #1011): the message, the
+            asset, the webhook event, or the task activation. A turn that answered a batch of
+            messages is named by its **newest** message's uuid. ``None`` when the exchange answered
+            no item (a library caller's own exchange). Handed to every provider; the MemPalace
+            adapter names each memory it files by it, so a retry of the same exchange finds it.
+        task_instructions: The instructions of the task, when ``item`` is a task activation, as the
+            task's author wrote them. ``None`` for every other kind. A provider may key a rule about
+            recurring tasks on them (the MemPalace adapter's door rule): a recurring task on this
+            platform is a new task with the same instructions each time it fires.
     """
 
     user: str
     assistant: str
     scope: MemoryScope
     seeded: bool = False
+    item: str | None = None
+    task_instructions: str | None = None
 
 
 class MemoryProvider(ABC):
@@ -182,19 +194,25 @@ class SqliteMemoryProvider(MemoryProvider):
 _PROVIDER_VAR = "HARNESS_MEMORY_PROVIDER"
 _SQLITE = "sqlite"
 _MEMPALACE = "mempalace"
-# The same MemPalace adapter under a second name (issue #1010). The memory redesign
-# (basecradle#966) gives `mempalace` to a new adapter and keeps today's selectable as
-# `mempalace-previous`, so each agent moves one at a time and can be set back. Until the new
-# adapter lands the two names select one class: same palace, same extra, same tools. Each reports
-# the name it was selected by (the capital's amendment on the issue): the adapter carries it, so
-# the NOC reads an agent's move off its resolved configuration and its `memory` lines, and the
-# release that gives `mempalace` to the new adapter changes no reported value.
+# The MemPalace adapter the fleet ran before the memory redesign (basecradle#966), under the second
+# name issue #1010 gave it. Issue #1011 gives `mempalace` to the new adapter
+# (`_mempalace_provider.MemPalaceProvider`) and keeps this one selectable as `mempalace-previous`,
+# unchanged, so each agent moves one at a time and can be set back: cutover sets an agent's
+# `HARNESS_MEMORY_PROVIDER` to `mempalace`, rollback sets it back. Both read and write the one
+# palace, under the one extra, with the one `memory_search` tool. Each reports the name it was
+# selected by, read off the bound object, so the NOC sees an agent's move in its resolved
+# configuration and its `memory` lines.
 _MEMPALACE_PREVIOUS = "mempalace-previous"
 _MEMPALACE_SELECTORS = frozenset({_MEMPALACE, _MEMPALACE_PREVIOUS})
 
-# The MemPalace adapter's class, by import path — so `describe_memory_provider` can *name* a
-# bound MemPalace provider without importing the optional-extra module to do it.
+# The previous MemPalace adapter's class, by import path — so `describe_memory_provider` can *name* a
+# bound MemPalace provider without importing the optional-extra module to do it. It still answers to
+# both names when built directly (the palace check opens a palace through it), and reports the one
+# it carries.
 _MEMPALACE_CLASS = "basecradle_harness._mempalace.MemPalaceMemoryProvider"
+# The new MemPalace adapter's class (issue #1011), by import path for the same reason. It answers to
+# `mempalace` alone.
+_MEMPALACE_NAMED_CLASS = "basecradle_harness._mempalace_provider.MemPalaceProvider"
 
 # The PyPI distribution backing each built-in alias, for the manifest's version field. Only
 # `mempalace` has one (the harness's `[mempalace]` extra); `sqlite` is absent on purpose — see
@@ -215,10 +233,12 @@ def memory_provider_from_env(home: str | os.PathLike[str] | None = None) -> Memo
     The selector, case-insensitive:
 
     - unset or ``sqlite`` → `SqliteMemoryProvider` (the default — host-local, private).
-    - ``mempalace`` or ``mempalace-previous`` → the optional reference adapter
-      (`basecradle_harness._mempalace.MemPalaceMemoryProvider`), which requires the
-      ``mempalace`` extra (``pip install basecradle-harness[mempalace]``). A clear
-      error names the extra if it is not installed.
+    - ``mempalace`` → the MemPalace adapter that files each memory under a BaseCradle name and
+      keeps its own record (`basecradle_harness._mempalace_provider.MemPalaceProvider`, issue
+      #1011); ``mempalace-previous`` → the MemPalace adapter the fleet ran before it
+      (`basecradle_harness._mempalace.MemPalaceMemoryProvider`). Both require the ``mempalace``
+      extra (``pip install basecradle-harness[mempalace]``), and a clear error names the extra
+      if it is not installed.
     - anything else → a dotted ``module:Class`` (or ``module.Class``) path to a custom
       `MemoryProvider` subclass, imported and instantiated with no arguments.
 
@@ -234,8 +254,12 @@ def configured_mempalace_name() -> str:
 
     For a command that opens a palace by its path rather than binding the agent's memory provider
     (`basecradle-harness-palace-check`), so its ``memory`` lines carry the name the agent's own
-    wakes do (issue #1010). The setting when it names the adapter (``mempalace`` or
-    ``mempalace-previous``, any case), else ``mempalace``: the command examines a MemPalace palace
+    wakes do (issue #1010), and for the two commands that delete inside a palace
+    (`basecradle-harness-scrub-palace`, `basecradle-harness-prune-palace`), which read the memories
+    filed under both adapters' names only under ``mempalace`` and hold on every name the previous
+    adapter does not write under ``mempalace-previous`` (issue #1011). The setting when it names
+    the adapter (``mempalace`` or ``mempalace-previous``, any case), else ``mempalace``: the command
+    examines a MemPalace palace
     whatever the agent binds, and refusing to run on another setting would hide the palace it was
     asked to read.
     """
@@ -266,7 +290,11 @@ def memory_provider_named(
     lowered = raw.lower()
     if lowered == _SQLITE:
         return SqliteMemoryProvider(_store_path(home))
-    if lowered in _MEMPALACE_SELECTORS:
+    if lowered == _MEMPALACE:
+        from basecradle_harness._mempalace_provider import MemPalaceProvider
+
+        return MemPalaceProvider(palace_path=_palace_path(home))
+    if lowered == _MEMPALACE_PREVIOUS:
         from basecradle_harness._mempalace import MemPalaceMemoryProvider
 
         return MemPalaceMemoryProvider(palace_path=_palace_path(home), name=lowered)
@@ -284,10 +312,11 @@ def describe_memory_provider(provider: MemoryProvider) -> tuple[str, str | None]
     - **name** — ``sqlite`` or ``mempalace`` for the built-ins (whichever alias *or* dotted
       path selected them: the class is the truth, so every spelling normalizes to the alias),
       else ``module:Class`` — the import path of the custom provider actually bound. A
-      *subclass* of a built-in is a custom provider and reports its own path, not the alias. The
-      MemPalace adapter reports the name it carries, the one it was selected by: ``mempalace``,
-      or ``mempalace-previous`` for its second name (issue #1010), read off the object like the
-      rest; one built directly with no name is ``mempalace``.
+      *subclass* of a built-in is a custom provider and reports its own path, not the alias. Each
+      MemPalace adapter reports the name it carries, the one it was selected by, read off the
+      object like the rest: ``mempalace`` for the adapter issue #1011 built, and for the previous
+      one either ``mempalace-previous`` (its name since issue #1010) or, built directly with no
+      name, ``mempalace``.
     - **version** — the installed version of the **backing distribution** the harness pins for
       that provider — today that means the ``mempalace`` extra — else ``None``. ``None`` for the
       built-in ``sqlite`` store, which ships *inside the harness* (its engine is stdlib
@@ -314,7 +343,7 @@ def _provider_name(provider: MemoryProvider) -> str:
     # module we must not import just to name a provider that isn't it (the same laziness the
     # adapter itself keeps around chromadb), and an exact-class check is what makes a
     # *subclass* correctly report as the custom provider it is.
-    if f"{cls.__module__}.{cls.__qualname__}" == _MEMPALACE_CLASS:
+    if f"{cls.__module__}.{cls.__qualname__}" in (_MEMPALACE_CLASS, _MEMPALACE_NAMED_CLASS):
         return provider.name  # the name it was selected by (issue #1010)
     return f"{cls.__module__}:{cls.__qualname__}"
 

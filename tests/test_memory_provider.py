@@ -158,30 +158,34 @@ def test_both_palace_path_vars_empty_falls_back_to_the_agent_home(
     assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "mempalace"
 
 
-def test_both_mempalace_names_bind_the_one_adapter_identically(
+def test_each_mempalace_name_binds_its_own_adapter_over_the_one_palace(
     monkeypatch, tmp_path, mempalace_selector
 ):
-    """`mempalace-previous` is a second name for today's adapter, nothing more (issue #1010).
+    """`mempalace` binds the adapter issue #1011 built; `mempalace-previous` the one before it.
 
-    The memory redesign (basecradle#966) will give `mempalace` to a new adapter; until it lands,
-    either name binds the same class over the same palace and contributes the same tools. Each
-    reports the name it was selected by, in its lowercase spelling, so `mempalace` reports what it
-    always did and an agent's move is visible to the NOC. Case-insensitive like every built-in.
+    Issue #1010 gave the previous adapter its second name so that this issue could give
+    `mempalace` to the new one with no agent's behaviour changing: every agent names
+    `mempalace-previous` before it rolls. Both bind the one palace and contribute the same tools, and
+    each reports the name it was selected by, in its lowercase spelling, so an agent's cutover and
+    its rollback are visible to the NOC. Case-insensitive like every built-in.
     """
+    from basecradle_harness._mempalace_provider import MemPalaceProvider
+
     monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
     monkeypatch.delenv("MEMPAL_PALACE_PATH", raising=False)
+    expected = MemPalaceProvider if mempalace_selector == "mempalace" else MemPalaceMemoryProvider
 
     for spelling in (mempalace_selector, mempalace_selector.upper()):
         monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", spelling)
         provider = memory_provider_from_env(home=tmp_path)
 
-        assert type(provider) is MemPalaceMemoryProvider
+        assert type(provider) is expected
         assert provider.palace_path == tmp_path / "mempalace"
         assert [tool.name for tool in provider.tools()] == ["memory_search"]
         assert provider.name == mempalace_selector
         assert describe_memory_provider(provider) == (mempalace_selector, None)
         named = memory_provider_named(spelling, tmp_path)
-        assert type(named) is MemPalaceMemoryProvider
+        assert type(named) is expected
         assert named.name == mempalace_selector
 
 
@@ -1144,3 +1148,127 @@ def test_an_exchange_the_redaction_cannot_run_on_is_never_filed(
 
     assert provider.observed == []
     assert "memory op=observe result=skipped reason=redaction_failed" in caplog.text
+
+
+# --- every exchange names the item it answered (issue #1011) ---------------------------------------
+
+T0 = "019e7770-5555-7eee-8fff-506172839405"
+
+
+def _task(*, uuid, instructions):
+    return {
+        "type": "task",
+        "created_at": "2026-06-10T00:00:00.000Z",
+        "updated_at": "2026-06-10T00:00:00.000Z",
+        "user": {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
+        "timeline": {"uuid": TIMELINE_UUID},
+        "content": {
+            "uuid": uuid,
+            "instructions": instructions,
+            "activate_at": "2026-06-11T06:00:00+00:00",
+            "status": "activated",
+        },
+    }
+
+
+def test_a_batch_is_named_by_its_newest_message(platform, tmp_path):
+    _serve_messages(
+        platform,
+        {
+            "messages": [
+                _message(uuid=M1, body="Second?"),
+                _message(uuid=M0, body="First?"),
+                _message(uuid=MSELF, body="earlier", mine=True),
+            ],
+            "next_cursor": None,
+        },
+    )
+    provider = RecordingProvider()
+
+    _wake(tmp_path, provider).wake()
+
+    ((exchange),) = provider.observed
+    assert exchange.item == M1  # newest, never the oldest that owns the anchor
+    assert exchange.task_instructions is None
+
+
+def test_a_seeded_message_is_named_by_its_own_uuid(platform, tmp_path):
+    _serve_messages(
+        platform,
+        {
+            "messages": [_message(uuid=M1, body=POINTER), _message(uuid=BRIEF, body=FACT)],
+            "next_cursor": None,
+        },
+    )
+    provider = RecordingProvider()
+
+    _wake(tmp_path, provider).wake()
+
+    seeded, turn = provider.observed
+    assert (seeded.item, turn.item) == (BRIEF, M1)
+
+
+def test_a_task_activation_is_named_by_the_task_and_carries_its_instructions(platform, tmp_path):
+    _serve_messages(platform, {"messages": [], "next_cursor": None})
+    platform.get("/tasks").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "tasks": [_task(uuid=T0, instructions="Report the build status.")],
+                "next_cursor": None,
+            },
+        )
+    )
+    provider = RecordingProvider()
+
+    _wake(tmp_path, provider).wake()
+
+    ((exchange),) = provider.observed
+    assert exchange.item == T0
+    assert exchange.task_instructions == "Report the build status."
+    assert "Report the build status." in exchange.user
+
+
+def test_a_task_activations_instructions_are_redacted_with_the_exchange(
+    platform, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FAL_KEY", _CONFIGURED_SECRET)
+    _serve_messages(platform, {"messages": [], "next_cursor": None})
+    platform.get("/tasks").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "tasks": [_task(uuid=T0, instructions=f"Rotate {_CONFIGURED_SECRET} weekly.")],
+                "next_cursor": None,
+            },
+        )
+    )
+    provider = RecordingProvider()
+
+    _wake(tmp_path, provider).wake()
+
+    ((exchange),) = provider.observed
+    assert exchange.task_instructions == "Rotate [redacted] weekly."
+
+
+def test_under_the_new_adapter_a_redaction_failure_writes_neither_record_nor_drawer(
+    platform, tmp_path, monkeypatch, fake_mempalace
+):
+    """`Redact before the record is written. If the scrub cannot run, write neither.`"""
+    from basecradle_harness._mempalace_provider import MemPalaceProvider
+
+    _serve_messages(
+        platform, {"messages": [_message(uuid=M0, body="Remember this.")], "next_cursor": None}
+    )
+
+    def broken(text):
+        raise RuntimeError("the redaction failed")
+
+    monkeypatch.setattr("basecradle_harness._wake.scrub_counted", broken)
+    convo_miner, _ = fake_mempalace
+    provider = MemPalaceProvider(tmp_path / "palace", sleep=lambda seconds: None)
+
+    _wake(tmp_path, provider).wake()
+
+    assert convo_miner.filed == []
+    assert not provider.records.root.exists()

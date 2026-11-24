@@ -46,7 +46,7 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 
 | Field | Meaning |
 |---|---|
-| `provider` | Who did the work. On a model call or a tool, the vendor that bills it (`AI_PROVIDER`'s value for the brain); on a memory line, the memory system's software, by the name its adapter was selected by (`mempalace`, or `mempalace-previous` for today's adapter under its second name, issue #1010). Software never names a head (issue #485); it appears only here. Always a lowercase slug, `^[a-z0-9._-]+$`, and never a display name (see [Identifiers](#identifiers)). |
+| `provider` | Who did the work. On a model call or a tool, the vendor that bills it (`AI_PROVIDER`'s value for the brain); on a memory line, the memory system's software, by the name its adapter was selected by (`mempalace` for the adapter issue #1011 built, `mempalace-previous` for the one before it, issue #1010). Software never names a head (issue #485); it appears only here. Always a lowercase slug, `^[a-z0-9._-]+$`, and never a display name (see [Identifiers](#identifiers)). |
 | `model` | The vendor's model id the work ran on, exactly as configured. No grammar of the harness's own (see [Identifiers](#identifiers)). |
 | `timeline` | The uuid of the BaseCradle timeline the work is for. |
 | `item` | The uuid of the message or task a wake is working. |
@@ -838,21 +838,40 @@ What the request the model is about to read is made of, in characters, summing e
 
 ### `memory`
 
-One line per memory-system operation other than a retrieval's report, which is `memory recall` (`_wake`, `_mempalace`). The wake writes its own `op=recall` and `op=observe` guard lines here when the provider's hook fails, and an INFO `op=observe result=skipped reason=marked` line for a marked real wake it did not hand to memory (issue #950).
+One line per memory-system operation other than a retrieval's report, which is `memory recall` (`_wake`, `_mempalace`, `_mempalace_provider`). The wake writes its own `op=recall` and `op=observe` guard lines here when the provider's hook fails, and an INFO `op=observe result=skipped reason=marked` line for a marked real wake it did not hand to memory (issue #950).
+
+The MemPalace adapter selected by `mempalace` (issue #1011) writes **one `op=observe` line for every exchange its door decides on**: filed (INFO, no `result`), not filed because it was already filed or was a near-copy of a recurring task's last filed reply (INFO, `result=skipped`), left unfiled because the palace stayed locked past the retry (INFO, `result=busy`; the next wake files it), or not filed because of any other error, which is never retried (WARNING, `result=failed` with the error's class). At the start of a wake that found records left unfiled, one `op=refile` line counts what happened to them.
+
+```text
+INFO memory op=observe provider=mempalace timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2 pieces=1 attempts=1
+INFO memory op=observe provider=mempalace result=skipped reason=near_copy timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2
+INFO memory op=observe provider=mempalace result=busy timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2 pieces=2 attempts=6
+INFO memory op=refile provider=mempalace records=2 filed=2 skipped=0 busy=0 failed=0 unreadable=0 left=0
+```
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
-| `op` | The operation: `recall`, `observe`, `search`, `palace-binding`. | The caller. | Never. |
-| `result` | How it ended, where it did not simply succeed: `failed`, `skipped`, `unfile_failed`. | The caller. | The operation succeeded. |
+| `op` | The operation: `recall`, `observe`, `search`, `palace-binding`, `refile` (the records a wake found unfiled, filed at its start). | The caller. | Never. |
+| `result` | How it ended, where it did not simply succeed: `failed`, `skipped`, `unfile_failed`, `busy` (the palace stayed locked past the retry; the record is left unfiled for the next wake). | The caller. | The operation succeeded. |
 | `provider` | Common: the memory software. | The caller. | The wake's own guard line, which does not know it; `op=palace-binding`. |
 | `surface` | As on `llm`. | `_mempalace`. | Not a search. |
-| `reason` | Why, as a slug: `marked` (a wake the NOC marked with a verified `BCNOC2`, not handed to memory); `redaction_failed` (an exchange the redaction could not run on, so not handed to memory: an exchange is never filed unredacted, issue #999); the MemPalace adapter's own slugs. | `_mempalace`; the wake, for `marked` and `redaction_failed`. | Nothing to explain. |
+| `reason` | Why, as a slug: `marked` (a wake the NOC marked with a verified `BCNOC2`, not handed to memory); `redaction_failed` (an exchange the redaction could not run on, so not handed to memory: an exchange is never filed unredacted, issue #999); `already_filed` (a drawer of this exchange is in the palace already, filed under its name or by the previous adapter, issue #1011); `near_copy` (a recurring task's reply that is a near-copy of the last one filed for that task, issue #1011); the MemPalace adapters' own slugs. | `_mempalace`, `_mempalace_provider`; the wake, for `marked` and `redaction_failed`. | Nothing to explain. |
 | `keys` | The field names of an error envelope upstream returned. | `_mempalace`. | Not that failure. |
 | `type` | The type of an answer that was not a mapping. | `_mempalace`. | Not that failure. |
 | `palace` | The palace path bound. | `_mempalace`. | Not a binding. |
 | `config` | The MemPalace config file path. | `_mempalace`. | Not a binding. |
-| `timeline` | Common. | The wake, on `reason=marked` and `reason=redaction_failed`. | Any other line. |
+| `timeline` | Common. | The wake, on `reason=marked` and `reason=redaction_failed`; `_mempalace_provider`, on `op=observe`. | Any other line, or an exchange on no timeline. |
 | `chars` | Common. | The wake. | Not the wake's guard line. |
+| `pieces` | How many drawers the exchange is filed as. | `_mempalace_provider`, on `op=observe`. | The exchange was skipped before it was cut. |
+| `attempts` | How many times the filing was tried: 1, or up to 6 when the palace's lock refused it. | `_mempalace_provider`, on `op=observe`. | The exchange was skipped at the door. |
+| `error` | Common: the class of the error a filing failed on. | `_mempalace_provider`, on `result=failed`. | Any other result. |
+| `records` | Records found unfiled at the start of the wake. | `_mempalace_provider`, on `op=refile`. | Any other op. |
+| `filed` | Of those, filed now. | `_mempalace_provider`, on `op=refile`. | Any other op. |
+| `skipped` | Of those, found already filed. | `_mempalace_provider`, on `op=refile`. | Any other op. |
+| `busy` | Of those, refused by the palace's lock past the retry. | `_mempalace_provider`, on `op=refile`. | Any other op. |
+| `failed` | Of those, not filed for any other error. | `_mempalace_provider`, on `op=refile`. | Any other op. |
+| `unreadable` | Of those, whose record could not be read: its marker is kept. | `_mempalace_provider`, on `op=refile`. | Any other op. |
+| `left` | Of those, not tried this wake, because the palace was busy. | `_mempalace_provider`, on `op=refile`. | Any other op. |
 
 ### `secrets redacted`
 

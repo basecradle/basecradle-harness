@@ -53,6 +53,23 @@ ones into the same palace. The harness takes no lock of its own here on purpose 
 belongs to whatever is launching wakes (the NOC on the fleet), and a second, private lock that
 only this command respects would read as a guarantee it cannot give.
 
+**Which drawers it can read depends on which adapter the agent runs** (issue #1011), read from
+``HARNESS_MEMORY_PROVIDER`` (`_memory_provider.configured_mempalace_name`):
+
+- **Under ``mempalace-previous``** it reads the names the previous adapter files under — the
+  absolute path of a conversation file — exactly as it always has (`PreviousReader`), and **holds
+  every other name**: a drawer the new adapter filed (``basecradle:<timeline>:<item>:<piece>``), or
+  any name that is not a path, is reported under ``HELD`` and never deleted or rewritten. That is
+  the guard that makes a rollback safe: an agent set back after filing under the new adapter loses
+  nothing to a scrub.
+- **Under ``mempalace``** it reads both (`NamedReader`). A new name's unit is its exchange (every
+  piece filed under the one ``basecradle:<timeline>:<item>`` stem), and ``--apply`` removes the
+  exchange's record and then its drawers, or a rebuild would file it again; an exchange whose record
+  is not yet fully filed is held. An old name is scrubbed only when its conversation file is found,
+  in the palace's ``conversations`` directory or in the archive directory old files are moved to
+  (``--archive``, else ``HARNESS_MEMPALACE_ARCHIVE``). A file found in neither holds its drawers: an
+  old drawer is never deleted because its file is missing from the palace.
+
 Nothing here writes to the palace on a dry run, and nothing here ever touches a drawer the
 report did not name.
 """
@@ -66,7 +83,18 @@ import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from basecradle_harness._memory_provider import _palace_path
+from basecradle_harness._exchange_records import (
+    NAME_SCHEME,
+    RecordStore,
+    archive_dir,
+    parse_name,
+    records_dir,
+)
+from basecradle_harness._memory_provider import (
+    _MEMPALACE_PREVIOUS,
+    _palace_path,
+    configured_mempalace_name,
+)
 from basecradle_harness._mempalace import _CONVERSATIONS_WING, _REGISTRY_ROOM, _import
 from basecradle_harness._mining import Verdict, catalog, classify
 from basecradle_harness._observability import (
@@ -101,6 +129,136 @@ _HELD_SIBLINGS = "its source file also mined {others} drawer(s) that are not sca
 #: held — the failure direction here is always "left alone".
 _HELD_NO_SOURCE = "no source file recorded — its file's other drawers cannot be counted"
 
+#: Why a chunk is held when its drawer is filed under a name the reader does not file under (issue
+#: #1011): under ``mempalace-previous``, a name the new adapter wrote, or anything that is not a
+#: path. The guard that makes a rollback safe: never deleted, never rewritten.
+_HELD_UNRECOGNISED = "its drawer is filed under a name this adapter does not file under"
+
+#: Why an old-name chunk is held under ``mempalace``: its conversation file is in neither place it
+#: can be. Deleting a drawer because its file is missing would be deleting on no evidence.
+_HELD_MISSING = (
+    "its conversation file is in neither the palace's conversations directory nor the archive"
+)
+
+#: Why a new-name chunk is held: its exchange's record says it is not yet fully filed, so a piece of
+#: it can still arrive, and unanimity over the pieces filed so far is not unanimity over the exchange.
+_HELD_UNFILED = "its exchange is not yet fully filed, so not every piece of it can be counted"
+
+
+class PreviousReader:
+    """How a drawer's unit is read under ``mempalace-previous``: its conversation file, by path.
+
+    Exactly the reading this tool has always made (`_file_of`, issue #606), with one guard (issue
+    #1011): a source that is not an absolute path is no name the previous adapter or MemPalace's
+    miner ever wrote, so it has no unit, and its chunk is held. Removal is the unlink this tool has
+    always made, inside this palace's own ``conversations`` directory only.
+    """
+
+    def __init__(self, palace: Path) -> None:
+        self.palace = palace
+        self.conversations = palace / _CONVERSATIONS_WING
+
+    def unit(self, source: str | None) -> str | None:
+        if not source or not os.path.isabs(source):
+            return None
+        return _file_of(source, self.conversations)
+
+    def held(self, source: str | None) -> str:
+        return _HELD_NO_SOURCE if not source else _HELD_UNRECOGNISED
+
+    def remove(self, unit: str) -> bool:
+        """Unlink the conversation file ``unit`` names, if it lies inside this palace's own dir."""
+        return _unlink_inside(Path(unit), (self.conversations,))
+
+
+class NamedReader:
+    """How a drawer's unit is read under ``mempalace``: an exchange, or a found conversation file.
+
+    A new name (``basecradle:<timeline>:<item>:<piece>``) belongs to its exchange, keyed by its stem,
+    held while the exchange's record is unfiled. An old name (a path in a ``conversations``
+    directory) belongs to its conversation file where that file is now: this palace's
+    ``conversations`` directory, else ``archive``; found in neither, it has no unit and is held.
+    Anything else is held as unrecognised.
+    """
+
+    def __init__(self, palace: Path, records: RecordStore, archive: Path | None = None) -> None:
+        self.palace = palace
+        self.conversations = palace / _CONVERSATIONS_WING
+        self.records = records
+        self.archive = archive
+
+    def unit(self, source: str | None) -> str | None:
+        parsed = parse_name(source)
+        if parsed is not None:
+            if self.records.is_unfiled(parsed.timeline, parsed.id):
+                return None
+            return f"{NAME_SCHEME}:{parsed.timeline}:{parsed.id}"
+        located = self._located(source)
+        return None if located is None else str(located)
+
+    def held(self, source: str | None) -> str:
+        if not source:
+            return _HELD_NO_SOURCE
+        if parse_name(source) is not None:
+            return _HELD_UNFILED
+        if _old_name(source):
+            return _HELD_MISSING
+        return _HELD_UNRECOGNISED
+
+    def remove(self, unit: str) -> bool:
+        """Remove the exchange's record, or unlink the found conversation file."""
+        parsed = parse_name(f"{unit}:1")
+        if parsed is not None:
+            return self.records.remove(parsed.timeline, parsed.id)
+        roots = (self.conversations,) + ((self.archive,) if self.archive else ())
+        return _unlink_inside(Path(unit), roots)
+
+    def _located(self, source: str | None) -> Path | None:
+        if not _old_name(source):
+            return None
+        name = Path(source).name
+        for folder in (self.conversations, self.archive):
+            if folder is not None and _regular_file(folder / name):
+                return folder / name
+        return None
+
+
+def _old_name(source: str | None) -> bool:
+    """Whether ``source`` is a name the previous adapter wrote: a path in a conversations dir."""
+    return (
+        bool(source) and os.path.isabs(source) and Path(source).parent.name == _CONVERSATIONS_WING
+    )
+
+
+def _regular_file(path: Path) -> bool:
+    return not path.is_symlink() and path.is_file()
+
+
+def _unlink_inside(path: Path, roots: tuple[Path, ...]) -> bool:
+    """Unlink ``path`` when it resolves directly inside one of ``roots``; ``True`` if it went.
+
+    A resolved-path containment test, never a string prefix: the path came out of a metadata
+    field, and a scrub must not be able to delete something elsewhere on the box because a drawer's
+    provenance said so.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:  # pragma: no cover - a path that cannot even be resolved is not ours
+        return False
+    allowed = {root.resolve() for root in roots}
+    if resolved in allowed or not any(root in resolved.parents for root in allowed):
+        return False
+    try:
+        resolved.unlink()
+    except FileNotFoundError:
+        return False  # already gone: another pass, or an operator's own cleanup. Not a failure.
+    except OSError as error:
+        # Loud, and not fatal: the drawers still go, and a file the next mine re-files is a
+        # re-pollution the next scrub catches. Silence here would leave it invisible.
+        _log.warning("scrub %s", kv(op="unlink", path=str(path), error=str(error)))
+        return False
+    return True
+
 
 @dataclass
 class Finding:
@@ -128,6 +286,12 @@ class Report:
     #: unknown). Deleted by nothing, on any invocation.
     held: list[Finding] = field(default_factory=list)
     review: list[Finding] = field(default_factory=list)
+    #: How each drawer's unit was read (`PreviousReader` or `NamedReader`); `apply` reads the same.
+    reader: PreviousReader | NamedReader | None = None
+
+    def __post_init__(self) -> None:
+        if self.reader is None:
+            self.reader = PreviousReader(self.palace)
 
     @property
     def kept(self) -> int:
@@ -135,7 +299,7 @@ class Report:
         return self.total - len(self.scrub) - len(self.held) - len(self.review)
 
 
-def scan(collection, palace: Path) -> Report:
+def scan(collection, palace: Path, reader: PreviousReader | NamedReader | None = None) -> Report:
     """Classify every drawer in the palace, then decide per *file* what may go.
 
     Reads documents and metadata only — no embeddings, no query, no write. Two passes, and the
@@ -166,8 +330,8 @@ def scan(collection, palace: Path) -> Report:
     be a non-scaffolding "sibling" and would hold every relocated file forever. They are neither
     classified nor counted, and nothing here deletes them.
     """
-    report = Report(palace=palace)
-    root = palace / _CONVERSATIONS_WING
+    report = Report(palace=palace, reader=reader)
+    unit_of = report.reader.unit
     findings: list[Finding] = []
     #: ``source_file -> drawers mined from it`` and ``-> those that classified SCRUB``.
     mined: dict[str, int] = {}
@@ -187,7 +351,7 @@ def scan(collection, palace: Path) -> Report:
             if meta.get("room") == _REGISTRY_ROOM:
                 continue
             source = meta.get("source_file") or None
-            file = _file_of(source, root)
+            file = unit_of(source)
             if file:
                 mined[file] = mined.get(file, 0) + 1
             if not text:
@@ -211,9 +375,9 @@ def scan(collection, palace: Path) -> Report:
         if finding.verdict is Verdict.REVIEW:
             report.review.append(finding)
             continue
-        file = _file_of(finding.source_file, root)
+        file = unit_of(finding.source_file)
         if file is None:
-            report.held.append(replace(finding, held=_HELD_NO_SOURCE))
+            report.held.append(replace(finding, held=report.reader.held(finding.source_file)))
             continue
         others = mined.get(file, 0) - scaffolding.get(file, 0)
         if others:
@@ -237,9 +401,11 @@ def apply(collection, report: Report) -> tuple[int, int]:
     report, however it was built.
 
     A source file is removed only when it lies inside this palace's own ``conversations``
-    directory. The check is a resolved-path containment test, not a string prefix: the path came
-    out of a metadata field, and a scrub must not be able to delete something elsewhere on the
-    box because a drawer's provenance said so.
+    directory (or, under ``mempalace``, the archive directory). The check is a resolved-path
+    containment test, not a string prefix: the path came out of a metadata field, and a scrub must
+    not be able to delete something elsewhere on the box because a drawer's provenance said so
+    (`_unlink_inside`). A new-name exchange's unit is its record (`NamedReader.remove`), removed
+    first for the same reason a file is: the record is what a rebuild would file it again from.
 
     **Files first, drawers second, and the order is the crash behavior.** A scrub that dies
     part-way through leaves the palace in one of two states, and only one of them is safe: unlink
@@ -250,22 +416,20 @@ def apply(collection, report: Report) -> tuple[int, int]:
     it but the miner, which now skips it); a drawer left orphaned of its file costs a re-mine.
     """
     blocked = _blocked(report)
+    reader = report.reader
     removed = 0
-    for path in _convo_files(report, blocked):
-        try:
-            path.unlink()
+    units = dict.fromkeys(
+        unit
+        for unit in (reader.unit(finding.source_file) for finding in report.scrub)
+        if unit and unit not in blocked
+    )
+    for unit in units:
+        if reader.remove(unit):
             removed += 1
-        except FileNotFoundError:
-            pass  # already gone: another pass, or an operator's own cleanup. Not a failure.
-        except OSError as error:
-            # Loud, and not fatal: the drawers still go, and a file the next mine re-files is a
-            # re-pollution the next scrub catches. Silence here would leave it invisible.
-            _log.warning("scrub %s", kv(op="unlink", path=str(path), error=str(error)))
-    root = report.palace / _CONVERSATIONS_WING
     ids = [
         finding.drawer_id
         for finding in report.scrub
-        if _file_of(finding.source_file, root) not in blocked
+        if reader.unit(finding.source_file) not in blocked
     ]
     for start in range(0, len(ids), _DELETE_BATCH):
         collection.delete(ids=ids[start : start + _DELETE_BATCH])
@@ -289,33 +453,9 @@ def _blocked(report: Report) -> frozenset[str]:
     `scan`'s tally alone, which is why the tally is the primary enforcement and this is the
     second line.
     """
-    root = report.palace / _CONVERSATIONS_WING
-    files = (_file_of(finding.source_file, root) for finding in (*report.held, *report.review))
+    unit_of = report.reader.unit
+    files = (unit_of(finding.source_file) for finding in (*report.held, *report.review))
     return frozenset(file for file in files if file)
-
-
-def _convo_files(report: Report, blocked: frozenset[str]) -> list[Path]:
-    """The mining input files behind the scrubbed drawers, restricted to this palace's own dir.
-
-    Each is located by `_file_of`, so a drawer filed under the home the palace lived in before a
-    rename unlinks the file where it is now (issue #606). The containment test below is applied
-    to that located path, and it is the whole of what keeps the unlink inside this palace.
-    """
-    root = (report.palace / _CONVERSATIONS_WING).resolve()
-    files: dict[Path, None] = {}
-    for finding in report.scrub:
-        file = _file_of(finding.source_file, report.palace / _CONVERSATIONS_WING)
-        if not file or file in blocked:
-            continue
-        path = Path(file)
-        try:
-            resolved = path.resolve()
-        except OSError:  # pragma: no cover - a path that cannot even be resolved is not ours
-            continue
-        if resolved == root or root not in resolved.parents:
-            continue
-        files[resolved] = None
-    return list(files)
 
 
 def _file_of(source: str | None, conversations: Path) -> str | None:
@@ -460,6 +600,14 @@ def resolve_palace(explicit: str | None) -> Path:
     return _palace_path(home)
 
 
+def reader_for(palace: Path, archive: str | None = None) -> PreviousReader | NamedReader:
+    """The reader the agent's adapter calls for (issue #1011): `PreviousReader` under
+    ``mempalace-previous``, else `NamedReader` over this palace's records and the archive."""
+    if configured_mempalace_name() == _MEMPALACE_PREVIOUS:
+        return PreviousReader(palace)
+    return NamedReader(palace, RecordStore(records_dir(palace)), archive_dir(archive))
+
+
 def main(argv: list[str] | None = None) -> int:
     """The ``basecradle-harness-scrub-palace`` entrypoint. Exit 0 on success, 1 on a bad palace."""
     parser = argparse.ArgumentParser(
@@ -492,13 +640,22 @@ def main(argv: list[str] | None = None) -> int:
             "findings are never deleted. Run this with the agent's wakes held."
         ),
     )
+    parser.add_argument(
+        "--archive",
+        metavar="DIR",
+        help=(
+            "under HARNESS_MEMORY_PROVIDER=mempalace: the directory old conversation files were "
+            "moved to, searched after the palace's conversations directory. Defaults to "
+            "HARNESS_MEMPALACE_ARCHIVE. Ignored under mempalace-previous."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, handlers=[log_handler("%(message)s", sys.stderr)])
     try:
         palace = resolve_palace(args.palace)
         collection = open_palace(palace)
-        report = scan(collection, palace)
+        report = scan(collection, palace, reader_for(palace, args.archive))
         deleted = removed = 0
         if args.apply and report.scrub:
             deleted, removed = apply(collection, report)

@@ -198,7 +198,12 @@ def fake_mempalace(monkeypatch):
     records its args in ``calls`` (the observe never calls it; the palace check's forecast does).
     ``palace.mine_lock`` records each path it locks in ``convo_miner.locked``, and a writable
     collection answers ``get(where={"source_file": …})`` from ``filed`` and records its deletes in
-    ``convo_miner.deleted`` (a test makes either raise by setting ``convo_miner.refuse``). ``search_memories`` records the
+    ``convo_miner.deleted`` (a test makes either raise by setting ``convo_miner.refuse``). For the
+    adapter issue #1011 built it answers the way MemPalace 3.11's typed results do (attribute access,
+    with the dict style beside it): a ``where`` on that adapter's two keys, under ``$and``, from each
+    filed drawer's ``extra_metadata``, and a ``where_document`` ``$contains`` on the stored text in a
+    wing. ``palace.MineAlreadyRunning`` is the library's lock refusal, and
+    ``convo_miner.busy`` is how many filings raise it before one goes through. ``search_memories`` records the
     kwargs it was *passed* (not their defaults — the `max_distance` tests turn on that
     distinction) and returns whatever the test stashes on it.
 
@@ -214,6 +219,7 @@ def fake_mempalace(monkeypatch):
     convo_miner.locked = []
     convo_miner.deleted = []
     convo_miner.refuse = None
+    convo_miner.busy = 0
 
     def mine_convos(convo_dir, palace_path, **kwargs):
         convo_miner.calls.append((convo_dir, palace_path, kwargs))
@@ -221,6 +227,9 @@ def fake_mempalace(monkeypatch):
     def file_conversation_exchange(collection, **kwargs):
         unknown = set(kwargs) - _FILE_KWARGS
         assert not unknown, f"MemPalace's file_conversation_exchange takes no {sorted(unknown)}"
+        if convo_miner.busy:
+            convo_miner.busy -= 1
+            raise MineAlreadyRunning("palace is held by another process")
         if not (kwargs["text"] or "").strip():
             return None
         drawer = f"drawer_{len(convo_miner.filed) + 1}"
@@ -255,15 +264,46 @@ def fake_mempalace(monkeypatch):
                 raise searcher.metric
             return searcher.metric
 
+    class MineAlreadyRunning(RuntimeError):
+        """MemPalace's lock refusal (`mempalace.palace.MineAlreadyRunning`)."""
+
+    class Result:
+        """A typed result: attribute access, and the dict style MemPalace keeps beside it."""
+
+        def __init__(self, drawers):
+            self.ids = [d["id"] for d in drawers]
+            self.documents = [d["stored"] for d in drawers]
+            self.metadatas = [
+                {
+                    "source_file": d["source_file"],
+                    "wing": d["wing"],
+                    "room": d["room"],
+                    **(d.get("extra_metadata") or {}),
+                }
+                for d in drawers
+            ]
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    def _matches(drawer, where):
+        if "$and" in where:
+            return all(_matches(drawer, clause) for clause in where["$and"])
+        ((field, wanted),) = where.items()
+        meta = {**drawer, **(drawer.get("extra_metadata") or {})}
+        return meta.get(field) == wanted
+
     class WritableCollection:
         def __init__(self, palace_path):
             self.palace = palace_path
 
-        def get(self, *, where, include):
+        def get(self, *, where, include, where_document=None):
             if convo_miner.refuse is not None:
                 raise convo_miner.refuse
-            wanted = where["source_file"]
-            return {"ids": [d["id"] for d in convo_miner.filed if d["source_file"] == wanted]}
+            found = [d for d in convo_miner.filed if _matches(d, where)]
+            if where_document is not None:
+                found = [d for d in found if where_document["$contains"] in d["stored"]]
+            return Result(found)
 
         def delete(self, *, ids):
             if convo_miner.refuse is not None:
@@ -286,6 +326,7 @@ def fake_mempalace(monkeypatch):
 
     palace.get_collection = get_collection
     palace.mine_lock = mine_lock
+    palace.MineAlreadyRunning = MineAlreadyRunning
 
     normalize = types.ModuleType("mempalace.normalize")
     normalize.normalize_conversations = lambda path: [pathlib.Path(path).read_text("utf-8")]

@@ -1521,7 +1521,10 @@ def test_the_cli_and_the_adapter_are_one_mind_not_two(
 
     mined_palace = convo_miner.filed[0]["palace"]
     assert mined_palace == _cli_default_palace(home)
-    assert (Path(mined_palace) / "conversations").is_dir()  # the palace the exchange landed in
+    if mempalace_selector == "mempalace-previous":
+        assert (Path(mined_palace) / "conversations").is_dir()  # the palace the exchange landed in
+    else:  # the new adapter writes nothing inside the palace; its record sits beside it (#1011)
+        assert any((Path(f"{mined_palace}-records")).rglob("*.json"))
 
 
 # --- what it must not disturb -------------------------------------------------
