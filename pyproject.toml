@@ -36,11 +36,14 @@ dependencies = [
     # no-shell boundary: its wheels bundle FFmpeg, so frames are decoded **in-process** — no
     # `ffmpeg` subprocess, no apt package, nothing for `Policy.locked()` to have an opinion about.
     #
-    # The `av` floor is 18. It was 17 while this package supported Python 3.10, which `av` 18
-    # dropped; the Python floor moved to 3.11 (@origin, 2026-11-06, issue #816), and with it this
-    # one, as its own comment had said it would. `<19` keeps the next major from arriving
-    # unreviewed.
-    "av>=18,<19",
+    # The `av` major is 18. Its floor was 17 while this package supported Python 3.10, which
+    # `av` 18 dropped; the Python floor moved to 3.11 (@origin, 2026-11-06, issue #816), and with
+    # it this one, as its own comment had said it would. `<19` keeps the next major from arriving
+    # unreviewed. Within 18 the floor is 18.1.1 since issue #1015: PyPI yanked 18.1.0 for a
+    # double free when decoding audio with custom channel layouts, and `av` opens media a
+    # stranger chose. A floor, not only a lock: an installed 18.1.0 satisfies `>=18`, so a
+    # release with the old range would leave every deployed venv where it is.
+    "av>=18.1.1,<19",
     # Pillow encodes the sampled frames as JPEG (`VideoFrame.to_image()` hands back a PIL image).
     # Floor is the current major, major-capped in this repo's usual style. 13 is the floor, not
     # merely allowed: every fix for the advisories against 12.x is in 13.0.0 (issue #816), so a
