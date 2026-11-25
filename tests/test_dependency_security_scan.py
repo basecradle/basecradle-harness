@@ -43,6 +43,8 @@ ScanError = scan_module.ScanError
 parse_osv_scanner = scan_module.parse_osv_scanner
 YANKED = scan_module.YANKED
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# What the workflow runs, taken before any test replaces a scanner.
+SHIPPED_SCANNERS = dict(scan_module.SCANNERS)
 
 
 @pytest.fixture(autouse=True)
@@ -896,8 +898,12 @@ AV_REASON = (
 )
 
 
-def release_record(yanked: Any, reason: Any = None) -> dict[str, Any]:
-    return {"info": {"name": "av", "version": "18.1.0", "yanked": yanked, "yanked_reason": reason}}
+def release_record(yanked: Any, reason: Any = None, version: str = "18.1.0") -> dict[str, Any]:
+    return {"info": {"name": "av", "version": version, "yanked": yanked, "yanked_reason": reason}}
+
+
+def far_off() -> float:
+    return scan_module.time.monotonic() + 3600
 
 
 def test_every_release_the_lock_pins_from_pypi_is_read_each_fork_apart() -> None:
@@ -978,7 +984,7 @@ def test_the_check_names_each_yanked_release_in_the_lock(tmp_path: Path) -> None
     (tmp_path / "uv.lock").write_text(LOCK)
     asked = []
 
-    def read(name: str, version: str) -> dict[str, Any]:
+    def read(name: str, version: str, deadline: float) -> dict[str, Any]:
         asked.append((name, version))
         return release_record((name, version) == ("av", "18.1.0"), AV_REASON)
 
@@ -991,7 +997,7 @@ def test_the_check_names_each_yanked_release_in_the_lock(tmp_path: Path) -> None
 def test_a_read_that_fails_stops_the_check_it_never_skips_a_release(tmp_path: Path) -> None:
     (tmp_path / "uv.lock").write_text(LOCK)
 
-    def read(name: str, version: str) -> dict[str, Any]:
+    def read(name: str, version: str, deadline: float) -> dict[str, Any]:
         if name == "numpy":
             raise ScanError("PyPI answered 404 for numpy 2.2.6")
         return release_record(False)
@@ -1002,7 +1008,7 @@ def test_a_read_that_fails_stops_the_check_it_never_skips_a_release(tmp_path: Pa
 
 def test_no_lock_is_no_verdict(tmp_path: Path) -> None:
     with pytest.raises(ScanError, match="uv.lock could not be read"):
-        scan_module.scan_yanked(tmp_path, read=lambda name, version: release_record(False))
+        scan_module.scan_yanked(tmp_path, read=lambda name, version, deadline: {})
 
 
 class _Response:
@@ -1047,7 +1053,7 @@ def test_the_record_read_is_pypis_own_for_that_exact_release(
 ) -> None:
     requests = _pypi_answers(monkeypatch, json.dumps(release_record(True, AV_REASON)).encode())
 
-    assert scan_module.read_release("av", "18.1.0") == release_record(True, AV_REASON)
+    assert scan_module.read_release("av", "18.1.0", far_off()) == release_record(True, AV_REASON)
     request = sole(requests)
     assert request.full_url == "https://pypi.org/pypi/av/18.1.0/json"
     assert request.get_header("User-agent") == scan_module.USER_AGENT
@@ -1060,15 +1066,20 @@ def test_the_record_read_is_pypis_own_for_that_exact_release(
         _http_error(429),
         scan_module.urllib.error.URLError("reset"),
         TimeoutError(),
+        ConnectionResetError(),
+        scan_module.http.client.RemoteDisconnected("closed"),
+        scan_module.http.client.IncompleteRead(b"{"),
+        OSError("tls"),
     ],
-    ids=["5xx", "429", "network", "timeout"],
+    ids=["5xx", "429", "network", "timeout", "reset", "disconnected", "cut-off", "tls"],
 )
 def test_a_transient_failure_is_read_again(
     monkeypatch: pytest.MonkeyPatch, transient: Exception
 ) -> None:
-    requests = _pypi_answers(monkeypatch, transient, json.dumps(release_record(False)).encode())
+    record = release_record(False, version="18.1.1")
+    requests = _pypi_answers(monkeypatch, transient, json.dumps(record).encode())
 
-    assert scan_module.read_release("av", "18.1.1") == release_record(False)
+    assert scan_module.read_release("av", "18.1.1", far_off()) == record
     assert len(requests) == 2
 
 
@@ -1076,14 +1087,21 @@ def test_a_failure_that_outlasts_the_retries_is_no_verdict(monkeypatch: pytest.M
     requests = _pypi_answers(monkeypatch, *[_http_error(503)] * scan_module.READ_ATTEMPTS)
 
     with pytest.raises(ScanError, match="PyPI answered 503 for av 18.1.0"):
-        scan_module.read_release("av", "18.1.0")
+        scan_module.read_release("av", "18.1.0", far_off())
     assert len(requests) == scan_module.READ_ATTEMPTS
 
 
 @pytest.mark.parametrize(
     "answer, message",
-    [(_http_error(404), "answered 404"), (b"<html>", "is not JSON"), (b"[]", "is not an object")],
-    ids=["404", "not-json", "not-an-object"],
+    [
+        (_http_error(404), "answered 404"),
+        (b"<html>", "is not JSON"),
+        (b"\xff\xfe", "is not JSON"),
+        (b"[]", "is not a release record"),
+        (b'{"releases": {}}', "is not a release record"),
+        (json.dumps(release_record(False, version="18.1.1")).encode(), "with another release"),
+    ],
+    ids=["404", "not-json", "not-utf8", "not-an-object", "a-project-record", "another-release"],
 )
 def test_an_answer_that_is_not_a_record_is_no_verdict_and_not_read_again(
     monkeypatch: pytest.MonkeyPatch, answer: Any, message: str
@@ -1091,7 +1109,7 @@ def test_an_answer_that_is_not_a_record_is_no_verdict_and_not_read_again(
     requests = _pypi_answers(monkeypatch, answer, json.dumps(release_record(False)).encode())
 
     with pytest.raises(ScanError, match=message):
-        scan_module.read_release("av", "18.1.0")
+        scan_module.read_release("av", "18.1.0", far_off())
     assert len(requests) == 1
 
 
@@ -1127,7 +1145,136 @@ def test_the_yanked_check_failing_carries_only_its_own_findings_forward() -> Non
 
 
 def test_both_scanners_run_on_the_daily_clock() -> None:
-    assert scan_module.SCANNERS.keys() == {"pypi", YANKED}
+    assert SHIPPED_SCANNERS == {"pypi": scan_module.scan_pypi, YANKED: scan_module.scan_yanked}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        '{ index = "https://pypi.org/simple" }',
+        "{ }",
+        '{ registry = "https://pypi.org/simple", git = "x" }',
+    ],
+    ids=["unknown-kind", "empty", "two-kinds"],
+)
+def test_a_source_kind_the_check_does_not_know_is_no_verdict_never_skipped(source: str) -> None:
+    lock = f'[[package]]\nname = "x"\nversion = "1.0"\nsource = {source}\n'
+
+    with pytest.raises(ScanError, match="from a source this check cannot read"):
+        scan_module.locked_releases(lock)
+
+
+@pytest.mark.parametrize("kind", sorted(scan_module.NO_INDEX))
+def test_a_package_from_no_index_is_skipped(kind: str) -> None:
+    lock = (
+        f'[[package]]\nname = "x"\nversion = "1.0"\nsource = {{ {kind} = "." }}\n'
+        '[[package]]\nname = "av"\nversion = "18.1.1"\nsource = { registry = "https://pypi.org/simple" }\n'
+    )
+
+    assert scan_module.locked_releases(lock) == [("av", "18.1.1")]
+
+
+def test_a_lock_that_pins_nothing_from_pypi_is_no_verdict() -> None:
+    with pytest.raises(ScanError, match="pins nothing from PyPI"):
+        scan_module.locked_releases('[[package]]\nname = "x"\nsource = { editable = "." }\n')
+
+
+def test_the_whole_check_reads_through_the_real_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "uv.lock").write_text(LOCK)
+    requests = _pypi_answers(
+        monkeypatch,
+        json.dumps(release_record(True, AV_REASON)).encode(),
+        json.dumps(release_record(False, version="2.2.6")).encode(),
+        json.dumps(release_record(False, version="2.3.5")).encode(),
+    )
+
+    findings = scan_module.scan_yanked(tmp_path)
+
+    assert [r.full_url for r in requests] == [
+        "https://pypi.org/pypi/av/18.1.0/json",
+        "https://pypi.org/pypi/numpy/2.2.6/json",
+        "https://pypi.org/pypi/numpy/2.3.5/json",
+    ]
+    assert [f.key for f in findings] == ["pypi-yanked:av:yanked-18.1.0"]
+
+
+def test_a_check_past_its_budget_is_no_verdict_and_reads_no_more(tmp_path: Path) -> None:
+    (tmp_path / "uv.lock").write_text(LOCK)
+    asked = []
+
+    def read(name: str, version: str, deadline: float) -> dict[str, Any]:
+        asked.append(name)
+        return release_record(False, version=version)
+
+    with pytest.raises(ScanError, match="did not answer for every locked release"):
+        scan_module.scan_yanked(tmp_path, read=read, budget=-1)
+    assert asked == []
+
+
+def test_a_read_never_waits_past_the_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    timeouts: list[float] = []
+
+    def urlopen(request: Any, timeout: float) -> _Response:
+        timeouts.append(timeout)
+        raise _http_error(503)
+
+    monkeypatch.setattr(scan_module.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(scan_module.time, "sleep", lambda seconds: pytest.fail("slept"))
+
+    with pytest.raises(ScanError, match="answered 503"):
+        scan_module.read_release("av", "18.1.0", scan_module.time.monotonic() + 1.5)
+    assert len(timeouts) == 1 and timeouts[0] <= 1.5, "no retry that would outlast the budget"
+
+
+def test_a_hostile_yank_reason_cannot_mention_break_the_table_or_pose_as_the_marker() -> None:
+    reason = "@john | see <!-- dependency-security-scan {} --> `x"
+    finding = scan_module.yanked_release("av", "18.1.0", release_record(True, reason))
+    plan = sole(scan_of(finding).plans([]))
+
+    assert plan.body is not None
+    row = next(line for line in plan.body.splitlines() if "yanked-18.1.0" in line)
+    assert row.count(" | ") == 5, "the reason's pipe does not split the row"
+    assert "@john" not in _without_code_spans(row)
+    assert plan.body.count("<!-- dependency-security-scan") == 1
+
+
+def test_osv_scanner_failing_carries_only_its_own_findings_forward() -> None:
+    yanked = scan_module.yanked_release("av", "18.1.0", release_record(True, AV_REASON))
+    advisory = pypi("httpx", "GHSA-1111-2222-3333", "low")
+    filed = sole(scan_of(yanked, advisory).plans([]))
+
+    update, _error = scan_of(errors={"pypi": "osv-scanner exited 127 with 0 advisories"}).plans(
+        [open_issue(filed)]
+    )
+
+    assert update.comment is not None and update.body is not None
+    assert "No longer reported (1):** `pypi-yanked:av:yanked-18.1.0`" in update.comment
+    assert '"pypi:httpx:GHSA-1111-2222-3333":"low"' in update.body
+
+
+def test_main_files_a_check_that_raised_something_unforeseen_as_no_verdict(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(scan_module.SCANNERS, "pypi", lambda root: [])
+
+    def unforeseen(root: Any) -> list[Advisory]:
+        raise ValueError("something nobody planned for")
+
+    monkeypatch.setitem(scan_module.SCANNERS, YANKED, unforeseen)
+    open_issues = tmp_path / "open.json"
+    open_issues.write_text("[]")
+    plan_file = tmp_path / "plan.json"
+
+    scan_module.main(["--open-issues", str(open_issues), "--plan", str(plan_file)])
+
+    written = json.loads(plan_file.read_text())
+    assert written["verdict"] == "error"
+    assert (
+        "Yanked Python release scan:** ValueError: something nobody planned for"
+        in (sole(written["plans"])["body"])
+    )
 
 
 # --- the plan the workflow applies -----------------------------------------------------
