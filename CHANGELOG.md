@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.215.0] - 2026-11-25
+
+### Changed: the `mempalace` adapter holds a reply cut off at its output budget until its resume finishes it (issue #1011)
+
+Decided by the capital on 2026-11-25, reviewed by `@briggs`, whose memory this is. A turn the vendor cut off mid-answer is resumed (issue #490), and under 0.213.0 the `mempalace` adapter filed the fragment at once, so when the resume landed, "already filed?" found the fragment under the same name and skipped the whole reply. No agent runs `mempalace` yet; `mempalace-previous` is unchanged and still files both, as it always has.
+
+- **A cut-off exchange is recorded as incomplete and not filed.** Its record says `cut_off` and keeps its unfiled marker, so the scrub and the prune hold it.
+- **The resume completes that same record and files it once, clean.** The continuation is added after the fragment's words (a line break between them), under the same name, with no marker. The fragment is never a piece of its own. A resume cut off again stays held with every word both attempts wrote.
+- **The hold covers the resume window, read off the wake's claims.** The harness does not finish a resume before another wake can run catch-up (catch-up runs at the start of every wake, on every timeline, and a resume can wait on an outage or an exhausted account), so the record carries the item's kind and each wake's catch-up asks the wake (`MemoryProvider.resumable`, answered by `WakeAgent._resume_window`): the turn can still be resumed exactly while the claim on its item is in flight. Held while it is, while there is no wake to ask, and while asking fails.
+- **With no resume, catch-up files the fragment once, verbatim, with one line after it**, where recall shows it: `Cut off. No resume arrived.` Only on that path: once the turn stalled, the wake was stopped, the item was dropped, or its timeline was deleted. A degraded resume, one that wrote none of the model's words, does not complete the record.
+- **The adapter never deletes and never replaces.** A cut-off task reply is judged by the near-copy door rule once it is whole; a near-copy is then set aside (`skipped` on its record, its marker dropped) rather than removed.
+- **The wake tells memory how each exchange's turn ended**: `MemoryExchange` gains `kind`, `cut_off` and `resumed`, and the record gains `kind`, `cut_off` and `skipped` (format 1; a record without them reads as before). The `memory` lines gain `result=held reason=cut_off`, `reason=no_resume` on a filed line, and `held=` and `near_copy=` counts on `op=refile` ([`docs/telemetry.md`](docs/telemetry.md#memory)).
+
 ## [0.214.0] - 2026-11-25
 
 ### Fixed: `av` 18.1.1, because PyPI yanked 18.1.0 for a double free (issue #1015)

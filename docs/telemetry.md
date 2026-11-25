@@ -840,22 +840,24 @@ What the request the model is about to read is made of, in characters, summing e
 
 One line per memory-system operation other than a retrieval's report, which is `memory recall` (`_wake`, `_mempalace`, `_mempalace_provider`). The wake writes its own `op=recall` and `op=observe` guard lines here when the provider's hook fails, and an INFO `op=observe result=skipped reason=marked` line for a marked real wake it did not hand to memory (issue #950).
 
-The MemPalace adapter selected by `mempalace` (issue #1011) writes **one `op=observe` line for every exchange its door decides on**: filed (INFO, no `result`), not filed because it was already filed or was a near-copy of a recurring task's last filed reply (INFO, `result=skipped`), left unfiled because the palace stayed locked past the retry (INFO, `result=busy`; the next wake files it), or not filed because of any other error, which is never retried (WARNING, `result=failed` with the error's class). At the start of a wake that found records left unfiled, one `op=refile` line counts what happened to them.
+The MemPalace adapter selected by `mempalace` (issue #1011) writes **one `op=observe` line for every exchange its door decides on**: filed (INFO, no `result`), not filed because it was already filed or was a near-copy of a recurring task's last filed reply (INFO, `result=skipped`), left unfiled because the palace stayed locked past the retry (INFO, `result=busy`; the next wake files it), or not filed because of any other error, which is never retried (WARNING, `result=failed` with the error's class). A reply cut off at its output budget is **held** (INFO, `result=held reason=cut_off`): recorded, not filed, until the resume that finishes the turn completes it, which files it once, whole (an ordinary filed line); a second exchange of the turn that is not a resume (the peer's half a stall hands memory) writes the same held line and adds nothing. A held reply nothing can resume any more is filed at a wake's start with its marker line (`reason=no_resume` on the filed line). At the start of a wake that found records left unfiled, one `op=refile` line counts what happened to them.
 
 ```text
 INFO memory op=observe provider=mempalace timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2 pieces=1 attempts=1
 INFO memory op=observe provider=mempalace result=skipped reason=near_copy timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2
 INFO memory op=observe provider=mempalace result=busy timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2 pieces=2 attempts=6
-INFO memory op=refile provider=mempalace records=2 filed=2 skipped=0 busy=0 failed=0 unreadable=0 left=0
+INFO memory op=observe provider=mempalace result=held reason=cut_off timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2
+INFO memory op=observe provider=mempalace reason=no_resume timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2 pieces=1 attempts=1
+INFO memory op=refile provider=mempalace records=2 filed=2 skipped=0 busy=0 failed=0 unreadable=0 left=0 held=0 near_copy=0
 ```
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
 | `op` | The operation: `recall`, `observe`, `search`, `palace-binding`, `refile` (the records a wake found unfiled, filed at its start). | The caller. | Never. |
-| `result` | How it ended, where it did not simply succeed: `failed`, `skipped`, `unfile_failed`, `busy` (the palace stayed locked past the retry; the record is left unfiled for the next wake). | The caller. | The operation succeeded. |
+| `result` | How it ended, where it did not simply succeed: `failed`, `skipped`, `unfile_failed`, `busy` (the palace stayed locked past the retry; the record is left unfiled for the next wake), `held` (a reply cut off at its output budget, recorded and not filed while a resume can still finish it, issue #1011). | The caller. | The operation succeeded. |
 | `provider` | Common: the memory software. | The caller. | The wake's own guard line, which does not know it; `op=palace-binding`. |
 | `surface` | As on `llm`. | `_mempalace`. | Not a search. |
-| `reason` | Why, as a slug: `marked` (a wake the NOC marked with a verified `BCNOC2`, not handed to memory); `redaction_failed` (an exchange the redaction could not run on, so not handed to memory: an exchange is never filed unredacted, issue #999); `already_filed` (a drawer of this exchange is in the palace already, filed under its name or by the previous adapter, issue #1011); `near_copy` (a recurring task's reply that is a near-copy of the last one filed for that task, issue #1011); the MemPalace adapters' own slugs. | `_mempalace`, `_mempalace_provider`; the wake, for `marked` and `redaction_failed`. | Nothing to explain. |
+| `reason` | Why, as a slug: `marked` (a wake the NOC marked with a verified `BCNOC2`, not handed to memory); `redaction_failed` (an exchange the redaction could not run on, so not handed to memory: an exchange is never filed unredacted, issue #999); `already_filed` (a drawer of this exchange is in the palace already, filed under its name or by the previous adapter, issue #1011); `near_copy` (a recurring task's reply that is a near-copy of the last one filed for that task, issue #1011); `cut_off` (on `result=held`: the reply stopped at its output budget); `no_resume` (on a filed line: a held reply filed with its marker line, because nothing can resume its turn any more); the MemPalace adapters' own slugs. | `_mempalace`, `_mempalace_provider`; the wake, for `marked` and `redaction_failed`. | Nothing to explain. |
 | `keys` | The field names of an error envelope upstream returned. | `_mempalace`. | Not that failure. |
 | `type` | The type of an answer that was not a mapping. | `_mempalace`. | Not that failure. |
 | `palace` | The palace path bound. | `_mempalace`. | Not a binding. |
@@ -872,6 +874,8 @@ INFO memory op=refile provider=mempalace records=2 filed=2 skipped=0 busy=0 fail
 | `failed` | Of those, not filed for any other error. | `_mempalace_provider`, on `op=refile`. | Any other op. |
 | `unreadable` | Of those, whose record could not be read: its marker is kept. | `_mempalace_provider`, on `op=refile`. | Any other op. |
 | `left` | Of those, not tried this wake, because the palace was busy. | `_mempalace_provider`, on `op=refile`. | Any other op. |
+| `held` | Of those, replies cut off at their output budget whose turn can still be resumed: kept unfiled. | `_mempalace_provider`, on `op=refile`. | Any other op. |
+| `near_copy` | Of those, held task replies nothing can resume any more that the door rule set aside as near-copies of the task's last filed reply: never filed. | `_mempalace_provider`, on `op=refile`. | Any other op. |
 
 ### `secrets redacted`
 

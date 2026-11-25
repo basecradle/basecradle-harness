@@ -932,6 +932,76 @@ def test_a_truncated_turn_is_mined_like_any_other(platform, tmp_path):
     assert memory.observed[0].assistant == "The barn owl is a sp"  # the fragment, honestly
 
 
+def test_the_exchanges_of_a_cut_off_turn_say_how_it_ended(platform, tmp_path):
+    """Issue #1011, the capital's decision of 2026-11-25: memory is told which exchange is a
+    fragment and which is the resume that continues it, so a provider can hold the fragment until
+    the resume completes it. Both are named by the item, with the item's kind."""
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    memory = _RecordingMemory()
+    brain = _CutOff(
+        Message.assistant(content="The barn owl is a sp"),
+        Message.assistant(content="ecies of owl."),
+        reasons=("length", "stop"),
+    )
+    agent, _ = build_wake(tmp_path, brain, memory_provider=memory)
+
+    agent.wake()
+
+    cut, resumed = memory.observed
+    assert (cut.item, cut.kind, cut.cut_off, cut.resumed) == (M0, "messages", True, False)
+    assert (resumed.item, resumed.kind, resumed.cut_off, resumed.resumed) == (
+        M0,
+        "messages",
+        False,
+        True,
+    )
+    assert resumed.assistant == "ecies of owl."  # the continuation only: the provider joins them
+
+
+def test_a_resume_cut_off_again_says_so_and_a_degraded_one_continues_nothing(platform, tmp_path):
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    memory = _RecordingMemory()
+    build_wake(tmp_path, _CutOffThenDown(), memory_provider=memory)[0].wake()
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    brain = _CutOff(Message.assistant(content="ecies"), reasons=("length",))
+    build_wake(tmp_path, brain, memory_provider=memory, tools=[MessagesTool()])[0].wake()
+
+    assert memory.observed[0].cut_off and not memory.observed[0].resumed
+    assert all(e.resumed and e.cut_off for e in memory.observed[1:])
+
+    class _Stuck:
+        def __init__(self):
+            self._degraded = True
+            self.timeline_uuid = TIMELINE_UUID
+            self.me_uuid = "019e7750-66ee-79c8-ad8a-bbb6ea7c2bcc"
+            self.memory_provider = _RecordingMemory()
+
+    stuck = _Stuck()
+    _wake_module.WakeAgent._observe(stuck, "a question", "stuck", item=M0, resumed=True)
+    (exchange,) = stuck.memory_provider.observed
+    assert not exchange.resumed  # a resume that wrote none of the model's words continued nothing
+
+
+def test_the_resume_window_is_open_exactly_while_the_claim_is_in_flight(platform, tmp_path):
+    """What a provider holding a cut-off reply asks at catch-up: the claims answer (issue #1011)."""
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    memory = _RecordingMemory()
+    first, _ = build_wake(tmp_path, _CutOffThenDown(), memory_provider=memory)
+    first.wake()
+
+    assert memory.resumable == first._resume_window  # bound before the wake's catch-up
+    assert first._resume_window(TIMELINE_UUID, M0, "messages") is True
+    assert first._resume_window(TIMELINE_UUID, M1, "messages") is False  # never claimed
+
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    second, _ = build_wake(tmp_path, _Finishes(), memory_provider=memory)
+    second.wake()
+
+    assert second._resume_window(TIMELINE_UUID, M0, "messages") is False  # committed
+    ClaimStore(tmp_path).abandon(TIMELINE_UUID, M0, kind="messages", reason="stalled")
+    assert second._resume_window(TIMELINE_UUID, M0, "messages") is False
+
+
 def test_the_guarantee_covers_every_kind_not_just_messages(platform, tmp_path):
     """`_act_on`'s three kinds run the same machinery, so they get the same verdict (issue #289).
 
