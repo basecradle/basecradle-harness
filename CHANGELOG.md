@@ -7,6 +7,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.214.0] - 2026-11-25
+
+### Fixed: `av` 18.1.1, because PyPI yanked 18.1.0 for a double free (issue #1015)
+
+PyPI yanked `av` 18.1.0 with the reason *"Memory corruption (double free) when decoding audio with custom channel layouts. Upgrade to 18.1.1"*, and `uv.lock` still locked it. `av` opens media a timeline participant supplied (`_video.py`, the assets tool's `watch`), and a release PyPI withdrew for memory corruption should not be reading files a stranger chose. The yanked bug's own path is decoding audio; the harness decodes only video frames and copies audio packets without decoding them, so it is not known to have reached that path. The release is moved off regardless.
+
+- **The floor is now `av>=18.1.1,<19`**, and `uv.lock` locks 18.1.1; no other package moved. A floor and not only a lock, because an installed 18.1.0 satisfies `>=18`: a release with the old range would have left every deployed venv on the yanked release.
+
 ## [0.213.0] - 2026-11-23
 
 ### Added: a new MemPalace adapter that files under a BaseCradle name, keeps its own record, and stamps nothing (issue #1011)

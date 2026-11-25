@@ -662,7 +662,9 @@ issue #484 — one noun, three senses. What follows is unchanged by that move ex
   `pillow` was `>=12,<13` rather than the issue's `>=11,<12`, which would have pinned the fleet to a
   superseded major. **Since issue #816** the Python floor is 3.11, the matrix is 3.11–3.14, and
   the ranges are `av>=18,<19` and `pillow>=13,<14` (13.0.0 carries every fix for the advisories
-  against 12.x).
+  against 12.x). **Since issue #1015** the `av` floor is 18.1.1: PyPI yanked 18.1.0 for a double
+  free when decoding audio with custom channel layouts, and a floor, unlike a lock, moves a
+  deployed venv that already holds 18.1.0.
 - **The cap bends the interval, never the window.** Targets are the first frame of the window, then
   one every `every` seconds, then the last — because "does frame 0 match the source still?" and
   "does it end the way I asked?" are the two questions watching a generated clip is *for*. Over
