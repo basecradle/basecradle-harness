@@ -23,7 +23,9 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
+import respx
 
 pytestmark = pytest.mark.mempalace
 
@@ -32,8 +34,12 @@ mempalace = pytest.importorskip("mempalace")
 from mempalace import convo_miner  # noqa: E402
 from mempalace import palace as mp  # noqa: E402
 
-from basecradle_harness import _prune, _scrub  # noqa: E402
-from basecradle_harness._exchange_records import RecordStore, records_dir  # noqa: E402
+from basecradle_harness import Message, MessagesTool, _prune, _scrub  # noqa: E402  # noqa: E402
+from basecradle_harness._exchange_records import (  # noqa: E402
+    CUT_OFF_MARKER,
+    RecordStore,
+    records_dir,
+)
 from basecradle_harness._memory_provider import MemoryExchange, MemoryScope  # noqa: E402
 from basecradle_harness._mempalace import _REGISTRY_ROOM, MemPalaceMemoryProvider  # noqa: E402
 from basecradle_harness._mempalace_provider import (  # noqa: E402
@@ -45,6 +51,22 @@ from basecradle_harness._mempalace_provider import (  # noqa: E402
 from basecradle_harness._mining import _LEGACY_RECALL_HEADING  # noqa: E402
 from basecradle_harness._wake import WakeAgent  # noqa: E402
 from tests.test_prune import START, hourly  # noqa: E402
+from tests.test_truncation import BODY, _CutOff, _CutOffThenDown, _Finishes  # noqa: E402
+from tests.test_wake import (  # noqa: E402  # noqa: E402
+    BC_URL,
+    REPLY,
+    asset_page,
+    build_wake,
+    dashboard,
+    event_page,
+    message,
+    page,
+    serve_messages,
+    task_page,
+)
+from tests.test_wake import M0 as W0  # noqa: E402
+from tests.test_wake import TIMELINE_UUID as WAKE_TIMELINE  # noqa: E402
+from tests.test_wake import timeline as timeline_json  # noqa: E402
 
 AGENT = "019a3b2c-4d5e-7f60-8a1b-000000000001"
 TIMELINE = "019a3b2c-4d5e-7f60-8a1b-2c3d4e5f6a7b"
@@ -335,3 +357,107 @@ def test_the_rollback_keeps_every_memory_and_the_previous_scrub_and_prune_delete
              item=ITEMS[30])  # fmt: skip
     assert _names(palace).count(f"basecradle:{TIMELINE}:{ITEMS[30]}:1") == 1
     assert len(_rows(palace)) == len(before) + 1
+
+
+# --- a reply cut off at its output budget (the capital's decision of 2026-11-25) ---------------------
+#
+# Each proof runs real wakes (`tests.test_wake.build_wake`, the platform mocked at the transport) over
+# a real palace, so the claims that answer "can this turn still be resumed?" are the wake's own.
+
+
+@pytest.fixture
+def platform():
+    """The respx-mocked platform: its own copy, for the reason `tests/test_truncation.py` keeps one."""
+    with respx.mock(base_url=BC_URL, assert_all_called=False) as router:
+        router.get("/users/dashboard").mock(return_value=httpx.Response(200, json=dashboard()))
+        router.get(f"/timelines/{WAKE_TIMELINE}").mock(
+            return_value=httpx.Response(200, json=timeline_json())
+        )
+        router.post(f"/timelines/{WAKE_TIMELINE}/messages").mock(
+            return_value=httpx.Response(
+                201, json={"message": message(uuid=REPLY, body="reply", mine=True)}
+            )
+        )
+        router.get("/assets").mock(return_value=httpx.Response(200, json=asset_page()))
+        router.get("/webhook_events").mock(return_value=httpx.Response(200, json=event_page()))
+        router.get("/tasks").mock(return_value=httpx.Response(200, json=task_page()))
+        yield router
+
+
+FRAGMENT = "The barn owl is a sp"
+REST = "ecies of owl; it hunts by sound alone. That is the whole of it."
+
+
+class _Down:
+    """A brain that cannot be reached at all, so a resume attempted now fails and waits."""
+
+    provider, model = "openai", "gpt-4o"
+    last_finish_reason = None
+
+    def chat(self, messages, tools=None):
+        raise RuntimeError("the provider is unreachable")
+
+
+def _wake_palace(tmp_path: Path) -> Path:
+    return tmp_path / "palace"
+
+
+def _wake(tmp_path, brain, **kwargs):
+    provider = _new(_wake_palace(tmp_path))
+    agent, _ = build_wake(tmp_path / "home", brain, memory_provider=provider, **kwargs)
+    _quiet(agent.wake)
+    return provider
+
+
+def _exchange_rows(palace: Path) -> list[tuple[str, str, dict]]:
+    return [row for row in _rows(palace) if W0 in row[2].get("source_file", "")]
+
+
+def test_a_cut_off_then_a_wake_between_then_the_resume_files_once_whole(platform, tmp_path):
+    """Cut off; a wake between files nothing for the exchange; the resume files it once, whole.
+
+    Recall then returns the whole reply, and no drawer anywhere holds the fragment alone.
+    """
+    palace = _wake_palace(tmp_path)
+    serve_messages(platform, page(message(uuid=W0, body=BODY)))
+    _wake(tmp_path, _CutOffThenDown(Message.assistant(content=FRAGMENT)))
+    assert not palace.exists() or _exchange_rows(palace) == []  # held, not filed
+
+    serve_messages(platform, page(message(uuid=W0, body=BODY)))
+    between = _wake(tmp_path, _Down())  # its catch-up holds; its resume fails and waits
+    assert not palace.exists() or _exchange_rows(palace) == []
+    assert between.records.read(WAKE_TIMELINE, W0).cut_off
+
+    serve_messages(platform, page(message(uuid=W0, body=BODY)))
+    _wake(tmp_path, _Finishes(REST))
+    _wake(tmp_path, _Finishes(REST))  # and a later wake adds nothing
+
+    rows = _exchange_rows(palace)
+    assert [meta["source_file"] for _, _, meta in rows] == [f"basecradle:{WAKE_TIMELINE}:{W0}:1"]
+    (_, text, _) = rows[0]
+    assert f"{FRAGMENT}\n{REST}" in text and CUT_OFF_MARKER not in text
+    hits = _new(palace).search("barn owl hunts by sound", 10)
+    whole = [hit["text"] for hit in hits if FRAGMENT in hit["text"]]
+    assert whole and all(REST in found for found in whole)  # never the fragment alone
+
+
+def test_a_cut_off_that_no_resume_finishes_is_filed_once_with_the_marker(platform, tmp_path):
+    """The turn keeps being cut off and stalls inside its wake, so nothing can resume it: the next
+    wake's catch-up files the record as it stands, every word verbatim, with the marker line."""
+    palace = _wake_palace(tmp_path)
+    serve_messages(platform, page(message(uuid=W0, body=BODY)))
+    stalled = _wake(tmp_path, _CutOff(Message.assistant(content=FRAGMENT)), tools=[MessagesTool()])
+    assert stalled.records.read(WAKE_TIMELINE, W0).cut_off
+    assert not palace.exists() or _exchange_rows(palace) == []  # the stalling wake filed nothing
+
+    serve_messages(platform, page())
+    _wake(tmp_path, _Finishes())
+    _wake(tmp_path, _Finishes())
+
+    rows = _exchange_rows(palace)
+    assert [meta["source_file"] for _, _, meta in rows] == [f"basecradle:{WAKE_TIMELINE}:{W0}:1"]
+    (_, text, _) = rows[0]
+    assert text.rstrip().endswith(f"{FRAGMENT}\n{CUT_OFF_MARKER}")
+    assert text.count(CUT_OFF_MARKER) == 1
+    hits = _new(palace).search("barn owl", 10)
+    assert any(CUT_OFF_MARKER in hit["text"] for hit in hits)  # where recall shows it

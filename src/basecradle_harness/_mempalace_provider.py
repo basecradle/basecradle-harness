@@ -32,6 +32,19 @@ memory goes through):
    and carries the timeline and the item as two metadata keys of ours (`TIMELINE_KEY`,
    `ITEM_KEY`). Nothing else is written onto a drawer, and no field the library owns is set.
 
+**A reply cut off at its output budget is held at the door** (the capital's decision of 2026-11-25 on
+issue #1011, reviewed by ``@briggs``). Its record is written, marked ``cut_off``, and not filed. The
+resume that finishes the turn completes the same record (the continuation added after the words so
+far) and files it once, whole, with no marker. While the record is held, nothing else files it:
+"already filed?" would otherwise find the fragment and skip the whole reply. A wake's catch-up
+(`begin_wake`) asks the wake whether the turn can still be resumed (`MemoryProvider.resumable`, read
+off the claim on the item); once it cannot (the item stalled, was stopped, dropped, or its timeline
+was deleted), the record is filed as it stands, with the one line
+`_exchange_records.CUT_OFF_MARKER` after its words. The harness does not finish every resume before
+another wake can run catch-up (catch-up runs first in every wake, on every timeline, and a resume
+can wait on an outage or a funded account), so the record carries the item's ``kind``, which is what
+the question needs.
+
 **The retry, fitted to one process per event** (`_file`). Only the library's own lock refusal
 (``mempalace.palace.MineAlreadyRunning``, raised when another process holds the palace's write lock)
 is retried, after 1, 2, 4, 8 and 16 seconds. Still busy, the record is left marked unfiled and the
@@ -82,12 +95,14 @@ import logging
 import time
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from basecradle_harness._exchange_records import (
     NO_TIMELINE,
     Record,
     RecordStore,
+    continued,
     exchange_text,
     new_record,
     parse_name,
@@ -120,6 +135,7 @@ from basecradle_harness._mempalace import (
 )
 from basecradle_harness._near_copy import near_copy
 from basecradle_harness._observability import kv, tool_failed
+from basecradle_harness._redaction import scrub
 from basecradle_harness._rerank import SURFACE_TOOL, SURFACE_TURN0, MemPalaceReranker
 from basecradle_harness._tools import Tool
 
@@ -144,6 +160,9 @@ _BUSY = "busy"
 _FAILED = "failed"
 _ALREADY = "already_filed"
 _NEAR_COPY = "near_copy"
+_HELD = "held"  # a reply cut off at its output budget, held unfiled while a resume can still come
+_CUT_OFF = "cut_off"
+_NO_RESUME = "no_resume"  # a held reply filed with its marker: nothing can resume it any more
 
 
 class MemPalaceProvider(MemPalaceMemoryProvider):
@@ -185,6 +204,11 @@ class MemPalaceProvider(MemPalaceMemoryProvider):
         The wake has already redacted the exchange (issue #999); an empty one (no user text *and* no
         reply) is skipped. A seeded exchange's names are recorded before it is filed (issue #746), so
         this wake's Turn-0 recall leaves its drawers out however far the filing got.
+
+        **A reply cut off at its output budget is held at the door** (the capital's decision of
+        2026-11-25): recorded, ``cut_off``, and not filed. A resume of the same turn completes that
+        record and files it once (`_continue`); anything else that reaches a held record adds
+        nothing to it. Never a fragment filed beside its whole, and nothing filed is ever replaced.
         """
         if not (exchange.user.strip() or exchange.assistant.strip()):
             return
@@ -196,8 +220,16 @@ class MemPalaceProvider(MemPalaceMemoryProvider):
             assistant=exchange.assistant,
             seeded=exchange.seeded,
             task_instructions=exchange.task_instructions,
+            kind=exchange.kind,
+            cut_off=exchange.cut_off,
         )
-        if record.task_instructions is not None and self._near_copy(record):
+        held = self._held(record)
+        if held is not None:
+            self._continue(held, exchange)
+            return
+        if not record.cut_off and record.task_instructions is not None and self._near_copy(record):
+            # A cut-off reply is not judged here: it is not the reply yet. It is judged when it is
+            # whole (`_settle`).
             self._log(record, result="skipped", reason=_NEAR_COPY)
             return
         pieces = _pieces(exchange_text(record))
@@ -215,7 +247,98 @@ class MemPalaceProvider(MemPalaceMemoryProvider):
         except Exception as error:  # noqa: BLE001 - the record still goes first; the filing reports
             _log.debug("memory already-filed check failed: %s", type(error).__name__)
         self.records.write(record)
+        if record.cut_off:
+            self._log(record, result=_HELD, reason=_CUT_OFF)
+            return
         self._file(record)
+
+    # --- a reply cut off at its output budget ----------------------------------------------------
+
+    def _held(self, record: Record) -> Record | None:
+        """The record held for ``record``'s exchange, cut off and not yet filed, or ``None``.
+
+        Read only for an exchange named by an item: an exchange that answered none takes a fresh id
+        and can have nothing held. A record that cannot be read is not treated as held, nor as
+        absent: it raises, and the wake's guard logs it, because writing over it could lose words.
+        """
+        held = self.records.read(record.timeline, record.id)
+        if held is None or held.filed or not held.cut_off or held.skipped is not None:
+            return None
+        return held
+
+    def _continue(self, held: Record, exchange: MemoryExchange) -> None:
+        """A second exchange of a held turn: a resume completes it; anything else adds nothing.
+
+        A resume's continuation is added after the reply so far (`continued`). Cut off again, the
+        record stays held, with every word both attempts wrote. Finished, it is filed once, whole,
+        and carries no marker. Anything that is not a resume (the peer's half a stall mines) leaves
+        the record as it is: it already holds that half, and whether a resume can still come is the
+        claims' to say, at the next wake (`begin_wake`).
+        """
+        if not exchange.resumed:
+            self._log(held, result=_HELD, reason=_CUT_OFF)
+            return
+        whole = self._across_the_cut(held, exchange.assistant, cut_off=exchange.cut_off)
+        if whole is None:
+            return
+        self.records.write(whole)
+        if whole.cut_off:
+            self._log(whole, result=_HELD, reason=_CUT_OFF)
+            return
+        self._settle(whole)
+
+    def _across_the_cut(self, held: Record, continuation: str, *, cut_off: bool) -> Record | None:
+        """``held`` completed by ``continuation`` (`continued`), redacted across the cut.
+
+        The wake redacted the fragment and the continuation one at a time (issue #999), so a secret
+        the cut split in two is in neither scrub, and joining them would file it whole. So the two
+        are scrubbed again as the model wrote them, run together: anything that finds was across the
+        cut, and the record then takes that text, the secret blanked and no line break at the seam.
+        If the redaction cannot run, nothing is written and the record stays held as it was.
+        """
+        try:
+            run_together = held.assistant + continuation
+            seamless = scrub(run_together)
+        except Exception:  # noqa: BLE001 - an exchange that cannot be redacted is never filed
+            _log.warning(
+                "memory %s",
+                kv(op="observe", provider=self.name, result="skipped", reason="redaction_failed"),
+                exc_info=True,
+            )
+            return None
+        if seamless != run_together:
+            return replace(held, assistant=seamless, cut_off=cut_off)
+        return continued(held, continuation, cut_off=cut_off)
+
+    def _settle(self, record: Record) -> str:
+        """File a record that was held: the door rule first, now that its reply can be judged.
+
+        A completed resume's record carries no marker; one whose resume never came carries
+        `CUT_OFF_MARKER` (`exchange_text`). A task reply that turns out to be a near-copy of the
+        task's last filed reply is set aside, never filed and never deleted.
+        """
+        if record.task_instructions is not None and self._near_copy(record):
+            self.records.set_aside(record, _NEAR_COPY)
+            self._log(record, result="skipped", reason=_NEAR_COPY)
+            return _NEAR_COPY
+        return self._file(record)
+
+    def _resumable(self, record: Record) -> bool:
+        """Whether the turn behind a held ``record`` can still be resumed: the wake's claims say.
+
+        Held while they say it can, while there is no wake to ask (`MemoryProvider.resumable` is
+        unset), and while asking fails: a fragment filed before its resume makes "already filed?"
+        skip the whole reply, which is the defect this hold exists to prevent, while one held too
+        long is still in its record and is filed by a later wake.
+        """
+        window = self.resumable
+        if window is None or record.kind is None or record.timeline == NO_TIMELINE:
+            return True
+        try:
+            return bool(window(record.timeline, record.id, record.kind))
+        except Exception as error:  # noqa: BLE001 - cannot tell is "still resumable": hold
+            _log.debug("memory resume-window check failed: %s", type(error).__name__)
+            return True
 
     def _near_copy(self, record: Record) -> bool:
         """Whether ``record``'s reply is a near-copy of the last filed reply of the same task."""
@@ -282,7 +405,12 @@ class MemPalaceProvider(MemPalaceMemoryProvider):
         filed = self.records.mark_filed(record)
         if filed.task_instructions is not None:
             self.records.remember_task(task_key(filed.timeline, filed.task_instructions), filed)
-        self._log(filed, attempts=attempts, pieces=len(pieces))
+        self._log(
+            filed,
+            reason=_NO_RESUME if filed.cut_off else None,
+            attempts=attempts,
+            pieces=len(pieces),
+        )
         return _FILED_OK
 
     def _filed_names(self, collection, record: Record) -> set[str]:
@@ -356,7 +484,18 @@ class MemPalaceProvider(MemPalaceMemoryProvider):
                 continue
             if record is None or record.filed:
                 continue
-            outcome = self._file(record)
+            if record.skipped is not None:
+                # Set aside by the door and killed before its marker went: finish that, never file.
+                self.records.set_aside(record, record.skipped)
+                counts[_NEAR_COPY] += 1
+                continue
+            if record.cut_off:
+                if self._resumable(record):
+                    counts[_HELD] += 1
+                    continue
+                outcome = self._settle(record)
+            else:
+                outcome = self._file(record)
             counts[outcome] += 1
             if outcome == _BUSY:
                 counts["left"] += len(pending) - index - 1
@@ -373,6 +512,8 @@ class MemPalaceProvider(MemPalaceMemoryProvider):
                 failed=counts[_FAILED],
                 unreadable=counts["unreadable"],
                 left=counts["left"],
+                held=counts[_HELD],
+                near_copy=counts[_NEAR_COPY],
             ),
         )
 

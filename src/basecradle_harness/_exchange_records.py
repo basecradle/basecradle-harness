@@ -15,13 +15,21 @@ Layout, under ``<palace parent>/<palace name>-records/`` (`records_dir`):
   (`MemoryExchange.item`), or a fresh one when it answered none, so the record's path and the
   name every drawer of it is filed under (`exchange_name`) are derived from the same two values.
 - ``unfiled/<timeline>.<id>`` — an empty marker that exists exactly while the record has not been
-  filed. Written before the record and removed after the record says it is filed, so a process
+  filed and the door has not set it aside (`Record.skipped`). Written before the record and removed after the record says it is filed, so a process
   killed anywhere in between leaves a marker the next wake reads (`RecordStore.unfiled`) and
   resolves against the record: filed, file it, or (no record was ever written) drop the marker.
 - ``tasks/<key>.json`` — for each recurring task, which record holds its last **filed** reply: what
   the door rule compares a new activation's reply against. A task is keyed by its timeline and its
   instructions, normalised as the near-copy measure normalises them (`task_key`), because a
   recurring task on this platform is a new task with the same instructions each time it fires.
+
+**A reply cut off at its output budget is held, never filed as a fragment** (the capital's decision
+of 2026-11-25 on issue #1011, reviewed by ``@briggs``, whose memory this is). Its record is written
+with ``cut_off`` set and keeps its marker, so it is unfiled; a resume of the same turn completes the
+same record (`continued`) and it is filed once, whole. A record whose resume never came is filed as
+it stands, with the one marker line `CUT_OFF_MARKER` after its words (`exchange_text`), once nothing
+can resume it any more. The record never loses a word: a continuation is added to it, never put in
+place of what is there.
 
 **One writer per agent, by the fleet's guarantee, not by a lock here.** The router runs one wake at
 a time per agent, which is what the session transcript already relies on (CLAUDE.md, Delivery
@@ -56,7 +64,23 @@ from basecradle_harness._near_copy import normalize
 
 #: The version of the record's own format. A field is added, never renamed or repurposed, without
 #: changing it; a reader refuses a version it does not know rather than guess at its fields.
-RECORD_FORMAT = 1
+#:
+#: 2 (issue #1011, the capital's decision of 2026-11-25): ``kind``, ``cut_off`` and ``skipped``. An
+#: unfiled record that is ``cut_off`` must not be filed while its turn can still be resumed, which a
+#: format-1 reader would do, so the version moved: a harness that reads only format 1 counts a
+#: format-2 record unreadable and keeps its marker, and its scrub and prune hold it. A format-1
+#: record reads as one with none of the three fields.
+RECORD_FORMAT = 2
+
+#: Every format this harness reads.
+READABLE_FORMATS = frozenset({1, 2})
+
+#: The one line a reply cut off at its output budget is filed with when no resume ever finished it
+#: (issue #1011, the capital's decision of 2026-11-25), after the reply's own words, where recall
+#: shows it. Exactly this text, on its own line, and only on that path: a reply a resume completed
+#: carries none. It is the one line the harness writes into a filed exchange of the agent's, by that
+#: decision, and it is never scrubbed: it says what happened to the reply, and recall needs it.
+CUT_OFF_MARKER = "Cut off. No resume arrived."
 
 #: The first word of every name the adapter files under: ``basecradle:<timeline>:<id>:<piece>``.
 NAME_SCHEME = "basecradle"
@@ -169,6 +193,17 @@ class Record:
     filed: bool = False
     seeded: bool = False
     task_instructions: str | None = None
+    #: The kind of item the exchange answered, in the wake's words (`MemoryExchange.kind`): what the
+    #: adapter hands back to the wake to ask whether a cut-off reply can still be resumed.
+    kind: str | None = None
+    #: The reply was cut off at its output budget and no resume has finished it. Held unfiled while
+    #: a resume can still come; filed with `CUT_OFF_MARKER` once none can.
+    cut_off: bool = False
+    #: Why the door declined to file this record after it was written, or ``None``. Only a reply that
+    #: was whole too late to judge at the door has one (``near_copy``: a cut-off task reply its
+    #: resume made a near-copy of the task's last filed reply). Such a record is never filed and
+    #: carries no marker; it is kept, because the adapter never deletes.
+    skipped: str | None = None
     format: int = RECORD_FORMAT
 
     @property
@@ -190,7 +225,7 @@ class Record:
             raw = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"not a record: {error}") from error
-        if not isinstance(raw, dict) or raw.get("format") != RECORD_FORMAT:
+        if not isinstance(raw, dict) or raw.get("format") not in READABLE_FORMATS:
             raise ValueError("not a record of a format this harness reads")
         try:
             record = cls(
@@ -202,23 +237,51 @@ class Record:
                 recorded_at=str(raw["recorded_at"]),
                 filed=bool(raw["filed"]),
                 seeded=bool(raw.get("seeded", False)),
-                task_instructions=(
-                    None if raw.get("task_instructions") is None else str(raw["task_instructions"])
-                ),
+                task_instructions=_optional(raw.get("task_instructions")),
+                kind=_optional(raw.get("kind")),
+                cut_off=bool(raw.get("cut_off", False)),
+                skipped=_optional(raw.get("skipped")),
             )
         except KeyError as error:
             raise ValueError(f"a record is missing {error}") from error
         return record
 
 
+def _optional(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
 def exchange_text(record: Record) -> str:
     """The exchange as it is filed and judged: MemPalace's exchange format, each incoming line
-    quoted ``> `` (`_mempalace._exchange_markdown`), composed from the record's two halves."""
+    quoted ``> `` (`_mempalace._exchange_markdown`), composed from the record's two halves.
+
+    A record still ``cut_off`` ends its reply with `CUT_OFF_MARKER` on a line of its own, so the
+    text is a function of the record alone: the filing, a refile of it, and the scrub and the prune
+    that judge it all read the same words.
+    """
     from basecradle_harness._memory_provider import MemoryExchange, MemoryScope
     from basecradle_harness._mempalace import _exchange_markdown
 
-    exchange = MemoryExchange(user=record.user, assistant=record.assistant, scope=MemoryScope(""))
+    assistant = _joined(record.assistant, CUT_OFF_MARKER) if record.cut_off else record.assistant
+    exchange = MemoryExchange(user=record.user, assistant=assistant, scope=MemoryScope(""))
     return _exchange_markdown(exchange)
+
+
+def continued(record: Record, continuation: str, *, cut_off: bool) -> Record:
+    """``record`` with a resume's ``continuation`` added after its reply, and ``cut_off`` as given.
+
+    The reply so far, a line break, then the continuation. A cut usually falls at the end of a word
+    (a model's tokens mostly carry their own leading space), and a continuation starts its first
+    word without one, so the two run together would make one word of two; a line break keeps every
+    word as the model wrote it. A word the cut did split stays in its two halves. An empty side adds
+    nothing. The record keeps every word it had. (A secret the cut split is the one exception, joined
+    without the break so it can be blanked: `_mempalace_provider.MemPalaceProvider._across_the_cut`.)
+    """
+    return replace(record, assistant=_joined(record.assistant, continuation), cut_off=cut_off)
+
+
+def _joined(first: str, second: str) -> str:
+    return "\n".join(part for part in (first, second) if part.strip())
 
 
 def new_record(
@@ -230,8 +293,10 @@ def new_record(
     assistant: str,
     seeded: bool = False,
     task_instructions: str | None = None,
+    kind: str | None = None,
+    cut_off: bool = False,
 ) -> Record:
-    """A record for an exchange about to be filed: not yet filed, stamped now."""
+    """A record for an exchange about to be filed (or, ``cut_off``, held): not filed, stamped now."""
     return Record(
         id=record_id(item),
         timeline=timeline_segment(timeline),
@@ -241,6 +306,8 @@ def new_record(
         recorded_at=_now(),
         seeded=seeded,
         task_instructions=task_instructions,
+        kind=kind,
+        cut_off=cut_off,
     )
 
 
@@ -344,6 +411,18 @@ class RecordStore:
         self._write(self.path(filed.timeline, filed.id), filed.to_bytes())
         self._marker(filed.timeline, filed.id).unlink(missing_ok=True)
         return filed
+
+    def set_aside(self, record: Record, reason: str) -> Record:
+        """Record that the door declined ``record`` for ``reason`` after it was written; drop its marker.
+
+        For a reply that could be judged only once it was whole (a cut-off task reply, completed by
+        its resume, that is a near-copy of the task's last filed reply). The record is kept, saying
+        why it was never filed, and the marker goes, so no later wake tries to file it.
+        """
+        aside = replace(record, skipped=reason)
+        self._write(self.path(aside.timeline, aside.id), aside.to_bytes())
+        self._marker(aside.timeline, aside.id).unlink(missing_ok=True)
+        return aside
 
     def remember_task(self, key: str, record: Record) -> None:
         """Point the task keyed ``key`` at ``record``, its last filed reply.

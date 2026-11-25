@@ -41,6 +41,7 @@ from __future__ import annotations
 import importlib
 import os
 from abc import ABC
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
@@ -97,6 +98,18 @@ class MemoryExchange:
             task's author wrote them. ``None`` for every other kind. A provider may key a rule about
             recurring tasks on them (the MemPalace adapter's door rule): a recurring task on this
             platform is a new task with the same instructions each time it fires.
+        kind: Which kind of platform item ``item`` is, in the wake's own words (``messages``,
+            ``assets``, ``webhook_events``, ``tasks``). ``None`` when the exchange answered no item. It is
+            what a provider hands back to `MemoryProvider.resumable` to ask whether a turn cut off
+            at its output budget can still be resumed.
+        cut_off: ``True`` when the reply was cut off at the output budget, so the turn is unfinished
+            and a resume may continue it (issue #490). A provider may hold the exchange rather than
+            file a fragment (the MemPalace adapter does, issue #1011); one that ignores the flag
+            files it as before.
+        resumed: ``True`` when the exchange is a resume finishing a turn an earlier exchange of the
+            same ``item`` may already have begun: ``assistant`` is then the continuation only, the
+            words the model wrote after the turn was cut off or interrupted. A degraded resume, one
+            that produced no words of the model's, is not ``resumed``: nothing continued the turn.
     """
 
     user: str
@@ -105,6 +118,14 @@ class MemoryExchange:
     seeded: bool = False
     item: str | None = None
     task_instructions: str | None = None
+    kind: str | None = None
+    cut_off: bool = False
+    resumed: bool = False
+
+
+#: The question `MemoryProvider.resumable` answers: can the turn that answered ``item`` (of
+#: ``kind``, on ``timeline``) still be resumed? ``(timeline, item, kind) -> bool``.
+ResumeWindow = Callable[[str, str, str], bool]
 
 
 class MemoryProvider(ABC):
@@ -124,6 +145,13 @@ class MemoryProvider(ABC):
     #: The durable engine, when the provider has one. The default SQLite provider sets
     #: it; a provider with no host-local store (a pure cloud middleware) may leave it None.
     store: object | None = None
+
+    #: Whether a turn cut off at its output budget can still be resumed (`ResumeWindow`), set by the
+    #: wake before every `begin_wake` (issue #1011). The wake answers from its claims: the turn can
+    #: be resumed while the claim on the item it answered is still in flight. ``None`` outside a
+    #: wake, where nothing can be told, so a provider that holds a cut-off exchange keeps holding
+    #: it. Only the MemPalace adapter selected by ``mempalace`` reads it.
+    resumable: ResumeWindow | None = None
 
     def tools(self) -> list[Tool]:
         """The model-facing memory tools to register. Default: none (automatic-only)."""

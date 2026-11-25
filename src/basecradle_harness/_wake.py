@@ -2999,15 +2999,20 @@ class WakeAgent:
                 marked=self._marked(item, kind),
                 item=uuid,
                 task_instructions=_instructions_of(item, kind),
+                kind=kind,
+                cut_off=truncated_turn,
             )
             if truncated_turn:
                 # The turn is unfinished, so it is **not committed** (issue #490): the claim stays
                 # in-flight, the record stops here, and the next wake finishes the turn. It *is*
-                # mined, above — a fragment is still the model's own words, and the peer's half is
-                # real whatever happened on our side (`_observe`'s `_STUCK_NOTE` precedent). The
-                # duplicate the resume then writes is a retrieval cost; withholding the mine would
-                # bet the peer's words on a resume that has three documented ways never to happen
-                # (`_drop` twice, `_abandon` once), and lose them from every timeline when it does.
+                # handed to memory, above, and says it was cut off — a fragment is still the model's
+                # own words, and the peer's half is real whatever happened on our side
+                # (`_observe`'s `_STUCK_NOTE` precedent). What a provider does with it is its own:
+                # the previous MemPalace adapter files it, and the resume's continuation beside it;
+                # the `mempalace` adapter holds it until the resume completes it, and files it as it
+                # stands once `_resume_window` says no resume can come (issue #1011). Withholding it
+                # here would bet the peer's words on a resume that has three documented ways never
+                # to happen (`_drop` twice, `_abandon` once).
                 ledger.append((uuid, _PENDING))
                 continue
             # **The claim settles the instant its turn ends — not at `_settle`, and this is not
@@ -3327,9 +3332,34 @@ class WakeAgent:
         if self.memory_provider is None:
             return
         try:
+            self.memory_provider.resumable = self._resume_window
+        except Exception:  # noqa: BLE001 - a provider that refuses the attribute still begins its wake
+            _log.warning("Memory provider refused the resume window; continuing.", exc_info=True)
+        try:
             self.memory_provider.begin_wake()
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake
             _log.warning("Memory provider begin_wake() failed; continuing.", exc_info=True)
+
+    def _resume_window(self, timeline: str, item: str, kind: str) -> bool:
+        """Can the turn that answered ``item`` still be resumed? The claims say (issue #1011).
+
+        The answer `MemoryProvider.resumable` gives a provider holding a reply cut off at its output
+        budget. A turn can be resumed exactly while the claim on its item is in flight: a resume
+        finishes it and commits the claim, after the exchange it completes is handed to memory; a
+        stall, a stop or a drop settles the claim, and a deleted timeline's claims are swept. A claim
+        that is gone (never written, or pruned, which only a settled claim is) can resume nothing.
+        A batch is named by its newest message, whose claim settles with the batch's: mates are
+        committed or abandoned with the turn (`_as_resumed`, `_stall`).
+
+        **The harness does not finish a resume before another wake can ask** — which is why there is a
+        question to ask. A provider's catch-up runs at the start of every wake (`_begin_memory_wake`,
+        before `_reconcile`), on whichever timeline the event is for; a resume runs only in a wake on
+        the item's own timeline, and waits behind an exhausted account (`_resume_orphan` returns
+        `_PENDING` while `_billing_blocked`), an outage (`wake deferred … reason=resume_failed`), or a
+        stall note the platform refused (`stall_note_refused`).
+        """
+        claim = self.claims.read(timeline, item, kind=kind)
+        return claim is not None and not claim.settled
 
     def _observe(
         self,
@@ -3340,6 +3370,9 @@ class WakeAgent:
         marked: bool = False,
         item: str | None = None,
         task_instructions: str | None = None,
+        kind: str | None = None,
+        cut_off: bool = False,
+        resumed: bool = False,
     ) -> None:
         """Hand a completed exchange to the memory provider's `observe` hook, guarded.
 
@@ -3368,6 +3401,12 @@ class WakeAgent:
           batch's newest message's, so a provider that files under it finds a retry of the same
           exchange. A task activation's carries its ``task_instructions`` too: the task's own
           words, already part of ``user``, and redacted here the same way.
+
+        - **The exchange says how its turn ended** (issue #1011, the capital's decision of
+          2026-11-25): ``cut_off`` when its reply stopped at the output budget, so the turn is
+          unfinished, and ``resumed`` when it is a resume's continuation of a turn an earlier
+          exchange of the same item may have begun. With ``kind``, the provider can hold a cut-off
+          reply until the resume finishes it, and ask `_resume_window` whether one still can.
 
         - **A marked real wake is not handed to memory at all** (``marked``, issue #950): the NOC's
           own verification wake, recognised by a verified `BCNOC2` marker bound to this timeline and
@@ -3432,6 +3471,10 @@ class WakeAgent:
                     seeded=seeded,
                     item=item,
                     task_instructions=task_instructions,
+                    kind=kind,
+                    cut_off=cut_off,
+                    # A degraded resume wrote none of the model's words, so nothing continued it.
+                    resumed=resumed and not self._degraded,
                 )
             )
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake; swallow it
@@ -3482,6 +3525,7 @@ class WakeAgent:
                 seeded=True,
                 marked=self._marked(message, _MESSAGES),
                 item=_uuid_of(message),
+                kind=_MESSAGES,
             )
 
     def _seeded_peers(self, seeded: list[object]) -> list[object]:
@@ -3836,6 +3880,8 @@ class WakeAgent:
             narration,
             marked=all(self._marked(message, _MESSAGES) for message in batch),
             item=_uuid_of(batch[-1]),  # a batch is named by its newest message (issue #1011)
+            kind=_MESSAGES,
+            cut_off=truncated_turn,
         )
         if truncated_turn:
             # The turn is unfinished (issue #490). Flip this batch's `_OURS` entries to `_PENDING`
@@ -4260,6 +4306,9 @@ class WakeAgent:
                 marked=self._turn_marked(turn, item, kind),
                 item=_turn_item(turn, item, kind),
                 task_instructions=_instructions_of(item, kind),
+                kind=kind,
+                cut_off=truncated_turn,
+                resumed=True,
             )
             if truncated_turn:
                 # The continuation was itself cut off (issue #490). The turn is still unfinished, so
@@ -4516,6 +4565,7 @@ class WakeAgent:
                 marked=self._turn_marked(turn, item, kind),
                 item=_turn_item(turn, item, kind),
                 task_instructions=_instructions_of(item, kind),
+                kind=kind,
             )
         for mate in turn.items:
             if mate != uuid:
