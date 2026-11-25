@@ -7,6 +7,10 @@ description: The response procedure for when the daily dependency scan files its
 
 `.github/workflows/dependency-security-scan.yml` runs `osv-scanner` against `uv.lock` on `main` every day (the schedule is the workflow's `cron`); the decisions are in `scripts/dependency_security_scan.py`. A finding arrives as one issue, `[SECURITY] Dependency Advisories Against main (Daily Scan)`, carrying `needs-human` when anything is rated High or Critical (it has paged `@origin`) and `needs-capital` otherwise. It is the capital's `security-scan-bump` procedure, carried for what applies to a Python package the NOC deploys to the fleet.
 
+## A Yanked Release
+
+The same script reads every release `uv.lock` pins from PyPI against PyPI's own record (`https://pypi.org/pypi/<package>/<version>/json`, `info.yanked`), because a yank carries no advisory and `osv-scanner` is silent on it (issue #1015, `av` 18.1.0). A yanked release is filed on the advisory issue as an unrated finding (`needs-capital`), with the id `yanked-<version>` and PyPI's stated reason as its title, and a PyPI read that fails, a package locked from another index or an unknown source kind, or a check past its 300-second budget is no verdict. Respond as to an advisory, with two differences: the version to bump to is the one PyPI's reason names (or the next release that is not yanked), and there is no dismissal, because `osv-scanner.toml` does not govern this check. When a deployed venv may hold the yanked release, move the floor past it as well as the lock: an installed release satisfies an unchanged range, so a release with the old range moves no venv.
+
 ## What the Issue Does on Its Own
 
 - **It updates itself and never closes itself.** A new advisory is added with a comment and its label; one re-rated High or Critical after it was filed lower pages then; one that stops being reported is noted; a clean scan says so once. Close it by hand once the fix is on `main` and a scan run is clean.
