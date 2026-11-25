@@ -783,27 +783,41 @@ def test_the_words_before_the_cut_are_put_back_as_the_wake_redacted_them_with_th
     the same words as the one redaction of the whole reply left them, and they go in its place."""
     convo_miner, _ = fake_mempalace
     provider.observe(_cut(assistant="the token is ghp_AbCdEf1234"))
-    assert provider.records.read(TIMELINE, M0).tail == "the token is ghp_AbCdEf1234"
+    assert provider.records.read(TIMELINE, M0).cut_pieces == ["the token is ghp_AbCdEf1234"]
 
-    provider.observe(_resume(assistant=" so use it.", continues="the token is [redacted]"))
+    provider.observe(_resume(assistant=" so use it.", continues=("the token is [redacted]",)))
 
     (drawer,) = convo_miner.filed
     assert "the token is [redacted]\n so use it." in drawer["text"]
     assert "AbCdEf" not in provider.records.path(TIMELINE, M0).read_text()
-    assert provider.records.read(TIMELINE, M0).tail is None  # filed: nothing is held
 
 
-def test_a_resume_cut_off_again_puts_back_only_the_words_it_continues(provider, fake_mempalace):
+def test_every_piece_is_put_back_when_the_record_holds_each_one(provider, fake_mempalace):
+    """A key opened in the first piece, a resume that wrote nothing, then the rest (review of
+    #1020): the first piece's opening goes too, because every piece is handed back."""
     convo_miner, _ = fake_mempalace
-    provider.observe(_cut(assistant="First part."))
-    provider.observe(_resume(assistant=" the key is sk-pr", cut_off=True, continues="First part."))
-    assert provider.records.read(TIMELINE, M0).tail == " the key is sk-pr"
+    provider.observe(_cut(assistant="The key is ghp_AbCdEf12"))
+    provider.observe(_resume(assistant="", cut_off=True, continues=("The key is [redacted]",)))
+    assert provider.records.read(TIMELINE, M0).cut_pieces == ["The key is [redacted]", ""]
 
-    provider.observe(_resume(assistant=" and done.", continues=" the key is [redacted]"))
+    provider.observe(_resume(assistant=" and done.", continues=("The key is [redacted]", "")))
 
     (drawer,) = convo_miner.filed
-    assert "First part.\n the key is [redacted]\n and done." in drawer["text"]
-    assert "sk-pr" not in drawer["text"]
+    assert "The key is [redacted]\n and done." in drawer["text"] and "AbCdEf" not in drawer["text"]
+
+
+def test_a_count_that_differs_keeps_every_word_and_swaps_nothing(provider, fake_mempalace):
+    """An exchange of the reply never reached the record (its wake was killed before it observed):
+    the wake hands back two pieces for the record's one, and nothing is put in place of a word."""
+    convo_miner, _ = fake_mempalace
+    provider.observe(_cut(assistant="The plan has three steps. First we migrate the"))
+    provider.observe(
+        _resume(assistant=" workers. Done.", continues=("…the cut-off text…", " database, then"))
+    )
+
+    (drawer,) = convo_miner.filed
+    assert "The plan has three steps. First we migrate the\n workers. Done." in drawer["text"]
+    assert "cut-off text" not in drawer["text"]
 
 
 def test_without_the_words_before_the_cut_the_reply_so_far_is_kept_as_it_is(
@@ -818,8 +832,8 @@ def test_without_the_words_before_the_cut_the_reply_so_far_is_kept_as_it_is(
     held = _exchange_records.new_record(
         timeline=TIMELINE, item=M1, agent="nova", user=CUT_USER, assistant=FRAGMENT, cut_off=True
     )
-    provider.records.write(replace(held, tail=None, kind=_MESSAGES))
-    provider.observe(_resume(item=M1, continues="something else"))
+    provider.records.write(replace(held, cut_pieces=None, cut_before=None, kind=_MESSAGES))
+    provider.observe(_resume(item=M1, continues=("something else",)))
 
     first, second = (drawer["text"] for drawer in convo_miner.filed)
     assert f"{FRAGMENT}\n{REST}" in first and f"{FRAGMENT}\n{REST}" in second

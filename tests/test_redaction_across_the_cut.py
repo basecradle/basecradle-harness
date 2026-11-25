@@ -266,10 +266,10 @@ def test_a_wake_cut_inside_a_secret_writes_none_of_its_tail(
     assert brain.calls == 2  # cut off, then resumed in the same wake (issue #596)
     _, resumed = memory.observed
     assert resumed.resumed and resumed.assistant == _after(shape)
-    assert resumed.continues + resumed.assistant == scrub(reply)
+    assert "".join(resumed.continues) + resumed.assistant == scrub(reply)
     transcript = _transcript(tmp_path)
     assert [m["content"] for m in transcript if m["role"] == "assistant"] == [
-        resumed.continues,
+        *resumed.continues,
         _after(shape),
     ]
     unspoken = [r.getMessage() for r in caplog.records if "unspoken" in r.getMessage()]
@@ -299,7 +299,56 @@ def test_memory_is_handed_the_words_before_the_cut_as_the_one_redaction_left_the
     # The fragment went to memory before its resume existed, redacted alone: nothing there to know.
     assert cut_off.assistant == "Here it is: ghp_"
     # Neither half alone is a key; the reply is one, and its two halves keep none of it.
-    assert resumed.continues == f"Here it is: {REDACTED}" and resumed.assistant == CLOSE
+    assert resumed.continues == (f"Here it is: {REDACTED}",) and resumed.assistant == CLOSE
+
+
+@pytest.mark.parametrize(("shape", "cut"), CASES)
+def test_a_fragment_saved_before_its_resume_takes_the_rest_of_its_key_with_it(
+    configured, shape, cut
+):
+    """A later wake holds the fragment only as it was saved, redacted alone: a key its opening
+    already matched is ``[redacted]`` there, and the rest of it opens the continuation. The marker
+    ends the piece, so the run that continues it goes with it (`_through_the_cut`)."""
+    reply, at, secret = _reply(shape)
+    saved = scrub(reply[: at + cut])
+
+    shares = scrub_parts([saved, reply[at + cut :]])
+
+    # The run goes up to the next blank, so a closer glued to the key (a JSON string's) goes too.
+    assert shares[1] in (_after(shape), CLOSE)
+    assert _absent(secret[cut:], "".join(shares)) and _absent(secret[:cut], "".join(shares))
+
+
+@pytest.mark.parametrize(("shape", "cut"), CASES)
+def test_a_resume_in_a_later_wake_writes_none_of_the_tail(
+    platform,  # noqa: F811 - the fixture
+    fake_mempalace,
+    configured,
+    tmp_path,
+    caplog,
+    shape,
+    cut,
+):
+    reply, at, secret = _reply(shape)
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    memory = _Watched(tmp_path / "palace", agent="nova")
+    first = _CutOffThenDown(Message.assistant(content=reply[: at + cut]))
+    build_wake(tmp_path, first, memory_provider=memory)[0].wake()
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    brain = _CutOff(Message.assistant(content=reply[at + cut :]), reasons=("stop",))
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        build_wake(tmp_path, brain, memory_provider=memory)[0].wake()
+
+    assert memory.observed[-1].resumed and memory.observed[-1].assistant in (_after(shape), CLOSE)
+    assert [m["content"] for m in _transcript(tmp_path) if m["role"] == "assistant"][-1] in (
+        _after(shape),
+        CLOSE,
+    )
+    assert _absent(secret[cut:], _written(tmp_path, caplog))
+    convo_miner, _ = fake_mempalace
+    (drawer,) = convo_miner.filed
+    assert _absent(secret[cut:], drawer["stored"])
 
 
 def test_a_resume_in_a_later_wake_is_redacted_with_the_fragment_the_transcript_kept(
@@ -330,3 +379,31 @@ def test_a_resume_in_a_later_wake_is_redacted_with_the_fragment_the_transcript_k
     convo_miner, _ = fake_mempalace
     (drawer,) = convo_miner.filed
     assert key[:12] not in drawer["text"] and key[12:] not in drawer["text"]
+
+
+def test_a_reply_in_three_pieces_hands_memory_every_piece_redacted_with_the_rest(
+    platform,  # noqa: F811 - the fixture
+    fake_mempalace,
+    tmp_path,
+):
+    """The fragment opens a key no shape knows at that length, a resume writes nothing and is cut
+    off again, and the next resume writes the rest. The opening is in the first piece, so memory is
+    handed every earlier piece, and the record puts each back (review of #1020)."""
+    key = "ghp_" + _RUN + "Ab3Cd5Ef7Gh"
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    brain = _CutOff(
+        Message.assistant(content=f"Here it is: {key[:12]}"),
+        Message.assistant(content=""),
+        Message.assistant(content=f"{key[12:]}{CLOSE}"),
+        reasons=("length", "length", "stop"),
+    )
+    memory = _Watched(tmp_path / "palace", agent="nova")
+    build_wake(tmp_path, brain, memory_provider=memory)[0].wake()
+
+    assert brain.calls == 3
+    finished = memory.observed[-1]
+    assert finished.continues == (f"Here it is: {REDACTED}", "") and finished.assistant == CLOSE
+    convo_miner, _ = fake_mempalace
+    (drawer,) = convo_miner.filed
+    assert f"Here it is: {REDACTED}\n{CLOSE}" in drawer["stored"]
+    assert key[:12] not in drawer["stored"] and key[12:] not in drawer["stored"]

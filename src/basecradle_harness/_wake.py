@@ -3133,7 +3133,7 @@ class WakeAgent:
 
         A resume's reply that picks up a cut-off text (``continued``, `Session.continued`) is
         journaled as its share of the one redaction of the whole reply (issue #1020): a secret the
-        cut fell inside keeps none of its tail here. The line's own scrub then finds nothing more.
+        cut fell inside keeps none of its tail here.
         """
         if continued:
             text = scrub_parts([*continued, text])[-1]
@@ -3425,8 +3425,8 @@ class WakeAgent:
           the pieces of a reply cut off at its output budget, which the session still holds
           (`Session.continued`). They are one reply, so they are redacted as one text
           (`_redaction.scrub_parts`), and a secret the cut fell inside keeps no part in the reply
-          handed over. The share of the piece just before the cut goes with it
-          (`MemoryExchange.continues`), for a provider that holds the words written before it.
+          handed over. Every earlier piece's share goes with it (`MemoryExchange.continues`), for
+          a provider that holds the words written before the cut.
 
         - **A marked real wake is not handed to memory at all** (``marked``, issue #950): the NOC's
           own verification wake, recognised by a verified `BCNOC2` marker bound to this timeline and
@@ -3466,12 +3466,12 @@ class WakeAgent:
             # stays, and the rest is filed. Before any provider sees the exchange, so before it is
             # split into drawers or written under `conversations/`.
             user, from_user = scrub_counted(user)
-            continues = None
-            if continued and assistant:
+            continues: tuple[str, ...] = ()
+            if continued:
                 pieces, counts = scrub_parts_counted(
                     [*(strip_injected(text) for text in continued), assistant]
                 )
-                assistant, from_assistant, continues = pieces[-1], counts[-1], pieces[-2]
+                assistant, from_assistant, continues = pieces[-1], counts[-1], tuple(pieces[:-1])
             else:
                 assistant, from_assistant = scrub_counted(assistant)
             if task_instructions is not None:

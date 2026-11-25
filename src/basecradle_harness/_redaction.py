@@ -1003,6 +1003,12 @@ def scrub_parts_counted(parts: Sequence[str]) -> tuple[list[str], list[int]]:
     own spans are taken too, read where they stand in the joined text: the union `scrub` keeps among
     its rules, kept across the pieces. One piece is `scrub_counted` exactly.
 
+    **A piece that ends in a redaction marker is a cut the redaction already reached**
+    (`_through_the_cut`): a fragment saved before its resume existed was redacted alone, so a key it
+    ended inside is ``[redacted]`` there, and nothing of the key is left to recognize the rest by. So
+    the run of non-whitespace that opens the next piece goes with that marker. It errs toward
+    redaction: a word the model glued onto a marker it wrote itself goes too.
+
     A redaction is counted in every piece it took something from, so a secret across a cut counts
     once in each piece it was split across.
     """
@@ -1016,6 +1022,7 @@ def scrub_parts_counted(parts: Sequence[str]) -> tuple[list[str], list[int]]:
             values |= {offset + start for start in own_values}
             streams.append(_shifted(own, offset))
             offset += len(part)
+        streams.append(_through_the_cut(parts, whole))
         spans = heapq.merge(*streams)
     starts = [0]
     for part in parts[:-1]:
@@ -1068,6 +1075,21 @@ def _spans(text: str) -> tuple[set[int], Iterator[tuple[int, int]]]:
         (match.span() for match in _PREFIX_RULES.finditer(text) if not _is_word(match)),
     )
     return values, spans
+
+
+_GLUED_RUN = re.compile(r"\S+")
+
+
+def _through_the_cut(parts: Sequence[str], whole: str) -> list[tuple[int, int]]:
+    """A span from each `REDACTED` a piece ends in through the run of non-whitespace that opens the
+    text after it (`scrub_parts_counted`), in order."""
+    spans: list[tuple[int, int]] = []
+    end = 0
+    for part in parts:
+        end += len(part)
+        if part.endswith(REDACTED) and (run := _GLUED_RUN.match(whole, end)) is not None:
+            spans.append((end - len(REDACTED), run.end()))
+    return spans
 
 
 def _shifted(spans: Iterable[tuple[int, int]], offset: int) -> Iterator[tuple[int, int]]:

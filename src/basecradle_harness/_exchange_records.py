@@ -206,11 +206,13 @@ class Record:
     #: resume made a near-copy of the task's last filed reply). Such a record is never filed and
     #: carries no marker; it is kept, because the adapter never deletes.
     skipped: str | None = None
-    #: While the record is held, the words its last exchange added to `assistant`: the reply's last
-    #: words before the cut, which a resume's `MemoryExchange.continues` is put in place of
-    #: (`continued`, issue #1020). ``None`` once the record is not held. Added within format 2: a
-    #: reader that does not know it ignores it, and holds and files the record as before.
-    tail: str | None = None
+    #: While the record is held, the pieces of the cut-off reply its `assistant` ends on, oldest
+    #: first, each as an exchange handed it, and the words of `assistant` before them
+    #: (`cut_before`): what a resume's `MemoryExchange.continues` is put in place of (`continued`,
+    #: issue #1020). ``None`` on a record that was never held. Both added within format 2: a reader
+    #: that does not know them ignores them, and holds and files the record as before.
+    cut_pieces: list[str] | None = None
+    cut_before: str | None = None
     format: int = RECORD_FORMAT
 
     @property
@@ -248,7 +250,8 @@ class Record:
                 kind=_optional(raw.get("kind")),
                 cut_off=bool(raw.get("cut_off", False)),
                 skipped=_optional(raw.get("skipped")),
-                tail=_optional(raw.get("tail")),
+                cut_pieces=_pieces(raw.get("cut_pieces")),
+                cut_before=_optional(raw.get("cut_before")),
             )
         except KeyError as error:
             raise ValueError(f"a record is missing {error}") from error
@@ -257,6 +260,10 @@ class Record:
 
 def _optional(value: object) -> str | None:
     return None if value is None else str(value)
+
+
+def _pieces(value: object) -> list[str] | None:
+    return [str(piece) for piece in value] if isinstance(value, list) else None
 
 
 def exchange_text(record: Record) -> str:
@@ -276,7 +283,7 @@ def exchange_text(record: Record) -> str:
 
 
 def continued(
-    record: Record, continuation: str, *, cut_off: bool, continues: str | None = None
+    record: Record, continuation: str, *, cut_off: bool, continues: tuple[str, ...] = ()
 ) -> Record:
     """``record`` with a resume's ``continuation`` added after its reply, and ``cut_off`` as given.
 
@@ -286,27 +293,33 @@ def continued(
     word as the model wrote it. A word the cut did split stays in its two halves. An empty side adds
     nothing. The record keeps every word it had.
 
-    **Redacted across the cut by the wake, never here** (issue #1020). The reply's last words before
-    the cut (`Record.tail`) reached the record redacted alone, and the continuation arrives redacted
-    with them as one text, so a secret the cut fell inside keeps none of its tail in it. Its opening
-    can still be in the tail, if no shape knew it alone; ``continues`` is the tail as that one
-    redaction left it (`MemoryExchange.continues`), and it is put in the tail's place. Without it,
-    or with no tail to put it in, the reply so far is kept as it is.
+    **Redacted across the cut by the wake, never here** (issue #1020). Each piece of a cut-off reply
+    reached the record redacted without what came after it (`Record.cut_pieces`), and the
+    continuation arrives redacted with them as one text, so a secret a cut fell inside keeps none of
+    its tail in it. Its opening can still be in an earlier piece, if no shape knew it there;
+    ``continues`` is every earlier piece as that one redaction left it (`MemoryExchange.continues`),
+    and they are put in the pieces' place, **only when the record holds exactly that many**: then
+    every exchange of the reply reached it, in order. A count that differs (an exchange that never
+    arrived, a record held before the pieces were kept) keeps every word it has, and the
+    continuation starts a new run of pieces after them, as one that continues nothing does.
     """
-    assistant = record.assistant
-    tail = record.tail
-    if continues is not None and tail is not None and tail.strip() and assistant.endswith(tail):
-        assistant = _joined(assistant[: len(assistant) - len(tail)].removesuffix("\n"), continues)
+    pieces = record.cut_pieces
+    before = record.cut_before or ""
+    if continues and pieces is not None and len(pieces) == len(continues):
+        pieces = [*continues, continuation]
+    else:
+        before, pieces = record.assistant, [continuation]
     return replace(
         record,
-        assistant=_joined(assistant, continuation),
+        assistant=_joined(before, *pieces),
         cut_off=cut_off,
-        tail=continuation if cut_off else None,
+        cut_pieces=pieces,
+        cut_before=before,
     )
 
 
-def _joined(first: str, second: str) -> str:
-    return "\n".join(part for part in (first, second) if part.strip())
+def _joined(*parts: str) -> str:
+    return "\n".join(part for part in parts if part.strip())
 
 
 def new_record(
@@ -333,7 +346,8 @@ def new_record(
         task_instructions=task_instructions,
         kind=kind,
         cut_off=cut_off,
-        tail=assistant if cut_off else None,
+        cut_pieces=[assistant] if cut_off else None,
+        cut_before="" if cut_off else None,
     )
 
 
