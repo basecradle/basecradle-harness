@@ -61,7 +61,6 @@ import os
 import re
 import stat
 import unicodedata
-from bisect import bisect_right
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from functools import cache
 from importlib import resources
@@ -994,9 +993,13 @@ def scrub_parts_counted(parts: Sequence[str]) -> tuple[list[str], list[int]]:
     cut fell inside is in neither: its opening may match a shape and be blanked, while the rest opens
     the continuation, where nothing recognizes it, and is written as it stands. So the pieces are
     redacted together: the rules read ``"".join(parts)``, and what each piece keeps is what that
-    redaction leaves of it. A redaction is written once, in the piece where it starts; what it took
-    from the pieces after is gone from them. ``"".join`` of the result is therefore the joined text
-    redacted, and no piece keeps any part of a secret the joined text holds whole.
+    redaction leaves of it. A redaction is written once, in the **last** piece it took something
+    from, and what it took from the pieces before is gone from them. ``"".join`` of the result is
+    therefore the joined text redacted, and no piece keeps any part of a secret the joined text holds
+    whole. The last piece, never the first: a piece saved with a marker at its end reads, on the next
+    save, as a cut a redaction already reached (below), so a marker the joint reading wrote there
+    would take the next piece's words again on every save; written after the cut, it is read back
+    as itself.
 
     **Never less than each piece alone.** Joining can make a rule decline what it takes in a piece
     (a key glued to the last word of the piece before reads as a word, `_is_word`), so every piece's
@@ -1006,8 +1009,11 @@ def scrub_parts_counted(parts: Sequence[str]) -> tuple[list[str], list[int]]:
     **A piece that ends in a redaction marker is a cut the redaction already reached**
     (`_through_the_cut`): a fragment saved before its resume existed was redacted alone, so a key it
     ended inside is ``[redacted]`` there, and nothing of the key is left to recognize the rest by. So
-    the run of non-whitespace that opens the next piece goes with that marker. It errs toward
-    redaction: a word the model glued onto a marker it wrote itself goes too.
+    the run of key and URL characters that opens the next piece (`_KEY_RUN`) goes with that marker,
+    added to the redactions the rules made and never changing one of them. It errs toward
+    redaction, and is bounded to that one run: what the model glued onto a marker that ended a key
+    exactly at the cut goes too, once (the marker then stands after the cut and reads back as
+    itself), and a quote, a bracket, a comma, a blank or a letter outside ASCII is never taken.
 
     A redaction is counted in every piece it took something from, so a secret across a cut counts
     once in each piece it was split across.
@@ -1022,8 +1028,10 @@ def scrub_parts_counted(parts: Sequence[str]) -> tuple[list[str], list[int]]:
             values |= {offset + start for start in own_values}
             streams.append(_shifted(own, offset))
             offset += len(part)
-        streams.append(_through_the_cut(parts, whole))
         spans = heapq.merge(*streams)
+    redactions: Iterable[tuple[int, int, str]] = _redactions(whole, values, spans)
+    if len(parts) > 1:
+        redactions = _with_runs(list(redactions), _through_the_cut(parts, whole))
     starts = [0]
     for part in parts[:-1]:
         starts.append(starts[-1] + len(part))
@@ -1043,11 +1051,12 @@ def scrub_parts_counted(parts: Sequence[str]) -> tuple[list[str], list[int]]:
             shares[k].append(whole[max(begin, starts[k]) : min(end, starts[k] + len(parts[k]))])
 
     pos = 0
-    for start, end, marker in _redactions(whole, values, spans):
+    for start, end, marker in redactions:
         keep(pos, start)
-        shares[bisect_right(starts, start) - 1].append(marker)
+        pieces = list(touched(start, end))
+        shares[pieces[-1]].append(marker)  # in the last piece it took from (see above)
         if whole[start:end] != marker:  # a marker already there is no new redaction
-            for k in touched(start, end):
+            for k in pieces:
                 counts[k] += 1
         pos = end
     keep(pos, len(whole))
@@ -1077,19 +1086,39 @@ def _spans(text: str) -> tuple[set[int], Iterator[tuple[int, int]]]:
     return values, spans
 
 
-_GLUED_RUN = re.compile(r"\S+")
+#: What `_through_the_cut` takes after a marker that ends a piece: the characters of a key, a token
+#: and a URL, ASCII only, and nothing that closes a quoted value, a list or a sentence's clause.
+_KEY_RUN = re.compile(r"[A-Za-z0-9._~+/=%&?:@-]+")
 
 
 def _through_the_cut(parts: Sequence[str], whole: str) -> list[tuple[int, int]]:
-    """A span from each `REDACTED` a piece ends in through the run of non-whitespace that opens the
-    text after it (`scrub_parts_counted`), in order."""
+    """A span from each `REDACTED` a piece ends in through the `_KEY_RUN` that opens the text after
+    it (`scrub_parts_counted`), in order."""
     spans: list[tuple[int, int]] = []
     end = 0
     for part in parts:
         end += len(part)
-        if part.endswith(REDACTED) and (run := _GLUED_RUN.match(whole, end)) is not None:
+        if part.endswith(REDACTED) and (run := _KEY_RUN.match(whole, end)) is not None:
             spans.append((end - len(REDACTED), run.end()))
     return spans
+
+
+def _with_runs(
+    redactions: list[tuple[int, int, str]], runs: list[tuple[int, int]]
+) -> list[tuple[int, int, str]]:
+    """``redactions`` with each of ``runs`` added: a redaction a run overlaps or touches grows to
+    cover it, keeping its own marker (`REDACTED_VALUE` if any it joins had one), and a run that
+    meets none is written as `REDACTED`. Added after the rules' merge, never fed into it, so a run
+    can only add to what the rules took (`_past_marker` is not monotone in a span's end)."""
+    merged: list[tuple[int, int, str]] = []
+    for start, end, marker in sorted([*redactions, *((s, e, REDACTED) for s, e in runs)]):
+        if merged and start <= merged[-1][1]:
+            first, last, kept = merged[-1]
+            value = REDACTED_VALUE if REDACTED_VALUE in (kept, marker) else REDACTED
+            merged[-1] = (first, max(last, end), value)
+        else:
+            merged.append((start, end, marker))
+    return merged
 
 
 def _shifted(spans: Iterable[tuple[int, int]], offset: int) -> Iterator[tuple[int, int]]:

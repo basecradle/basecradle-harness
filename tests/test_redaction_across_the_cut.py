@@ -118,10 +118,17 @@ def _after(shape: str) -> str:
     return SHAPES[shape][2] + CLOSE
 
 
+def _rest(shape: str) -> str:
+    """The continuation once redacted: the secret's marker, written after the cut, then what
+    follows the secret. Nothing of the secret is in it."""
+    marker = REDACTED_VALUE if shape == "credential_assignment" else REDACTED
+    return marker + _after(shape)
+
+
 def _whole(shape: str) -> str:
     """The reply as the record files it: the words before the cut, a line break, the rest."""
     redacted = scrub(_reply(shape)[0])
-    return redacted[: -len(_after(shape))] + "\n" + _after(shape)
+    return redacted[: -len(_rest(shape))] + "\n" + _rest(shape)
 
 
 def _absent(piece: str, text: str) -> bool:
@@ -141,7 +148,7 @@ def test_a_continuation_keeps_none_of_the_secret_its_cut_fell_inside(configured,
     shares = scrub_parts([fragment, rest])
 
     assert "".join(shares) == scrub(reply)  # the reply as one text…
-    assert shares[1] == _after(shape)  # …so the continuation keeps nothing of the secret
+    assert shares[1] == _rest(shape)  # …so the continuation keeps nothing of the secret
 
 
 @pytest.mark.parametrize(("shape", "cut"), CASES)
@@ -169,15 +176,15 @@ def test_one_piece_is_the_scrub_exactly(configured):
         assert scrub_parts_counted([reply]) == ([scrub(reply)], [scrub_counted(reply)[1]])
 
 
-def test_a_redaction_is_written_once_where_it_starts_and_counted_in_each_piece():
+def test_a_redaction_is_written_once_in_the_last_piece_it_took_from_and_counted_in_each():
     key = "ghp_" + _RUN + "Ab3Cd5Ef7Gh"
     shares, counts = scrub_parts_counted(["token " + key[:10], "", key[10:] + " done"])
-    assert shares == ["token " + REDACTED, "", " done"] and counts == [1, 0, 1]
+    assert shares == ["token ", "", REDACTED + " done"] and counts == [1, 0, 1]
 
 
 def test_a_value_marker_stays_with_its_name():
     shares = scrub_parts(["export GH_TOKEN=" + _RUN[:5], _RUN[5:] + " ok"])
-    assert shares == ["export GH_TOKEN=" + REDACTED_VALUE, " ok"]
+    assert shares == ["export GH_TOKEN=", REDACTED_VALUE + " ok"]
 
 
 # --- the transcript ----------------------------------------------------------------------------
@@ -213,7 +220,20 @@ def test_the_transcript_holds_no_tail(configured, shape, cut):
     reply, at, _ = _reply(shape)
     saved = json.loads(_payload(_cut_turn(reply[: at + cut], reply[at + cut :])))
     assert saved[2]["content"] + saved[5]["content"] == scrub(reply)
-    assert saved[5]["content"] == _after(shape)
+    assert saved[5]["content"] == _rest(shape)
+
+
+@pytest.mark.parametrize(("shape", "cut"), CASES)
+@pytest.mark.parametrize("alone", [False, True], ids=["same_wake", "saved_alone"])
+def test_saving_a_loaded_transcript_again_changes_nothing(configured, shape, cut, alone):
+    """Every save rewrites the transcript from what the last one wrote (review of #1020): a marker
+    the joint reading wrote at a piece's end would be read as a cut the redaction reached, and take
+    the next piece's words on every later save. Written after the cut, it reads back as itself."""
+    reply, at, _ = _reply(shape)
+    fragment = scrub(reply[: at + cut]) if alone else reply[: at + cut]
+    once = _payload(_cut_turn(fragment, reply[at + cut :]))
+    loaded = [Message.from_dict(data) for data in json.loads(once)]
+    assert _payload(loaded) == once
 
 
 # --- a real wake: everything it writes ----------------------------------------------------------
@@ -265,12 +285,12 @@ def test_a_wake_cut_inside_a_secret_writes_none_of_its_tail(
 
     assert brain.calls == 2  # cut off, then resumed in the same wake (issue #596)
     _, resumed = memory.observed
-    assert resumed.resumed and resumed.assistant == _after(shape)
+    assert resumed.resumed and resumed.assistant == _rest(shape)
     assert "".join(resumed.continues) + resumed.assistant == scrub(reply)
     transcript = _transcript(tmp_path)
     assert [m["content"] for m in transcript if m["role"] == "assistant"] == [
         *resumed.continues,
-        _after(shape),
+        _rest(shape),
     ]
     unspoken = [r.getMessage() for r in caplog.records if "unspoken" in r.getMessage()]
     assert CLOSE.strip() in unspoken[-1] and _absent(secret[cut:], unspoken[-1])
@@ -299,7 +319,7 @@ def test_memory_is_handed_the_words_before_the_cut_as_the_one_redaction_left_the
     # The fragment went to memory before its resume existed, redacted alone: nothing there to know.
     assert cut_off.assistant == "Here it is: ghp_"
     # Neither half alone is a key; the reply is one, and its two halves keep none of it.
-    assert resumed.continues == (f"Here it is: {REDACTED}",) and resumed.assistant == CLOSE
+    assert resumed.continues == ("Here it is: ",) and resumed.assistant == REDACTED + CLOSE
 
 
 @pytest.mark.parametrize(("shape", "cut"), CASES)
@@ -314,8 +334,7 @@ def test_a_fragment_saved_before_its_resume_takes_the_rest_of_its_key_with_it(
 
     shares = scrub_parts([saved, reply[at + cut :]])
 
-    # The run goes up to the next blank, so a closer glued to the key (a JSON string's) goes too.
-    assert shares[1] in (_after(shape), CLOSE)
+    assert shares[1] == _rest(shape)
     assert _absent(secret[cut:], "".join(shares)) and _absent(secret[:cut], "".join(shares))
 
 
@@ -340,10 +359,9 @@ def test_a_resume_in_a_later_wake_writes_none_of_the_tail(
     with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
         build_wake(tmp_path, brain, memory_provider=memory)[0].wake()
 
-    assert memory.observed[-1].resumed and memory.observed[-1].assistant in (_after(shape), CLOSE)
-    assert [m["content"] for m in _transcript(tmp_path) if m["role"] == "assistant"][-1] in (
-        _after(shape),
-        CLOSE,
+    assert memory.observed[-1].resumed and memory.observed[-1].assistant == _rest(shape)
+    assert [m["content"] for m in _transcript(tmp_path) if m["role"] == "assistant"][-1] == (
+        _rest(shape)
     )
     assert _absent(secret[cut:], _written(tmp_path, caplog))
     convo_miner, _ = fake_mempalace
@@ -402,8 +420,8 @@ def test_a_reply_in_three_pieces_hands_memory_every_piece_redacted_with_the_rest
 
     assert brain.calls == 3
     finished = memory.observed[-1]
-    assert finished.continues == (f"Here it is: {REDACTED}", "") and finished.assistant == CLOSE
+    assert finished.continues == ("Here it is: ", "") and finished.assistant == REDACTED + CLOSE
     convo_miner, _ = fake_mempalace
     (drawer,) = convo_miner.filed
-    assert f"Here it is: {REDACTED}\n{CLOSE}" in drawer["stored"]
+    assert f"Here it is: \n{REDACTED}{CLOSE}" in drawer["stored"]
     assert key[:12] not in drawer["stored"] and key[12:] not in drawer["stored"]
