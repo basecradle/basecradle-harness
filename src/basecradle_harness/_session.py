@@ -94,7 +94,7 @@ from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._caching import anchor_cacheable_prefix, bind_conversation, cache_mode
 from basecradle_harness._context import TOOL_ARGS_CAP, TOOL_RESULT_CAP, Compactor
 from basecradle_harness._elision import argument_marker, gone, is_marker, result_marker
-from basecradle_harness._engine import Engine
+from basecradle_harness._engine import Engine, is_truncation_note
 from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._idempotency import create_kind
 from basecradle_harness._messages import ImageContent, Message, ToolCall
@@ -103,6 +103,7 @@ from basecradle_harness._redaction import (
     configured_values,
     names_a_secret_field,
     scrub,
+    scrub_parts,
     stable_cut,
 )
 from basecradle_harness._stop import WakeStopped
@@ -225,6 +226,13 @@ class Session:
         #: What each text this session last saved redacted to (issue #999), so a save rescans only
         #: what changed since the one before: every step of a turn saves the whole transcript.
         self._redactions = _RedactionMemo()
+        #: The texts the reply the last `resume` ended on continues, oldest first, as `history` held
+        #: them when it ended (issue #1020): the earlier pieces of a reply that was cut off at its
+        #: output budget, which the resume's reply picks up from (`reply_pieces`). Empty when that
+        #: reply continues no cut text — a fresh turn, a resume of a turn killed mid-tool-chain, a
+        #: resume whose first reply was not its last — or when the resume raised. The wake redacts
+        #: the resume's reply together with these before it writes it anywhere.
+        self.continued: tuple[str, ...] = ()
         #: The index in `history` of the user turn of the exchange in progress (or the last one
         #: that ran). With `_convo`/`_adopted` it answers `turn_work` — what *this* turn has
         #: produced — which is what the idempotency minter counts its ordinal off (`_idempotency`).
@@ -360,6 +368,7 @@ class Session:
         if _index_of(self.history, turn) is None:
             raise ValueError("the turn to resume is not in this transcript")
         self._turn = turn
+        self.continued = ()
         # The engine's give-up line reads it (issue #957): a resume's own-budget timeout is the
         # turn's fault, so no router attempt follows it.
         self.engine.resuming = True
@@ -385,6 +394,8 @@ class Session:
                 "Retrying the resumed turn once against the compacted transcript: %s", error
             )
             reply = self._continue(turn, brief)
+        # Read before the compaction below, which can summarize the very turn this resume finished.
+        self.continued = _continued(self.history, reply)
         self._compact_if_needed()
         return reply.content or ""
 
@@ -991,6 +1002,12 @@ def _payload(messages: list[Message], redact: Callable[[str], str] = scrub) -> s
     from exactly those bytes. That exception is bounded as the cap's is: one dead turn's creates,
     until the re-issue writes a real result and the next save redacts them.
 
+    **A reply held in pieces is redacted as one text** (issue #1020): a reply cut off at its output
+    budget and the resume that finished it are two assistant messages (`reply_pieces`), and a
+    secret the cut fell inside is in neither, so their texts go through `_redaction.scrub_parts`
+    together and each message persists its share. Not memoized as single texts are: a reply is
+    bounded by the output budget, and only a turn that was cut off has one.
+
     The caps stay a fixed point with the redaction in front of them: a cut never splits a marker
     or leaves a value open for the next save's scrub to complete (`_redaction.stable_cut`), and an
     excerpt that would not read back as itself falls to the floor. The server-tool record is
@@ -1002,12 +1019,15 @@ def _payload(messages: list[Message], redact: Callable[[str], str] = scrub) -> s
     types it back types a placeholder, never the secret; that is the price, and it is stated here.
     """
     capped = _capped_results(messages, redact)
+    pieces = _pieces_redacted(messages)
     payload: list[dict] = []
     for index, message in enumerate(messages):
         data = message.to_dict()
         data.pop("images", None)  # a viewed image is seen once; base64 never lands in a transcript
         if index in capped:
             data["content"] = capped[index]
+        elif index in pieces:
+            data["content"] = pieces[index]
         elif isinstance(message.content, str) and not _is_interrupted(message):
             data["content"] = redact(message.content)
         if message.tool_calls:
@@ -1016,6 +1036,66 @@ def _payload(messages: list[Message], redact: Callable[[str], str] = scrub) -> s
             )
         payload.append(data)
     return json.dumps(payload, indent=2)
+
+
+def reply_pieces(messages: list[Message]) -> list[list[int]]:
+    """Every reply `messages` holds in more than one piece: each one's indices, in order (#1020).
+
+    A reply cut off at its output budget is followed by the truncation note (`is_truncation_note`),
+    and the resume that finishes it writes the turn's next assistant message, which continues the
+    cut text from where it stopped. The two are one reply, and a resume cut off again adds a third.
+    Only system turns may stand between a piece and the note after it, or between the note and the
+    next piece (a step note; the failure marker a resume that raised leaves): a tool result or a
+    user turn ends the reply, and the text after it is a new one.
+    """
+    replies: list[list[int]] = []
+    reply: list[int] = []
+    noted = False  # a truncation note stands after the reply's last piece
+    for index, message in enumerate(messages):
+        if message.role == "assistant":
+            if not noted:
+                if len(reply) > 1:
+                    replies.append(reply)
+                reply = []
+            reply.append(index)
+            noted = False
+        elif message.role == "system":
+            noted = noted or (bool(reply) and is_truncation_note(message))
+        else:
+            if len(reply) > 1:
+                replies.append(reply)
+            reply, noted = [], False
+    if len(reply) > 1:
+        replies.append(reply)
+    return replies
+
+
+def _texts(messages: list[Message], indices: list[int]) -> list[str]:
+    return [
+        message.content if isinstance(message.content, str) else ""
+        for message in (messages[index] for index in indices)
+    ]
+
+
+def _pieces_redacted(messages: list[Message]) -> dict[int, str]:
+    """Each piece of every reply held in pieces (`reply_pieces`), as its share of the one redaction
+    of the reply (`_redaction.scrub_parts`), by index. A piece with no text keeps none."""
+    redacted: dict[int, str] = {}
+    for reply in reply_pieces(messages):
+        for index, share in zip(reply, scrub_parts(_texts(messages, reply)), strict=True):
+            if isinstance(messages[index].content, str):
+                redacted[index] = share
+    return redacted
+
+
+def _continued(history: list[Message], reply: Message) -> tuple[str, ...]:
+    """The texts of the pieces before ``reply`` of the reply it is the last piece of, found by
+    identity (`reply_pieces`); empty when ``reply`` continues nothing."""
+    at = next((index for index, message in enumerate(history) if message is reply), None)
+    for pieces in reply_pieces(history):
+        if pieces[-1] == at:
+            return tuple(_texts(history, pieces[:-1]))
+    return ()
 
 
 def _calls_payload(

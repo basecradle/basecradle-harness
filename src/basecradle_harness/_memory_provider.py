@@ -110,6 +110,12 @@ class MemoryExchange:
             same ``item`` may already have begun: ``assistant`` is then the continuation only, the
             words the model wrote after the turn was cut off or interrupted. A degraded resume, one
             that produced no words of the model's, is not ``resumed``: nothing continued the turn.
+        continues: For a ``resumed`` exchange whose ``assistant`` picks up a reply cut off at its
+            output budget where it stopped, the last words written before the cut, redacted with
+            ``assistant`` as one text (issue #1020); ``None`` otherwise. Those words reached an
+            earlier exchange's ``assistant`` redacted alone, so part of a secret the cut fell inside
+            can be in them; this is the same text, without it. A provider that holds the earlier
+            words may put this in their place; one that filed them as they came ignores it.
     """
 
     user: str
@@ -121,6 +127,7 @@ class MemoryExchange:
     kind: str | None = None
     cut_off: bool = False
     resumed: bool = False
+    continues: str | None = None
 
 
 #: The question `MemoryProvider.resumable` answers: can the turn that answered ``item`` (of

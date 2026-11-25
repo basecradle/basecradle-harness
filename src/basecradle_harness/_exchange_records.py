@@ -29,7 +29,9 @@ with ``cut_off`` set and keeps its marker, so it is unfiled; a resume of the sam
 same record (`continued`) and it is filed once, whole. A record whose resume never came is filed as
 it stands, with the one marker line `CUT_OFF_MARKER` after its words (`exchange_text`), once nothing
 can resume it any more. The record never loses a word: a continuation is added to it, never put in
-place of what is there.
+place of what is there. The one thing ever put in place of a word is a redaction: the words just
+before a cut, which the wake redacted alone, are taken again as the wake redacted them with their
+continuation (`continued`, issue #1020), so a secret the cut fell inside keeps no part.
 
 **One writer per agent, by the fleet's guarantee, not by a lock here.** The router runs one wake at
 a time per agent, which is what the session transcript already relies on (CLAUDE.md, Delivery
@@ -204,6 +206,11 @@ class Record:
     #: resume made a near-copy of the task's last filed reply). Such a record is never filed and
     #: carries no marker; it is kept, because the adapter never deletes.
     skipped: str | None = None
+    #: While the record is held, the words its last exchange added to `assistant`: the reply's last
+    #: words before the cut, which a resume's `MemoryExchange.continues` is put in place of
+    #: (`continued`, issue #1020). ``None`` once the record is not held. Added within format 2: a
+    #: reader that does not know it ignores it, and holds and files the record as before.
+    tail: str | None = None
     format: int = RECORD_FORMAT
 
     @property
@@ -241,6 +248,7 @@ class Record:
                 kind=_optional(raw.get("kind")),
                 cut_off=bool(raw.get("cut_off", False)),
                 skipped=_optional(raw.get("skipped")),
+                tail=_optional(raw.get("tail")),
             )
         except KeyError as error:
             raise ValueError(f"a record is missing {error}") from error
@@ -267,17 +275,34 @@ def exchange_text(record: Record) -> str:
     return _exchange_markdown(exchange)
 
 
-def continued(record: Record, continuation: str, *, cut_off: bool) -> Record:
+def continued(
+    record: Record, continuation: str, *, cut_off: bool, continues: str | None = None
+) -> Record:
     """``record`` with a resume's ``continuation`` added after its reply, and ``cut_off`` as given.
 
     The reply so far, a line break, then the continuation. A cut usually falls at the end of a word
     (a model's tokens mostly carry their own leading space), and a continuation starts its first
     word without one, so the two run together would make one word of two; a line break keeps every
     word as the model wrote it. A word the cut did split stays in its two halves. An empty side adds
-    nothing. The record keeps every word it had. (A secret the cut split is the one exception, joined
-    without the break so it can be blanked: `_mempalace_provider.MemPalaceProvider._across_the_cut`.)
+    nothing. The record keeps every word it had.
+
+    **Redacted across the cut by the wake, never here** (issue #1020). The reply's last words before
+    the cut (`Record.tail`) reached the record redacted alone, and the continuation arrives redacted
+    with them as one text, so a secret the cut fell inside keeps none of its tail in it. Its opening
+    can still be in the tail, if no shape knew it alone; ``continues`` is the tail as that one
+    redaction left it (`MemoryExchange.continues`), and it is put in the tail's place. Without it,
+    or with no tail to put it in, the reply so far is kept as it is.
     """
-    return replace(record, assistant=_joined(record.assistant, continuation), cut_off=cut_off)
+    assistant = record.assistant
+    tail = record.tail
+    if continues is not None and tail is not None and tail.strip() and assistant.endswith(tail):
+        assistant = _joined(assistant[: len(assistant) - len(tail)].removesuffix("\n"), continues)
+    return replace(
+        record,
+        assistant=_joined(assistant, continuation),
+        cut_off=cut_off,
+        tail=continuation if cut_off else None,
+    )
 
 
 def _joined(first: str, second: str) -> str:
@@ -308,6 +333,7 @@ def new_record(
         task_instructions=task_instructions,
         kind=kind,
         cut_off=cut_off,
+        tail=assistant if cut_off else None,
     )
 
 

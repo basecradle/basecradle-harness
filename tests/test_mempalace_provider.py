@@ -775,36 +775,61 @@ def test_the_previous_adapter_files_a_cut_off_reply_and_its_resume_as_it_always_
     assert FRAGMENT in texts[0] and REST in texts[1] and FRAGMENT not in texts[1]
 
 
-def test_a_secret_the_cut_split_in_two_is_blanked_when_the_halves_are_joined(
+def test_the_words_before_the_cut_are_put_back_as_the_wake_redacted_them_with_the_rest(
     provider, fake_mempalace
 ):
-    """Each half was redacted alone by the wake, and neither half alone is a key."""
+    """Issue #1020: the wake redacts across the cut, the adapter never does. The fragment reached
+    the record redacted alone, where no shape knew the opening of the key; the resume arrives with
+    the same words as the one redaction of the whole reply left them, and they go in its place."""
     convo_miner, _ = fake_mempalace
     provider.observe(_cut(assistant="the token is ghp_AbCdEf1234"))
+    assert provider.records.read(TIMELINE, M0).tail == "the token is ghp_AbCdEf1234"
 
-    provider.observe(_resume(assistant="GhIjKlMn5678 so use it."))
+    provider.observe(_resume(assistant=" so use it.", continues="the token is [redacted]"))
 
     (drawer,) = convo_miner.filed
-    assert "AbCdEf1234" not in drawer["text"] and "GhIjKlMn5678" not in drawer["text"]
-    assert "the token is [redacted] so use it." in drawer["text"]
+    assert "the token is [redacted]\n so use it." in drawer["text"]
     assert "AbCdEf" not in provider.records.path(TIMELINE, M0).read_text()
+    assert provider.records.read(TIMELINE, M0).tail is None  # filed: nothing is held
 
 
-def test_a_redaction_that_cannot_run_across_the_cut_writes_nothing(
-    provider, fake_mempalace, monkeypatch
+def test_a_resume_cut_off_again_puts_back_only_the_words_it_continues(provider, fake_mempalace):
+    convo_miner, _ = fake_mempalace
+    provider.observe(_cut(assistant="First part."))
+    provider.observe(_resume(assistant=" the key is sk-pr", cut_off=True, continues="First part."))
+    assert provider.records.read(TIMELINE, M0).tail == " the key is sk-pr"
+
+    provider.observe(_resume(assistant=" and done.", continues=" the key is [redacted]"))
+
+    (drawer,) = convo_miner.filed
+    assert "First part.\n the key is [redacted]\n and done." in drawer["text"]
+    assert "sk-pr" not in drawer["text"]
+
+
+def test_without_the_words_before_the_cut_the_reply_so_far_is_kept_as_it_is(
+    provider, fake_mempalace
 ):
+    """A resume that continues no cut text, and a record held before the record kept its tail
+    (0.215.0), each keep the words they hold: the adapter puts nothing in place of what it cannot
+    find."""
     convo_miner, _ = fake_mempalace
     provider.observe(_cut())
-    before = provider.records.path(TIMELINE, M0).read_bytes()
-
-    def broken(text):
-        raise RuntimeError("the redaction failed")
-
-    monkeypatch.setattr(_mempalace_provider, "scrub", broken)
     provider.observe(_resume())
+    held = _exchange_records.new_record(
+        timeline=TIMELINE, item=M1, agent="nova", user=CUT_USER, assistant=FRAGMENT, cut_off=True
+    )
+    provider.records.write(replace(held, tail=None, kind=_MESSAGES))
+    provider.observe(_resume(item=M1, continues="something else"))
 
-    assert convo_miner.filed == []
-    assert provider.records.path(TIMELINE, M0).read_bytes() == before
+    first, second = (drawer["text"] for drawer in convo_miner.filed)
+    assert f"{FRAGMENT}\n{REST}" in first and f"{FRAGMENT}\n{REST}" in second
+    assert "something else" not in second
+
+
+def test_the_adapter_never_redacts():
+    """One owner for the redaction of what memory is handed: the wake (`WakeAgent._observe`)."""
+    source = Path(_mempalace_provider.__file__).read_text()
+    assert "_redaction" not in source and "scrub" not in source
 
 
 def test_a_record_set_aside_by_a_wake_killed_before_its_marker_went_is_never_filed(

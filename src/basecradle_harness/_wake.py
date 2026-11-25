@@ -235,7 +235,13 @@ from basecradle_harness._platform import PlatformContext, bind_platform_tools, e
 from basecradle_harness._plugins import ResolvedTools
 from basecradle_harness._probe import verify_marked
 from basecradle_harness._provider import Provider
-from basecradle_harness._redaction import bounded, scrub, scrub_counted
+from basecradle_harness._redaction import (
+    bounded,
+    scrub,
+    scrub_counted,
+    scrub_parts,
+    scrub_parts_counted,
+)
 from basecradle_harness._report import (
     BILLING,
     OUTAGE,
@@ -3113,7 +3119,7 @@ class WakeAgent:
         self._model_ok()
         return narration
 
-    def _unspoken(self, text: str) -> None:
+    def _unspoken(self, text: str, *, continued: tuple[str, ...] = ()) -> None:
         """Journal a turn's final text — the Unspoken Channel's one delivery point (issue #293).
 
         This is where the auto-post used to be, and the swap is the whole design: what was
@@ -3124,7 +3130,13 @@ class WakeAgent:
         The three endings a turn can have are labelled, because they read nothing alike to whoever
         (or whatever) reconstructs this later: an ordinary `narration`, the step-cap's self-authored
         `reserve` report, and the `stuck` note when even that failed.
+
+        A resume's reply that picks up a cut-off text (``continued``, `Session.continued`) is
+        journaled as its share of the one redaction of the whole reply (issue #1020): a secret the
+        cut fell inside keeps none of its tail here. The line's own scrub then finds nothing more.
         """
+        if continued:
+            text = scrub_parts([*continued, text])[-1]
         log_unspoken(text, timeline=self.timeline_uuid, kind=self._narration_kind())
 
     def _narration_kind(self) -> str:
@@ -3373,6 +3385,7 @@ class WakeAgent:
         kind: str | None = None,
         cut_off: bool = False,
         resumed: bool = False,
+        continued: tuple[str, ...] = (),
     ) -> None:
         """Hand a completed exchange to the memory provider's `observe` hook, guarded.
 
@@ -3407,6 +3420,13 @@ class WakeAgent:
           unfinished, and ``resumed`` when it is a resume's continuation of a turn an earlier
           exchange of the same item may have begun. With ``kind``, the provider can hold a cut-off
           reply until the resume finishes it, and ask `_resume_window` whether one still can.
+
+        - **A resume's reply is redacted with the text it continues** (``continued``, issue #1020):
+          the pieces of a reply cut off at its output budget, which the session still holds
+          (`Session.continued`). They are one reply, so they are redacted as one text
+          (`_redaction.scrub_parts`), and a secret the cut fell inside keeps no part in the reply
+          handed over. The share of the piece just before the cut goes with it
+          (`MemoryExchange.continues`), for a provider that holds the words written before it.
 
         - **A marked real wake is not handed to memory at all** (``marked``, issue #950): the NOC's
           own verification wake, recognised by a verified `BCNOC2` marker bound to this timeline and
@@ -3446,7 +3466,14 @@ class WakeAgent:
             # stays, and the rest is filed. Before any provider sees the exchange, so before it is
             # split into drawers or written under `conversations/`.
             user, from_user = scrub_counted(user)
-            assistant, from_assistant = scrub_counted(assistant)
+            continues = None
+            if continued and assistant:
+                pieces, counts = scrub_parts_counted(
+                    [*(strip_injected(text) for text in continued), assistant]
+                )
+                assistant, from_assistant, continues = pieces[-1], counts[-1], pieces[-2]
+            else:
+                assistant, from_assistant = scrub_counted(assistant)
             if task_instructions is not None:
                 task_instructions, _ = scrub_counted(task_instructions)
         except Exception:  # noqa: BLE001 - an exchange that cannot be redacted is never filed
@@ -3475,6 +3502,7 @@ class WakeAgent:
                     cut_off=cut_off,
                     # A degraded resume wrote none of the model's words, so nothing continued it.
                     resumed=resumed and not self._degraded,
+                    continues=continues,
                 )
             )
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake; swallow it
@@ -4294,7 +4322,10 @@ class WakeAgent:
             except EngineError as error:
                 narration = self._stuck_note(error)
             self._model_ok()  # a call got through → clear any billing-blocked marker (issue #336)
-            self._unspoken(narration)
+            # The text a cut-off turn had written, which this resume's reply picks up from (issue
+            # #1020): the reply is redacted with it, as one text, everywhere it is written below.
+            continued = () if self._degraded else session.continued
+            self._unspoken(narration, continued=continued)
             truncated_turn = self._turn_truncated(kind=kind, item=uuid)
             # A resumed **message** turn is mined from `rendered`, not from the item: the dead
             # wake's turn may have carried a *batch* (`_render_batch`), and mining the one item
@@ -4309,6 +4340,7 @@ class WakeAgent:
                 kind=kind,
                 cut_off=truncated_turn,
                 resumed=True,
+                continued=continued,
             )
             if truncated_turn:
                 # The continuation was itself cut off (issue #490). The turn is still unfinished, so

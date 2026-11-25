@@ -7,6 +7,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.216.0] - 2026-11-25
+
+### Fixed: a secret a cut-off reply's cut fell inside is redacted as one text with its resume (issue #1020)
+
+A reply cut off at its output budget is resumed (issue #490), and the wake redacted the fragment and the continuation one at a time. A secret the cut fell inside was then in neither: its opening could match a shape and be blanked while the rest opened the continuation, where no shape recognizes it, and was written as it stood, in the transcript, the resume's journal line and the exchange handed to memory. The one definition of a secret (issue #999) was applied to two texts where there is one reply.
+
+- **One redaction of a text held in pieces** (`_redaction.scrub_parts`): the rules read the pieces joined, each redaction is written once, in the piece where it starts, and what it took from the pieces after is gone from them. Every piece's own reading is taken too, so no piece is redacted less than it would be alone (a key glued to the last word of the piece before reads as a word when joined). One piece is `scrub` exactly.
+- **The transcript** redacts every reply it holds in pieces (an assistant text, the truncation note, and the turn's next assistant text, with only system turns between) as one text on every save (`_session.reply_pieces`).
+- **The resume's journal line and its exchange** are redacted with the pieces the session holds of the reply it continues (`Session.continued`): the raw fragment in the wake that cut it off, and the fragment as the transcript kept it in a later wake.
+- **`MemoryExchange` gains `continues`**: for a resumed exchange that picks up a cut text, the last words before the cut as the one redaction left them. The `mempalace` adapter puts them in place of the words its held record ended on (the record's new `tail`, added within format 2: 0.215.0 ignores it), and no longer redacts across the seam itself, so the wake is the one owner of the redaction memory is handed. `mempalace-previous` files each exchange as it comes and ignores it.
+- **Proven per registered shape**: every vendor-key prefix, every label family, the heartbeat URL and a configured value, each cut at four points inside the secret, through a real wake, with nothing it wrote holding the tail; each write path's wiring removed in turn makes it fail.
+
 ## [0.215.0] - 2026-11-25
 
 ### Changed: the `mempalace` adapter holds a reply cut off at its output budget until its resume finishes it (issue #1011)
