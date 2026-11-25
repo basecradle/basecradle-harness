@@ -95,6 +95,7 @@ import logging
 import time
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from basecradle_harness._exchange_records import (
@@ -134,6 +135,7 @@ from basecradle_harness._mempalace import (
 )
 from basecradle_harness._near_copy import near_copy
 from basecradle_harness._observability import kv, tool_failed
+from basecradle_harness._redaction import scrub
 from basecradle_harness._rerank import SURFACE_TOOL, SURFACE_TURN0, MemPalaceReranker
 from basecradle_harness._tools import Tool
 
@@ -276,12 +278,37 @@ class MemPalaceProvider(MemPalaceMemoryProvider):
         if not exchange.resumed:
             self._log(held, result=_HELD, reason=_CUT_OFF)
             return
-        whole = continued(held, exchange.assistant, cut_off=exchange.cut_off)
+        whole = self._across_the_cut(held, exchange.assistant, cut_off=exchange.cut_off)
+        if whole is None:
+            return
         self.records.write(whole)
         if whole.cut_off:
             self._log(whole, result=_HELD, reason=_CUT_OFF)
             return
         self._settle(whole)
+
+    def _across_the_cut(self, held: Record, continuation: str, *, cut_off: bool) -> Record | None:
+        """``held`` completed by ``continuation`` (`continued`), redacted across the cut.
+
+        The wake redacted the fragment and the continuation one at a time (issue #999), so a secret
+        the cut split in two is in neither scrub, and joining them would file it whole. So the two
+        are scrubbed again as the model wrote them, run together: anything that finds was across the
+        cut, and the record then takes that text, the secret blanked and no line break at the seam.
+        If the redaction cannot run, nothing is written and the record stays held as it was.
+        """
+        try:
+            run_together = held.assistant + continuation
+            seamless = scrub(run_together)
+        except Exception:  # noqa: BLE001 - an exchange that cannot be redacted is never filed
+            _log.warning(
+                "memory %s",
+                kv(op="observe", provider=self.name, result="skipped", reason="redaction_failed"),
+                exc_info=True,
+            )
+            return None
+        if seamless != run_together:
+            return replace(held, assistant=seamless, cut_off=cut_off)
+        return continued(held, continuation, cut_off=cut_off)
 
     def _settle(self, record: Record) -> str:
         """File a record that was held: the door rule first, now that its reply can be judged.
@@ -456,6 +483,11 @@ class MemPalaceProvider(MemPalaceMemoryProvider):
                 counts["unreadable"] += 1
                 continue
             if record is None or record.filed:
+                continue
+            if record.skipped is not None:
+                # Set aside by the door and killed before its marker went: finish that, never file.
+                self.records.set_aside(record, record.skipped)
+                counts[_NEAR_COPY] += 1
                 continue
             if record.cut_off:
                 if self._resumable(record):

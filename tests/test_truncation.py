@@ -998,8 +998,38 @@ def test_the_resume_window_is_open_exactly_while_the_claim_is_in_flight(platform
     second.wake()
 
     assert second._resume_window(TIMELINE_UUID, M0, "messages") is False  # committed
+
+
+def test_the_resume_window_closes_when_an_in_flight_claim_is_abandoned(platform, tmp_path):
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    agent, _ = build_wake(tmp_path, _CutOffThenDown())
+    agent.wake()
+    assert agent._resume_window(TIMELINE_UUID, M0, "messages") is True
+
     ClaimStore(tmp_path).abandon(TIMELINE_UUID, M0, kind="messages", reason="stalled")
-    assert second._resume_window(TIMELINE_UUID, M0, "messages") is False
+
+    assert agent._resume_window(TIMELINE_UUID, M0, "messages") is False
+
+
+def test_a_provider_that_refuses_the_resume_window_still_begins_its_wake(platform, tmp_path):
+    class _Slotted(MemoryProvider):
+        __slots__ = ("began",)
+
+        def __init__(self):
+            self.began = 0
+
+        @property
+        def resumable(self):
+            return None
+
+        def begin_wake(self):
+            self.began += 1
+
+    serve_messages(platform, page())
+    memory = _Slotted()
+    build_wake(tmp_path, _Finishes(), memory_provider=memory)[0].wake()
+
+    assert memory.began == 1
 
 
 def test_the_guarantee_covers_every_kind_not_just_messages(platform, tmp_path):

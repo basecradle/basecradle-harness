@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -772,3 +773,64 @@ def test_the_previous_adapter_files_a_cut_off_reply_and_its_resume_as_it_always_
     texts = [drawer["text"] for drawer in convo_miner.filed]
     assert len(texts) == 2
     assert FRAGMENT in texts[0] and REST in texts[1] and FRAGMENT not in texts[1]
+
+
+def test_a_secret_the_cut_split_in_two_is_blanked_when_the_halves_are_joined(
+    provider, fake_mempalace
+):
+    """Each half was redacted alone by the wake, and neither half alone is a key."""
+    convo_miner, _ = fake_mempalace
+    provider.observe(_cut(assistant="the token is ghp_AbCdEf1234"))
+
+    provider.observe(_resume(assistant="GhIjKlMn5678 so use it."))
+
+    (drawer,) = convo_miner.filed
+    assert "AbCdEf1234" not in drawer["text"] and "GhIjKlMn5678" not in drawer["text"]
+    assert "the token is [redacted] so use it." in drawer["text"]
+    assert "AbCdEf" not in provider.records.path(TIMELINE, M0).read_text()
+
+
+def test_a_redaction_that_cannot_run_across_the_cut_writes_nothing(
+    provider, fake_mempalace, monkeypatch
+):
+    convo_miner, _ = fake_mempalace
+    provider.observe(_cut())
+    before = provider.records.path(TIMELINE, M0).read_bytes()
+
+    def broken(text):
+        raise RuntimeError("the redaction failed")
+
+    monkeypatch.setattr(_mempalace_provider, "scrub", broken)
+    provider.observe(_resume())
+
+    assert convo_miner.filed == []
+    assert provider.records.path(TIMELINE, M0).read_bytes() == before
+
+
+def test_a_record_set_aside_by_a_wake_killed_before_its_marker_went_is_never_filed(
+    provider, fake_mempalace
+):
+    convo_miner, _ = fake_mempalace
+    held = _exchange_records.new_record(
+        timeline=TIMELINE, item=T1, agent="nova", user="task", assistant="reply", kind=_TASKS
+    )
+    provider.records.write(replace(held, skipped="near_copy"))  # marker kept
+    assert provider.records.unfiled() == [(TIMELINE, T1)]
+
+    provider.begin_wake()
+
+    assert convo_miner.filed == [] and provider.records.unfiled() == []
+    assert provider.records.read(TIMELINE, T1).skipped == "near_copy"
+
+
+def test_a_format_one_record_is_read_and_a_new_one_is_written_as_format_two(tmp_path):
+    store = RecordStore(tmp_path / "records")
+    record = _exchange_records.new_record(
+        timeline=TIMELINE, item=M0, agent="nova", user="hi", assistant="hello"
+    )
+    assert json.loads(record.to_bytes())["format"] == _exchange_records.RECORD_FORMAT == 2
+    raw = json.loads(record.to_bytes())
+    raw["format"] = 1
+    store._write(store.path(TIMELINE, M0), json.dumps(raw).encode())
+
+    assert store.read(TIMELINE, M0).assistant == "hello"

@@ -3333,6 +3333,9 @@ class WakeAgent:
             return
         try:
             self.memory_provider.resumable = self._resume_window
+        except Exception:  # noqa: BLE001 - a provider that refuses the attribute still begins its wake
+            _log.warning("Memory provider refused the resume window; continuing.", exc_info=True)
+        try:
             self.memory_provider.begin_wake()
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake
             _log.warning("Memory provider begin_wake() failed; continuing.", exc_info=True)

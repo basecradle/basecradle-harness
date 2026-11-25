@@ -99,7 +99,7 @@ class MemoryExchange:
             recurring tasks on them (the MemPalace adapter's door rule): a recurring task on this
             platform is a new task with the same instructions each time it fires.
         kind: Which kind of platform item ``item`` is, in the wake's own words (``messages``,
-            ``assets``, ``webhooks``, ``tasks``). ``None`` when the exchange answered no item. It is
+            ``assets``, ``webhook_events``, ``tasks``). ``None`` when the exchange answered no item. It is
             what a provider hands back to `MemoryProvider.resumable` to ask whether a turn cut off
             at its output budget can still be resumed.
         cut_off: ``True`` when the reply was cut off at the output budget, so the turn is unfinished

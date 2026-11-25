@@ -62,10 +62,18 @@ from pathlib import Path
 
 from basecradle_harness._near_copy import normalize
 
-#: The version of the record's own format. A field may be added without changing it, with a default
-#: that means what a record written before the field meant; a field is never renamed or repurposed
-#: without changing it. A reader refuses a version it does not know rather than guess at its fields.
-RECORD_FORMAT = 1
+#: The version of the record's own format. A field is added, never renamed or repurposed, without
+#: changing it; a reader refuses a version it does not know rather than guess at its fields.
+#:
+#: 2 (issue #1011, the capital's decision of 2026-11-25): ``kind``, ``cut_off`` and ``skipped``. An
+#: unfiled record that is ``cut_off`` must not be filed while its turn can still be resumed, which a
+#: format-1 reader would do, so the version moved: a harness that reads only format 1 counts a
+#: format-2 record unreadable and keeps its marker, and its scrub and prune hold it. A format-1
+#: record reads as one with none of the three fields.
+RECORD_FORMAT = 2
+
+#: Every format this harness reads.
+READABLE_FORMATS = frozenset({1, 2})
 
 #: The one line a reply cut off at its output budget is filed with when no resume ever finished it
 #: (issue #1011, the capital's decision of 2026-11-25), after the reply's own words, where recall
@@ -217,7 +225,7 @@ class Record:
             raw = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError(f"not a record: {error}") from error
-        if not isinstance(raw, dict) or raw.get("format") != RECORD_FORMAT:
+        if not isinstance(raw, dict) or raw.get("format") not in READABLE_FORMATS:
             raise ValueError("not a record of a format this harness reads")
         try:
             record = cls(
@@ -262,9 +270,12 @@ def exchange_text(record: Record) -> str:
 def continued(record: Record, continuation: str, *, cut_off: bool) -> Record:
     """``record`` with a resume's ``continuation`` added after its reply, and ``cut_off`` as given.
 
-    The reply so far, a line break, then the continuation: the model was told to continue from
-    where its text stops, and a line break joins the two without running a cut word into the next
-    one. An empty side adds nothing. The record keeps every word it had.
+    The reply so far, a line break, then the continuation. A cut usually falls at the end of a word
+    (a model's tokens mostly carry their own leading space), and a continuation starts its first
+    word without one, so the two run together would make one word of two; a line break keeps every
+    word as the model wrote it. A word the cut did split stays in its two halves. An empty side adds
+    nothing. The record keeps every word it had. (A secret the cut split is the one exception, joined
+    without the break so it can be blanked: `_mempalace_provider.MemPalaceProvider._across_the_cut`.)
     """
     return replace(record, assistant=_joined(record.assistant, continuation), cut_off=cut_off)
 
