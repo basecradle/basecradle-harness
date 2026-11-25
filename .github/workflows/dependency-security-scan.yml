@@ -7,6 +7,10 @@ name: Dependency Security Scan
 # carries needs-human, which pages @origin through the needs-human alert stub (his ruling,
 # 2026-11-05, basecradle#750); anything lower carries needs-capital. No model is called.
 #
+# Beside osv-scanner, the same script reads every release uv.lock pins from PyPI against
+# PyPI's own record and files a yanked one on the same issue, unrated (issue #1015): a yank
+# carries no advisory, so osv-scanner is silent on it.
+#
 # The decisions live in scripts/dependency_security_scan.py, with tests. This file only
 # runs it and applies its plan. The capital's workflow of the same name is the model, by
 # way of basecradle-python's port.

@@ -10,7 +10,10 @@ Dependabot does not move a transitive pin. The first reading of ``uv.lock`` foun
 advisories against twelve packages, two Critical ones among the transitive pins alone
 (#817). The capital learned the same lesson on 2026-11-04, when a Rails security release
 went unnoticed for 23 hours (basecradle#750). This is the clock: ``osv-scanner`` against
-``uv.lock``, every day, against ``main``.
+``uv.lock``, every day, against ``main``. Beside it, on the same clock and the same route,
+every locked PyPI release's ``yanked`` flag, read from PyPI's own record (issue #1015): a
+yanked release carries no advisory, so ``osv-scanner`` is silent on it, and ``uv.lock`` held
+``av`` 18.1.0, yanked for a double free, with nothing to say so.
 
 The decisions are a port of the capital's ``lib/dependency_security_scan.rb``, by way of
 the Python SDK's port (basecradle-python#317), kept in its shape and its wording so that
@@ -31,6 +34,11 @@ import os
 import re
 import subprocess
 import sys
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, replace
@@ -49,7 +57,10 @@ PAGING_LABEL = "needs-human"
 INBOX_LABEL = "needs-capital"
 
 SEVERITY_ORDER = ("critical", "high", "medium", "moderate", "low", "none", "unknown")
-ECOSYSTEM_NAMES = {"pypi": "Python package"}
+# A scanner's key is its findings' ecosystem: what a failed scanner's earlier findings are
+# carried forward by, so the yanked-release check and osv-scanner never vouch for each other.
+YANKED = "pypi-yanked"
+ECOSYSTEM_NAMES = {"pypi": "Python package", YANKED: "Yanked Python release"}
 
 # The only authors whose issues are the scan's own. This repository is public, so anyone
 # can open an issue with the scan's title and a marker of their choosing; one the scan did
@@ -491,7 +502,7 @@ class DependencySecurityScan:
 {self._carried_note(carried)}
 ## What Happens Next
 
-The fix is the `security-scan-bump` skill: a bump on its own branch to the minimum version that resolves the advisory (`uv lock --upgrade-package <package>==<fixed version>`), then the Critical and High advisories read against the harness on this issue. `uv.lock` pins this repository's CI and development environment, not what a user or the fleet installs, so a lock bump needs no release; an advisory whose fix sits outside a range in `pyproject.toml` (a floor below it, a cap above it) needs that range moved, which ships in a release and reaches the fleet only when the NOC converges it. An advisory that does not apply here is dismissed in `osv-scanner.toml` (`[[IgnoredVulns]]`, with its reason). Closing this issue dismisses nothing: while an advisory stands, the next scan files a new issue.
+The fix is the `security-scan-bump` skill: a bump on its own branch to the minimum version that resolves the advisory (`uv lock --upgrade-package <package>==<fixed version>`), then the Critical and High advisories read against the harness on this issue. `uv.lock` pins this repository's CI and development environment, not what a user or the fleet installs, so a lock bump needs no release; an advisory whose fix sits outside a range in `pyproject.toml` (a floor below it, a cap above it) needs that range moved, which ships in a release and reaches the fleet only when the NOC converges it. An advisory that does not apply here is dismissed in `osv-scanner.toml` (`[[IgnoredVulns]]`, with its reason). A yanked release is listed as an advisory of its own, titled with the reason PyPI gives for the yank; it has no dismissal, and the fix is a bump off it. Closing this issue dismisses nothing: while an advisory stands, the next scan files a new issue.
 
 ## How This Was Routed
 
@@ -684,7 +695,133 @@ def scan_pypi(root: Path) -> list[Advisory]:
     return parse_osv_scanner(process.stdout, process.returncode)
 
 
-SCANNERS: dict[str, Callable[[Path], list[Advisory]]] = {"pypi": scan_pypi}
+# --- yanked releases (issue #1015) ------------------------------------------------------
+#
+# PyPI yanks a release (PEP 592) when it should not be installed, and says why; a resolver
+# then skips it unless it is pinned exactly, which is what a lockfile does. No advisory
+# database carries a yank, so this reads PyPI's own record of every release the lock pins.
+# Standard library only and reading nothing but ``uv.lock`` and PyPI, so another Python
+# repository's scan takes it as it stands.
+
+PYPI_INDEX = "https://pypi.org/simple"
+PYPI_RELEASE = "https://pypi.org/pypi/{name}/{version}/json"
+# A generic client name: the request says what reads PyPI, never whose repository it is.
+USER_AGENT = "dependency-security-scan (yanked-release check)"
+READ_ATTEMPTS = 3
+READ_TIMEOUT = 30
+
+
+def locked_releases(lock: str) -> list[tuple[str, str]]:
+    """Every ``(name, version)`` ``uv.lock`` pins from PyPI, each fork's version apart.
+
+    A package from no index (the project itself, a path, a git checkout) is no release
+    PyPI could have yanked. One from an index other than PyPI cannot be read here, so it
+    is no verdict, never a pass."""
+    try:
+        packages = tomllib.loads(lock).get("package")
+    except tomllib.TOMLDecodeError as error:
+        raise ScanError(f"uv.lock could not be read: {error}") from None
+    if not isinstance(packages, list) or not all(isinstance(p, dict) for p in packages):
+        raise ScanError("uv.lock holds no package list this check can read")
+
+    releases = set()
+    for entry in packages:
+        name, version, source = entry.get("name"), entry.get("version"), entry.get("source")
+        if not isinstance(name, str) or not name or not isinstance(source, dict):
+            raise ScanError("uv.lock holds a package this check cannot read")
+        if "registry" not in source:
+            continue
+        if source["registry"] != PYPI_INDEX:
+            raise ScanError(f"{name} is locked from an index this check cannot read")
+        if not isinstance(version, str) or not version:
+            raise ScanError(f"uv.lock pins {name} from PyPI with no version")
+        releases.add((name, version))
+    return sorted(releases)
+
+
+def read_release(name: str, version: str) -> dict[str, Any]:
+    """PyPI's JSON record of one release. A transient failure (a 429, a 5xx, the network) is
+    tried again, a bounded number of times; anything else, and a read that never succeeds,
+    is no verdict."""
+    url = PYPI_RELEASE.format(
+        name=urllib.parse.quote(name, safe=""), version=urllib.parse.quote(version, safe="")
+    )
+    request = urllib.request.Request(
+        url, headers={"Accept": "application/json", "User-Agent": USER_AGENT}
+    )
+    attempt = 1
+    while True:
+        try:
+            with urllib.request.urlopen(request, timeout=READ_TIMEOUT) as response:
+                record = json.load(response)
+            if not isinstance(record, dict):
+                raise ScanError(f"PyPI's record of {name} {version} is not an object")
+            return record
+        except urllib.error.HTTPError as error:
+            error.close()
+            transient = error.code == 429 or error.code >= 500
+            failure = f"PyPI answered {error.code} for {name} {version}"
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            transient = True
+            failure = f"PyPI could not be read for {name} {version}: {type(error).__name__}"
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            transient = False
+            failure = f"PyPI's record of {name} {version} is not JSON"
+        if not transient or attempt == READ_ATTEMPTS:
+            raise ScanError(failure)
+        time.sleep(2**attempt)
+        attempt += 1
+
+
+def yanked_release(name: str, version: str, record: dict[str, Any]) -> Advisory | None:
+    """A finding when PyPI's record says the release is yanked, titled with PyPI's reason.
+
+    Unrated, because a yank carries no rating: it goes to the capital's inbox, as an
+    unrated advisory does, and pages nobody."""
+    info = record.get("info")
+    yanked = info.get("yanked") if isinstance(info, dict) else None
+    if not isinstance(yanked, bool):
+        raise ScanError(f"PyPI's record of {name} {version} does not say whether it is yanked")
+    if not yanked:
+        return None
+    # The reason whole, on one line: it is PyPI's words, not a document with headings.
+    stated = info.get("yanked_reason")
+    reason = " ".join(stated.split()) if isinstance(stated, str) else ""
+    if reason and len(reason) > TITLE_LIMIT:
+        reason = reason[: TITLE_LIMIT - 1].rstrip() + "…"
+    advisory_id = f"yanked-{version}"
+    return Advisory(
+        ecosystem=YANKED,
+        package=name,
+        affected=version,
+        id=advisory_id,
+        severity="unknown",
+        title=reason or "Yanked on PyPI, with no reason given",
+        url=(
+            f"https://pypi.org/project/{urllib.parse.quote(name, safe='')}/"
+            f"{urllib.parse.quote(version, safe='')}/"
+        ),
+        aliases=(advisory_id,),
+    )
+
+
+def scan_yanked(
+    root: Path, read: Callable[[str, str], dict[str, Any]] = read_release
+) -> list[Advisory]:
+    """Every release ``uv.lock`` pins from PyPI that PyPI has yanked."""
+    try:
+        lock = (root / "uv.lock").read_text()
+    except OSError as error:
+        raise ScanError(f"uv.lock could not be read: {type(error).__name__}") from None
+    findings = []
+    for name, version in locked_releases(lock):
+        finding = yanked_release(name, version, read(name, version))
+        if finding is not None:
+            findings.append(finding)
+    return findings
+
+
+SCANNERS: dict[str, Callable[[Path], list[Advisory]]] = {"pypi": scan_pypi, YANKED: scan_yanked}
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -15,6 +15,15 @@ PyPI yanked `av` 18.1.0 with the reason *"Memory corruption (double free) when d
 
 - **The floor is now `av>=18.1.1,<19`**, and `uv.lock` locks 18.1.1; no other package moved. A floor and not only a lock, because an installed 18.1.0 satisfies `>=18`: a release with the old range would have left every deployed venv on the yanked release.
 
+### Added: the daily dependency scan reads every locked release's yanked flag (issue #1015)
+
+Nothing caught the yanked `av` release. A yank carries no advisory, so the daily `osv-scanner` reading of `uv.lock` (issue #816) was silent on it, and Dependabot's seven-day wait held 18.1.1 back. Approved by the capital as an addition, because the problem had happened. This is repository tooling and changes nothing a user or an agent installs.
+
+- **`scripts/dependency_security_scan.py` gains a second scanner, `pypi-yanked`**, on the same daily clock. It reads every release `uv.lock` pins from PyPI against PyPI's own JSON record (`/pypi/<package>/<version>/json`, `info.yanked`). A yanked one is filed on the same `[SECURITY]` issue as an advisory, unrated so it goes to `needs-capital`, with the id `yanked-<version>`, a link to the release on PyPI, and PyPI's stated reason as its title.
+- **A read that fails is never a clean result.** A 429, a 5xx or a network failure is read again, three attempts in all; a 404, an answer that is not a record, a record that does not say whether the release is yanked, a lock it cannot parse, or a package locked from another index is no verdict, filed as the scan's *Could Not Reach a Verdict* issue under its own name. A failure of either scanner carries only that scanner's earlier findings forward.
+- **Shaped for another Python repository to take as it stands**: standard library only, reading nothing but `uv.lock` and PyPI.
+- **Proven both ways against live PyPI**: on `main`'s lock before the `av` bump it names `av 18.1.0` with PyPI's reason; on the bumped lock it reads all 115 PyPI releases and finds none.
+
 ## [0.213.0] - 2026-11-23
 
 ### Added: a new MemPalace adapter that files under a BaseCradle name, keeps its own record, and stamps nothing (issue #1011)

@@ -5,7 +5,9 @@ The workflow (``.github/workflows/dependency-security-scan.yml``) only applies t
 these decisions produce, so this file is where the rules are pinned: one issue and never a
 second, High and Critical page and nothing else does, a scan that cannot reach a verdict
 never reads as clean, and nothing upstream can break the issue, pose as its marker, or
-mention a stranger. A port of the capital's ``test/lib/dependency_security_scan_test.rb``,
+mention a stranger. Beside ``osv-scanner``, the yanked-release check (issue #1015): a locked
+release PyPI has yanked is a finding, on the same route, and a read of PyPI that fails is
+never a clean result. A port of the capital's ``test/lib/dependency_security_scan_test.rb``,
 test for test, plus what reading ``osv-scanner`` adds.
 """
 
@@ -39,6 +41,21 @@ DependencySecurityScan = scan_module.DependencySecurityScan
 Plan = scan_module.Plan
 ScanError = scan_module.ScanError
 parse_osv_scanner = scan_module.parse_osv_scanner
+YANKED = scan_module.YANKED
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reads PyPI: the yanked-release check finds nothing unless a test says
+    otherwise, and a read that slips past it fails loudly instead of reaching the network."""
+    monkeypatch.setitem(scan_module.SCANNERS, YANKED, lambda root: [])
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a test reached for the network")
+
+    monkeypatch.setattr(scan_module.urllib.request, "urlopen", refuse)
+
 
 # --- helpers ---------------------------------------------------------------------------
 
@@ -839,6 +856,278 @@ def test_the_marker_cannot_close_its_own_comment() -> None:
     assert marker.count("-->") == 1
     assert marker.endswith(" -->")
     assert scan_module._state_in(marker) == {"advisories": {"pypi:x:-->": "high"}}
+
+
+# --- yanked releases (issue #1015) -----------------------------------------------------
+
+LOCK = """version = 1
+revision = 5
+requires-python = ">=3.11"
+
+[[package]]
+name = "av"
+version = "18.1.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "basecradle-harness"
+source = { editable = "." }
+
+[[package]]
+name = "numpy"
+version = "2.3.5"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = ["python_full_version >= '3.14'"]
+
+[[package]]
+name = "numpy"
+version = "2.2.6"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "vendored"
+version = "0.1.0"
+source = { git = "https://example.com/vendored.git?rev=main#0123abc" }
+"""
+
+AV_REASON = (
+    "Memory corruption (double free) when decoding audio with custom channel layouts. "
+    "Upgrade to 18.1.1"
+)
+
+
+def release_record(yanked: Any, reason: Any = None) -> dict[str, Any]:
+    return {"info": {"name": "av", "version": "18.1.0", "yanked": yanked, "yanked_reason": reason}}
+
+
+def test_every_release_the_lock_pins_from_pypi_is_read_each_fork_apart() -> None:
+    assert scan_module.locked_releases(LOCK) == [
+        ("av", "18.1.0"),
+        ("numpy", "2.2.6"),
+        ("numpy", "2.3.5"),
+    ], "the project itself and a git checkout are no release PyPI could have yanked"
+
+
+def test_this_repositorys_own_lock_is_one_the_check_can_read() -> None:
+    lock = (REPO_ROOT / "uv.lock").read_text()
+    releases = scan_module.locked_releases(lock)
+
+    assert len(releases) == lock.count('source = { registry = "https://pypi.org/simple" }')
+    assert len(releases) > 100
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        "this is = not [ toml",
+        "version = 1\n",
+        '[[package]]\nname = "x"\nversion = "1.0"\nsource = { registry = "https://mirror.example.com/simple" }\n',
+        '[[package]]\nname = "x"\nsource = { registry = "https://pypi.org/simple" }\n',
+        '[[package]]\nversion = "1.0"\nsource = { registry = "https://pypi.org/simple" }\n',
+    ],
+    ids=["not-toml", "no-packages", "another-index", "no-version", "no-name"],
+)
+def test_a_lock_the_check_cannot_read_is_no_verdict_never_a_pass(lock: str) -> None:
+    with pytest.raises(ScanError):
+        scan_module.locked_releases(lock)
+
+
+def test_a_yanked_release_is_a_finding_titled_with_pypis_reason() -> None:
+    finding = scan_module.yanked_release("av", "18.1.0", release_record(True, AV_REASON))
+
+    assert finding == Advisory(
+        ecosystem=YANKED,
+        package="av",
+        affected="18.1.0",
+        id="yanked-18.1.0",
+        severity="unknown",
+        title=AV_REASON,
+        url="https://pypi.org/project/av/18.1.0/",
+        aliases=("yanked-18.1.0",),
+    )
+    assert not finding.pages, "a yank carries no rating, so it goes to the capital's inbox"
+
+
+def test_a_release_that_is_not_yanked_is_no_finding() -> None:
+    assert scan_module.yanked_release("av", "18.1.1", release_record(False)) is None
+
+
+def test_a_yank_with_no_reason_says_so_and_a_long_one_is_a_table_cell() -> None:
+    bare = scan_module.yanked_release("av", "18.1.0", release_record(True, ""))
+    long = scan_module.yanked_release("av", "18.1.0", release_record(True, "a\n\n# b " * 200))
+
+    assert bare is not None and bare.title == "Yanked on PyPI, with no reason given"
+    assert long is not None and "\n" not in long.title
+    assert long.title.startswith("a # b") and long.title.endswith("…")
+    assert len(long.title) <= scan_module.TITLE_LIMIT
+
+
+@pytest.mark.parametrize(
+    "record",
+    [{}, {"info": None}, {"info": {}}, release_record("true"), release_record(None)],
+    ids=["no-info", "null-info", "no-flag", "string-flag", "null-flag"],
+)
+def test_a_record_that_does_not_say_whether_it_is_yanked_is_no_verdict(
+    record: dict[str, Any],
+) -> None:
+    with pytest.raises(ScanError, match="does not say whether it is yanked"):
+        scan_module.yanked_release("av", "18.1.0", record)
+
+
+def test_the_check_names_each_yanked_release_in_the_lock(tmp_path: Path) -> None:
+    (tmp_path / "uv.lock").write_text(LOCK)
+    asked = []
+
+    def read(name: str, version: str) -> dict[str, Any]:
+        asked.append((name, version))
+        return release_record((name, version) == ("av", "18.1.0"), AV_REASON)
+
+    findings = scan_module.scan_yanked(tmp_path, read=read)
+
+    assert asked == [("av", "18.1.0"), ("numpy", "2.2.6"), ("numpy", "2.3.5")]
+    assert [(f.key, f.title) for f in findings] == [("pypi-yanked:av:yanked-18.1.0", AV_REASON)]
+
+
+def test_a_read_that_fails_stops_the_check_it_never_skips_a_release(tmp_path: Path) -> None:
+    (tmp_path / "uv.lock").write_text(LOCK)
+
+    def read(name: str, version: str) -> dict[str, Any]:
+        if name == "numpy":
+            raise ScanError("PyPI answered 404 for numpy 2.2.6")
+        return release_record(False)
+
+    with pytest.raises(ScanError, match="404"):
+        scan_module.scan_yanked(tmp_path, read=read)
+
+
+def test_no_lock_is_no_verdict(tmp_path: Path) -> None:
+    with pytest.raises(ScanError, match="uv.lock could not be read"):
+        scan_module.scan_yanked(tmp_path, read=lambda name, version: release_record(False))
+
+
+class _Response:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self, *args: Any) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_Response":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def _http_error(code: int) -> Exception:
+    return scan_module.urllib.error.HTTPError(
+        "https://pypi.org/pypi/av/18.1.0/json", code, "status", None, None
+    )
+
+
+def _pypi_answers(monkeypatch: pytest.MonkeyPatch, *answers: Any) -> list[Any]:
+    """PyPI answers each read in turn: an exception is raised, bytes are the body."""
+    requests: list[Any] = []
+    pending = list(answers)
+
+    def urlopen(request: Any, timeout: float) -> _Response:
+        requests.append(request)
+        answer = pending.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return _Response(answer)
+
+    monkeypatch.setattr(scan_module.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(scan_module.time, "sleep", lambda seconds: None)
+    return requests
+
+
+def test_the_record_read_is_pypis_own_for_that_exact_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _pypi_answers(monkeypatch, json.dumps(release_record(True, AV_REASON)).encode())
+
+    assert scan_module.read_release("av", "18.1.0") == release_record(True, AV_REASON)
+    request = sole(requests)
+    assert request.full_url == "https://pypi.org/pypi/av/18.1.0/json"
+    assert request.get_header("User-agent") == scan_module.USER_AGENT
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [
+        _http_error(503),
+        _http_error(429),
+        scan_module.urllib.error.URLError("reset"),
+        TimeoutError(),
+    ],
+    ids=["5xx", "429", "network", "timeout"],
+)
+def test_a_transient_failure_is_read_again(
+    monkeypatch: pytest.MonkeyPatch, transient: Exception
+) -> None:
+    requests = _pypi_answers(monkeypatch, transient, json.dumps(release_record(False)).encode())
+
+    assert scan_module.read_release("av", "18.1.1") == release_record(False)
+    assert len(requests) == 2
+
+
+def test_a_failure_that_outlasts_the_retries_is_no_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests = _pypi_answers(monkeypatch, *[_http_error(503)] * scan_module.READ_ATTEMPTS)
+
+    with pytest.raises(ScanError, match="PyPI answered 503 for av 18.1.0"):
+        scan_module.read_release("av", "18.1.0")
+    assert len(requests) == scan_module.READ_ATTEMPTS
+
+
+@pytest.mark.parametrize(
+    "answer, message",
+    [(_http_error(404), "answered 404"), (b"<html>", "is not JSON"), (b"[]", "is not an object")],
+    ids=["404", "not-json", "not-an-object"],
+)
+def test_an_answer_that_is_not_a_record_is_no_verdict_and_not_read_again(
+    monkeypatch: pytest.MonkeyPatch, answer: Any, message: str
+) -> None:
+    requests = _pypi_answers(monkeypatch, answer, json.dumps(release_record(False)).encode())
+
+    with pytest.raises(ScanError, match=message):
+        scan_module.read_release("av", "18.1.0")
+    assert len(requests) == 1
+
+
+def test_a_yanked_release_files_on_the_advisory_issue_for_the_capital_and_pages_nobody() -> None:
+    finding = scan_module.yanked_release("av", "18.1.0", release_record(True, AV_REASON))
+    plan = sole(scan_of(finding).plans([]))
+
+    assert plan.action == "create"
+    assert plan.title == ADVISORIES_TITLE
+    assert plan.labels == ["needs-capital"]
+    assert plan.body is not None
+    assert (
+        "| Unknown | Yanked Python release | `av` | `18.1.0` "
+        "| [yanked-18.1.0](https://pypi.org/project/av/18.1.0/) | Memory corruption" in plan.body
+    )
+
+
+def test_the_yanked_check_failing_carries_only_its_own_findings_forward() -> None:
+    yanked = scan_module.yanked_release("av", "18.1.0", release_record(True, AV_REASON))
+    advisory = pypi("httpx", "GHSA-1111-2222-3333", "low")
+    filed = sole(scan_of(yanked, advisory).plans([]))
+
+    plans = scan_of(errors={YANKED: "PyPI answered 503 for av 18.1.0"}).plans([open_issue(filed)])
+    update, error = plans
+
+    assert update.action == "update"
+    assert update.comment is not None and update.body is not None
+    assert "No longer reported (1):** `pypi:httpx:GHSA-1111-2222-3333`" in update.comment
+    assert '"pypi-yanked:av:yanked-18.1.0":"unknown"' in update.body
+    assert error.title == ERROR_TITLE
+    assert error.body is not None
+    assert "Yanked Python release scan:** PyPI answered 503" in error.body
+
+
+def test_both_scanners_run_on_the_daily_clock() -> None:
+    assert scan_module.SCANNERS.keys() == {"pypi", YANKED}
 
 
 # --- the plan the workflow applies -----------------------------------------------------
