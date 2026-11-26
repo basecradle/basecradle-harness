@@ -996,15 +996,18 @@ def scrub_parts_counted(parts: Sequence[str]) -> tuple[list[str], list[int]]:
     redaction leaves of it. A redaction is written once, in the **last** piece it took something
     from, and what it took from the pieces before is gone from them. ``"".join`` of the result is
     therefore the joined text redacted, and no piece keeps any part of a secret the joined text holds
-    whole. The last piece, never the first: a piece saved with a marker at its end reads, on the next
-    save, as a cut a redaction already reached (below), so a marker the joint reading wrote there
-    would take the next piece's words again on every save; written after the cut, it is read back
-    as itself.
+    whole. The last piece, never the first, and when the redaction ends exactly where that piece
+    ends, the start of the next piece that holds anything: a piece saved with a marker at its end
+    reads, on the next save, as a cut a redaction already reached (below), so a marker the joint
+    reading wrote there would take the next piece's opening words when the transcript is read back.
+    Written after the cut, it reads back as itself. Only the reply's last piece can end in one.
 
-    **Never less than each piece alone.** Joining can make a rule decline what it takes in a piece
-    (a key glued to the last word of the piece before reads as a word, `_is_word`), so every piece's
-    own spans are taken too, read where they stand in the joined text: the union `scrub` keeps among
-    its rules, kept across the pieces. One piece is `scrub_counted` exactly.
+    **Each piece's own reading is taken too.** Joining can make a rule decline what it takes in a
+    piece (a key glued to the last word of the piece before reads as a word, `_is_word`), so every
+    piece's own spans are added, read where they stand in the joined text: the union `scrub` keeps
+    among its rules, kept across the pieces. One corner stays where `scrub` itself has it: a
+    credential value read on through a marker (`_past_marker`) can end differently in the joined text
+    than in the piece, and the joined reading decides. One piece is `scrub_counted` exactly.
 
     **A piece that ends in a redaction marker is a cut the redaction already reached**
     (`_through_the_cut`): a fragment saved before its resume existed was redacted alone, so a key it
@@ -1054,7 +1057,10 @@ def scrub_parts_counted(parts: Sequence[str]) -> tuple[list[str], list[int]]:
     for start, end, marker in redactions:
         keep(pos, start)
         pieces = list(touched(start, end))
-        shares[pieces[-1]].append(marker)  # in the last piece it took from (see above)
+        target = pieces[-1]  # the last piece it took from (see above)…
+        if end == starts[target] + len(parts[target]):  # …or, ending at that piece's end, the next
+            target = next((k for k in range(target + 1, len(parts)) if parts[k]), target)
+        shares[target].append(marker)
         if whole[start:end] != marker:  # a marker already there is no new redaction
             for k in pieces:
                 counts[k] += 1

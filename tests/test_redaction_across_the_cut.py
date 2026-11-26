@@ -425,3 +425,23 @@ def test_a_reply_in_three_pieces_hands_memory_every_piece_redacted_with_the_rest
     (drawer,) = convo_miner.filed
     assert f"Here it is: \n{REDACTED}{CLOSE}" in drawer["stored"]
     assert key[:12] not in drawer["stored"] and key[12:] not in drawer["stored"]
+
+
+@pytest.mark.parametrize(
+    ("fragment", "rest"),
+    [
+        ("Call it with sk-proj-" + _RUN, "/v1/models?limit=5&page=2 to list them."),
+        ("The token ghp_" + _RUN + "Ab3Cd5Ef7Gh", ".github.io:8080 serves the docs."),
+    ],
+)
+def test_a_key_that_ends_exactly_at_the_cut_keeps_every_word_after_it(fragment, rest):
+    """A redaction that ends where a piece ends is written at the start of the next piece, so the
+    fragment's share never ends in a marker that the next reading takes as a cut inside a key
+    (review of #1020): the words after the cut survive every reload."""
+    turn = _cut_turn(fragment, rest)
+    saves = []
+    for _ in range(3):
+        saves.append(_payload(turn))
+        turn = [Message.from_dict(data) for data in json.loads(saves[-1])]
+    assert len(set(saves)) == 1
+    assert turn[5].content == REDACTED + rest and _RUN not in saves[0]
