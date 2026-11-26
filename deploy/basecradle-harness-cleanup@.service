@@ -47,9 +47,10 @@ ExecStart=/home/%i/venv/bin/basecradle-harness-cleanup --sweep
 #                               `.basecradle-env.*.tmp` it removes (it holds a live
 #                               BASECRADLE_TOKEN), and the in-place token re-mint
 #                               `_token.write_token_to_env_file` performs on a 401.
-#   /home/%i/.mempalace         ONLY its top level, for the stranded `.config.json.<hex>.tmp`
-#   /home/%i/.config/mempalace  `_mempalace._write_cli_config` leaves behind. The sweep never
-#                               walks beneath it, and the palace itself lives under harness/.
+#   /home/%i/.mempalace         ONLY the top level of each, for the stranded
+#   /home/%i/.config/mempalace  `.config.json.<hex>.tmp` `_mempalace._write_cli_config` leaves
+#                               behind. The sweep never walks beneath either, and the palace
+#                               itself lives under harness/.
 #                               The publisher writes into whichever of the two MemPalace reads
 #                               its config from (`MempalaceConfig().config_dir`, issue #1026):
 #                               ~/.mempalace where that already holds an install, as on every

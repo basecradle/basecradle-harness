@@ -2093,7 +2093,7 @@ def _publish_palace_binding(memory: MemoryProvider) -> None:
     Guarded exactly as the upgrade reconcile above is, and for the same reason: this is an operator
     convenience, so a read-only home, a full disk, or a permission error must cost the convenience
     and never the wake. Its absence is not silent — the CLI *names the path it looked at*
-    ("No palace found at ~/.mempalace/palace"), which says on its face that the publication did not
+    ("No palace found at <its config directory>/palace"), which says on its face that the publication did not
     land, and the failure is logged here besides.
 
     Deliberately **not** a `basecradle-harness-verify` claim: verify runs as the agent's own user

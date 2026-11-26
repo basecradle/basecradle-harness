@@ -19,7 +19,8 @@ The harness mirrored how MemPalace resolves its palace (`_memory_provider._palac
   - The publisher now writes into `MempalaceConfig().config_dir`, upstream's public property, still merged, never replaced (`_mempalace.cli_config_dir`). On every fleet box today that is `~/.mempalace`, where the file already exists, so nothing moves.
 - **The sweep follows the same answer.** The stranded-temp pass looks for the publisher's `.config.json.<hex>.tmp` in that directory.
   - By the capital's decision, a config directory the sweep cannot write to is named at WARNING, with the directory, the temp and the remedy, and skipped, never a failed run: MemPalace chooses the directory, so an agent can exist before its unit grants it.
-  - Where MemPalace is not installed, the pass has nothing to look at.
+  - Where MemPalace is not installed, the pass has nothing to look at. A lookup that fails any other way (upstream refused a look at `~/.mempalace`) is named at WARNING and the pass skipped, so it never fails the sweep either.
+- **`scripts/isolated_home.py` drops `XDG_CONFIG_HOME`** from the command's environment, as the real-palace tests do: with it kept, a local wake would publish into the developer's own MemPalace config.
 - **The cleanup unit template grants `ReadWritePaths=-/home/%i/.config/mempalace`** beside `~/.mempalace` (`deploy/`), with the same `-` prefix for a directory that does not exist.
 - **The palace path reads MemPalace 3.11's short alias.** `MEMPALACE_PALACE` sits between `MEMPALACE_PALACE_PATH` and the legacy `MEMPAL_PALACE_PATH` in upstream's order, and the harness read only the two, so with it set the agent and the CLI resolved different palaces.
   - One list, `PALACE_PATH_VARS`, now serves every reader, the palace check's cleared variables included.

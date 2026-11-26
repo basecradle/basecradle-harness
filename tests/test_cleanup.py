@@ -1411,3 +1411,56 @@ def test_without_mempalace_installed_the_config_temp_pass_has_nothing_to_look_at
 
     assert stranded.exists()
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PermissionError(13, "Permission denied", "/home/nova/.mempalace"),
+        AttributeError("config_dir"),
+    ],
+)
+def test_a_lookup_of_mempalaces_config_directory_that_fails_never_fails_the_sweep(
+    tmp_path, monkeypatch, caplog, failure
+):
+    """Upstream's look at ``~/.mempalace`` can be refused (a root-owned directory), and a MemPalace
+    older than the floor has no ``config_dir``: either is named at WARNING, and every other pass,
+    and the run, go on as if the pass had found nothing."""
+    monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
+    stranded = _strand_every_kind(tmp_path)
+    for path in stranded.values():
+        _age(path, STRANDED_AFTER + 60)
+
+    def refused():
+        raise failure
+
+    monkeypatch.setattr(cleanup, "cli_config_dir", refused)
+    blocked: list[Path] = []
+
+    with caplog.at_level(logging.INFO, "basecradle_harness"):
+        removed = prune_stranded_temps(tmp_path, blocked=blocked)
+
+    assert stranded["mempalace"].exists() and stranded["mempalace"] not in removed
+    assert all(not path.exists() for kind, path in stranded.items() if kind != "mempalace")
+    assert blocked == []
+    (line,) = [r for r in caplog.records if "could not ask MemPalace" in r.getMessage()]
+    assert line.levelno == logging.WARNING and type(failure).__name__ in line.getMessage()
+
+
+@_not_root
+def test_a_young_temp_in_an_unwritable_config_directory_is_not_called_stranded(
+    tmp_path, mempalace_config, caplog
+):
+    """A publish in progress is neither removed nor reported: the age rule comes first."""
+    mempalace_config.config_dir = Path.home() / ".config" / "mempalace"
+    temp = _strand_a_cli_config_temp(mempalace_config.config_dir)
+    _age(temp, 1)
+
+    with (
+        _read_only(mempalace_config.config_dir),
+        caplog.at_level(logging.INFO, "basecradle_harness"),
+    ):
+        assert prune_stranded_temps(tmp_path, blocked=[]) == []
+
+    assert temp.exists()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

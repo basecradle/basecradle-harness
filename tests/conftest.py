@@ -285,7 +285,8 @@ def fake_mempalace(monkeypatch):
     kwargs it was *passed* (not their defaults — the `max_distance` tests turn on that
     distinction) and returns whatever the test stashes on it.
 
-    The palace is the fleet's (issue #625): MemPalace 3.10.0, a drawers collection that declares
+    The palace is the fleet's when issue #625 was decided: MemPalace 3.10.0 (below today's floor of
+    3.11, and kept because the threshold rule reads the same from 3.9), a drawers collection that declares
     the cosine metric, so `search` passes ``max_distance=2.0`` by default. A test that needs
     another palace sets ``searcher.metric`` (the collection's ``distance_metric``; an exception
     instance is raised on read) or patches ``_mempalace.mempalace_version``. ``searcher.opened``
@@ -575,6 +576,8 @@ def _isolated_mempalace_home(request, monkeypatch):
     """
     if request.node.get_closest_marker("mempalace") is not None:
         monkeypatch.setenv("HOME", str(request.getfixturevalue("_mempalace_home")))
+        for name in isolated_home.HOME_RELATIVE:  # the wrapper drops them for the same reason
+            monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture

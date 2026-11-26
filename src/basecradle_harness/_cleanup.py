@@ -578,18 +578,27 @@ def prune_stranded_temps(
     whose ``~/.mempalace`` holds no install), a new agent can be stood up before its unit's
     ``ReadWritePaths`` names it, and a sweep failed on every run until then pages for a temp it can
     say plainly it cannot reach. Where MemPalace is not installed nothing published through it, so
-    there is no such temp and the pass skips it.
+    there is no such temp and the pass skips it, and a lookup that fails any other way is named at
+    WARNING and skipped too.
     """
     now = time.time() if now is None else now
     removed: list[Path] = []
 
-    def consider(path: Path, pid: int | None) -> None:
+    def consider(path: Path, pid: int | None, *, writable: bool = True) -> None:
         try:
             age = now - path.stat().st_mtime
         except OSError:
             return  # gone already, or unreadable: nothing to decide
         if age < STRANDED_AFTER or (pid is not None and _writer_alive(pid)):
             return  # young enough to be mid-write, or its writer is still alive
+        if not writable:  # MemPalace's config directory only, by the decision on issue #1026
+            _log.warning(
+                "cleanup: cannot write MemPalace's config directory %s, so its stranded temp %s is "
+                "skipped; the sweep's unit needs that directory in ReadWritePaths",
+                path.parent,
+                path.name,
+            )
+            return
         try:
             path.unlink(missing_ok=True)
         except OSError as error:
@@ -627,25 +636,31 @@ def prune_stranded_temps(
                 consider(path, None)
 
     for path in _mempalace_temps():
-        if os.access(path.parent, os.W_OK):
-            consider(path, None)
-        else:
-            _log.warning(
-                "cleanup: cannot write MemPalace's config directory %s, so its stranded temp %s is "
-                "skipped; the sweep's unit needs that directory in ReadWritePaths",
-                path.parent,
-                path.name,
-            )
+        consider(path, None, writable=os.access(path.parent, os.W_OK))
 
     return removed
 
 
 def _mempalace_temps() -> list[Path]:
-    """The publisher's staged temps, in the directory it publishes to: upstream's, never ours."""
+    """The publisher's staged temps, in the directory it publishes to: upstream's, never ours.
+
+    Asking can fail, and by the decision on issue #1026 it never fails the sweep: without MemPalace
+    nothing was published through it, so there is nothing to look for; any other failure (a
+    ``PermissionError`` from upstream's look at ``~/.mempalace``, a MemPalace older than its
+    ``config_dir`` property) is named at WARNING and the pass skipped.
+    """
     try:
         folder = cli_config_dir()
     except ImportError:
         return []  # MemPalace is not installed, so nothing was ever published through it
+    except Exception as error:  # noqa: BLE001 - upstream's answer must never fail the sweep
+        _log.warning(
+            "cleanup: could not ask MemPalace where it reads its config (%s: %s), so its "
+            "stranded temps are not looked for",
+            type(error).__name__,
+            error,
+        )
+        return []
     return [path for path in _entries(folder) if _MEMPALACE_TEMP.match(path.name)]
 
 
