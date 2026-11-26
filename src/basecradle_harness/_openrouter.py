@@ -79,11 +79,10 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
     ServerToolTally,
-    answered,
     finish_reason,
     generation_id,
     generation_id_header,
-    log_llm_call,
+    log_answered_call,
     log_server_tools,
     read_answer,
     reported_cost,
@@ -477,7 +476,8 @@ class OpenRouterProvider:
         reply, unreadable = read_answer(
             lambda: message_from_chat(data), data, usage=usage, cap=output_cap(self._default_params)
         )
-        log_llm_call(
+        log_answered_call(
+            unreadable,
             provider=self.provider,
             model=self.model,
             seconds=seconds,
@@ -496,7 +496,6 @@ class OpenRouterProvider:
             # OpenRouter's generation id (``gen-…``), the id its feedback and refund path asks for
             # (issue #634). The body's ``id`` equals the ``X-Generation-Id`` header on a success.
             generation_id=generation_id(data),
-            **answered(unreadable),
         )
         # The web searches OpenRouter ran for the call (its ``openrouter:web_search`` server tool),
         # one `tool` line beside the call's `llm` line (issue #758). OpenRouter names no call and

@@ -110,10 +110,9 @@ from basecradle_harness._faults import (
 from basecradle_harness._messages import ImageContent, Message, ServerToolUse, ToolCall, ToolSpec
 from basecradle_harness._observability import (
     ServerToolTally,
-    answered,
     finish_reason,
     generation_id,
-    log_llm_call,
+    log_answered_call,
     log_server_tools,
     read_answer,
     reasoning_apart,
@@ -410,7 +409,8 @@ class XaiSdkProvider:
             usage=reasoning_apart(usage),
             cap=output_cap(self._default_params),
         )
-        log_llm_call(
+        log_answered_call(
+            unreadable,
             provider=self.provider,
             model=self.model,
             seconds=seconds,
@@ -434,7 +434,6 @@ class XaiSdkProvider:
             # xAI's response id (issue #634) — on its HTTP surface the same value it sends as
             # ``x-request-id``, so a support request names the call either way.
             generation_id=generation_id(response),
-            **answered(unreadable),
         )
         # The tools grok ran server-side inside this call, one `tool` line each (issue #758).
         log_server_tools(

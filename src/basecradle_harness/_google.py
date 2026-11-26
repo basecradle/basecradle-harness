@@ -157,9 +157,9 @@ from basecradle_harness._observability import (
     TOKENS_CHARGE,
     UNKNOWN_MODEL,
     UNPRICED_TIER,
-    answered,
     finish_reason,
     generation_id,
+    log_answered_call,
     log_cost_unpriced,
     log_llm_call,
     log_server_tools,
@@ -780,7 +780,8 @@ class GoogleProvider:
             cap=output_cap(self._default_params),
         )
         cost, gap = self._cost(meta, usage)
-        log_llm_call(
+        log_answered_call(
+            unreadable,
             provider=self.provider,
             model=self.model,
             seconds=seconds,
@@ -792,7 +793,6 @@ class GoogleProvider:
             cost_gap=gap,
             finish_reason=self.last_finish_reason,
             generation_id=response_id,
-            **answered(unreadable),
         )
         # The built-ins Gemini ran on this call, one `tool` line each beside its `llm` line (#758).
         log_server_tools(
