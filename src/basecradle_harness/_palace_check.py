@@ -274,8 +274,8 @@ def census(collection, palace: Path) -> Census:
             registry = meta.get("room") == _REGISTRY_ROOM
             # A BaseCradle name has no file for a mine to read, so it takes no part in what a mine
             # would do: not in the version-stale classes, the location count or the pre-3.7 count.
-            named = parse_name(source) is not None
-            if out.chunker is not None and not named and _exchange_mode(meta):
+            under_name = parse_name(source) is not None
+            if out.chunker is not None and not under_name and _exchange_mode(meta):
                 name = Path(source).name
                 if _version_stale(meta, out.chunker, normalize):
                     stale.add(name)
@@ -302,7 +302,7 @@ def census(collection, palace: Path) -> Census:
                     group[1] = meta.get("chunk_total")
             row = (drawer_id, meta, text)
             out.real.append(row)
-            if named:
+            if under_name:
                 out.named += 1
                 continue
             if not source.startswith(prefix):
