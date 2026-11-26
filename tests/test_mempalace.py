@@ -1417,7 +1417,8 @@ def _cli_default_palace(home: Path, *, palace_flag: str | None = None) -> str:
     """The palace a `mempalace` command would operate on — upstream's own resolution order.
 
     A faithful transcription of `mempalace.config.MempalaceConfig.palace_path` (MemPalace 3.x):
-    an explicit ``--palace`` wins, then ``MEMPALACE_PALACE_PATH`` / ``MEMPAL_PALACE_PATH``, then
+    an explicit ``--palace`` wins, then ``MEMPALACE_PALACE_PATH`` / ``MEMPALACE_PALACE`` /
+    ``MEMPAL_PALACE_PATH``, then
     ``~/.mempalace/config.json``'s ``palace_path`` (expanduser'd), then ``~/.mempalace/palace``.
     Every CLI command resolves through exactly this one property — ``status``, ``search``,
     ``sync``, ``mine``, ``repair-status``, ``migrate``, ``wake-up`` alike — which is why pointing
@@ -1431,7 +1432,11 @@ def _cli_default_palace(home: Path, *, palace_flag: str | None = None) -> str:
     """
     if palace_flag is not None:
         return os.path.abspath(os.path.expanduser(palace_flag))
-    env = os.environ.get("MEMPALACE_PALACE_PATH") or os.environ.get("MEMPAL_PALACE_PATH")
+    env = (
+        os.environ.get("MEMPALACE_PALACE_PATH")
+        or os.environ.get("MEMPALACE_PALACE")
+        or os.environ.get("MEMPAL_PALACE_PATH")
+    )
     if env:
         return os.path.abspath(os.path.expanduser(env))
     config_file = home / ".mempalace" / "config.json"

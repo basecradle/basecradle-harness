@@ -254,12 +254,13 @@ _MEMPALACE_NAMED_CLASS = "basecradle_harness._mempalace_provider.MemPalaceProvid
 # `describe_memory_provider`.
 _PROVIDER_DISTRIBUTIONS = {_MEMPALACE: "mempalace", _MEMPALACE_PREVIOUS: "mempalace"}
 
-# MemPalace's *own* palace-path environment variables, in upstream's precedence order
-# (`mempalace.config.MempalaceConfig.palace_path`). The harness reads the same two, in the same
-# order, so the adapter and the `mempalace` CLI can never resolve different palaces — see
-# `_palace_path`. The legacy `MEMPAL_` spelling is upstream's; it is honored for the same reason.
-_PALACE_PATH_VAR = "MEMPALACE_PALACE_PATH"
-_PALACE_PATH_VAR_LEGACY = "MEMPAL_PALACE_PATH"
+#: MemPalace's *own* palace-path environment variables, in upstream's precedence order
+#: (`mempalace.config.MempalaceConfig.palace_path`): the documented name, the short alias 3.11
+#: added (MemPalace#2366), and the legacy ``MEMPAL_`` spelling. The harness reads the same ones, in
+#: the same order, so the adapter and the `mempalace` CLI can never resolve different palaces (see
+#: `_palace_path`). The one list every reader of them uses; ``test_memory_provider.py`` holds it to
+#: the names upstream's property reads when the extra is installed (issue #1026).
+PALACE_PATH_VARS = ("MEMPALACE_PALACE_PATH", "MEMPALACE_PALACE", "MEMPAL_PALACE_PATH")
 
 
 def memory_provider_from_env(home: str | os.PathLike[str] | None = None) -> MemoryProvider:
@@ -408,31 +409,32 @@ def _store_path(home: str | os.PathLike[str] | None) -> Path | None:
 
 
 def _palace_path(home: str | os.PathLike[str] | None) -> Path:
-    """The MemPalace palace directory: MemPalace's own env var, else under the agent's home.
+    """The MemPalace palace directory: MemPalace's own env vars, else under the agent's home.
 
     Falls back to the same per-agent root the SQLite store uses (``$HARNESS_HOME`` else a
     dotdir under ``$HOME``), so a MemPalace agent's memory is private to its OS user the
     same way the default's is.
 
-    **`MEMPALACE_PALACE_PATH` is read first, and reading it is the point** (issue #409). The
-    `mempalace` CLI resolves its palace as ``--palace`` → ``MEMPALACE_PALACE_PATH`` /
-    ``MEMPAL_PALACE_PATH`` → ``~/.mempalace/config.json`` → ``~/.mempalace/palace``, and the
-    harness *publishes* the path it binds into that config file (`_mempalace.publish_palace_binding`)
+    **MemPalace's own variables are read first, and reading them is the point** (issue #409). The
+    `mempalace` CLI resolves its palace as ``--palace`` → `PALACE_PATH_VARS`, in order → its config
+    file's ``palace_path`` → a ``palace`` directory beside that file, and the harness *publishes* the path it binds into that config file (`_mempalace.publish_palace_binding`)
     so a bare ``mempalace status`` reaches the agent's live palace. A published file sits **below**
     the env in that order — so if the adapter ignored the env, the day anyone exported it (in an
     `agent.env`, in a wake runner) the CLI would silently follow the env, the harness would silently
     follow ``$HARNESS_HOME``, and the two would be looking at different minds again with the
-    publication no longer able to say so. Reading the same var, in upstream's own order, is what
+    publication no longer able to say so. Reading the same vars, in upstream's own order, is what
     makes the two agree in *every* configuration rather than only in the unset one.
 
-    Matched to upstream deliberately, degenerate cases included: a set-but-empty
-    ``MEMPALACE_PALACE_PATH`` falls through to ``MEMPAL_PALACE_PATH`` (``or``, not "is set"), and
-    the value is ``expanduser`` + ``abspath``-ed exactly as `MempalaceConfig.palace_path` does. The
+    Matched to upstream deliberately, degenerate cases included: a set-but-empty variable falls
+    through to the next one (``or``, not "is set"), and the value is ``expanduser`` +
+    ``abspath``-ed exactly as `MempalaceConfig.palace_path` does. The
     one case the two *cannot* be made to agree on is a **relative** value, which upstream resolves
     against the process's cwd — the wake's and the operator's shell's are not the same directory.
-    Set an absolute path.
+    Set an absolute path. And the list is the current upstream's: MemPalace before 3.11 does not
+    read ``MEMPALACE_PALACE``, so under 3.9 or 3.10 that one variable moves the agent's palace and
+    not the CLI's. Set ``MEMPALACE_PALACE_PATH``, which every version reads.
     """
-    explicit = os.environ.get(_PALACE_PATH_VAR) or os.environ.get(_PALACE_PATH_VAR_LEGACY)
+    explicit = next((value for var in PALACE_PATH_VARS if (value := os.environ.get(var))), None)
     if explicit:
         return Path(os.path.abspath(os.path.expanduser(explicit)))
     root = Path(home) if home is not None else _default_path().parent

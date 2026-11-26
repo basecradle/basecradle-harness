@@ -23,6 +23,7 @@ import respx.mocks
 from respx.mocks import HTTPCoreMocker
 
 from basecradle_harness import OpenAIProvider, _mempalace, _mining, _openai, _venv
+from basecradle_harness._memory_provider import PALACE_PATH_VARS
 from tests._palace_results import got
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -402,6 +403,18 @@ def _isolated_commands_dir(tmp_path_factory, monkeypatch):
     _venv._reset()
     yield
     _venv._reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_palace_path(monkeypatch):
+    """Clear MemPalace's palace-path variables, so a developer's shell never picks a test's palace.
+
+    The adapter honors every one of them ahead of ``$HARNESS_HOME`` (`PALACE_PATH_VARS`), so one
+    left exported in the shell that runs the suite would move every palace a test resolves. A test
+    that exercises them sets its own.
+    """
+    for var in PALACE_PATH_VARS:
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture(autouse=True)
