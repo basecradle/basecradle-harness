@@ -161,24 +161,6 @@ def test_an_empty_exchange_writes_nothing(provider, fake_mempalace):
     assert convo_miner.filed == [] and not provider.records.root.exists()
 
 
-def test_results_are_read_by_attribute_never_by_the_dict_style(provider, monkeypatch):
-    """MemPalace keeps ``result.get("ids")`` only as a migration shim scheduled for removal."""
-    import sys
-
-    probe = sys.modules["mempalace.palace"].get_collection(str(provider.palace_path))
-    result_type = type(probe.get(where={"wing": "conversations"}, include=[]))
-
-    def refuse(self, *args, **kwargs):
-        raise AssertionError("the dict style was used on a MemPalace result")
-
-    monkeypatch.setattr(result_type, "get", refuse)
-
-    provider.observe(_exchange(item=M0))
-    provider.observe(_exchange(item=M0))  # the second asks "already filed?" and reads results
-
-    assert provider.records.read(TIMELINE, M0).filed
-
-
 @pytest.mark.parametrize("module", [_mempalace_provider, _exchange_records])
 def test_the_new_adapter_names_no_field_the_library_owns(module):
     """The grep is the test: not one of these names appears in the new adapter's modules."""

@@ -7,6 +7,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.218.0] - 2026-11-26
+
+### Changed: MemPalace's results are read by attribute everywhere, never through the shim upstream will remove (issue #1026)
+
+MemPalace keeps the dict style on its typed collection results (`result.get("ids")`, `result["ids"]`) only as "a migration shim … scheduled for removal in a follow-up cleanup. New code MUST use attribute access" (`mempalace.backends.base`, unchanged from 3.9.0 to 3.11.0). The previous adapter, the scrub, the prune and the palace check made twenty-two reads that way, one of them on the observe's rollback, so the release that removes the shim would have broken each on upgrade, the rollback silently (its failure is logged and swallowed).
+
+- **Every read is by attribute** (`page.ids`, `got.metadatas`), the form upstream documents and the `mempalace` adapter already used. Attribute access works across the whole supported range, 3.9.0 through 3.11.
+- **The suite can no longer pass on the old form.** Every fake collection returns results with MemPalace's fields and no dict protocol (`tests/_palace_results.py`, held to upstream's field lists when the extra is installed), and `tests/test_palace_results.py` fails on a dict-style read of a result anywhere in the package or the suite, read from the syntax tree, so a path no test drives and a real-palace test that runs only with the extra are held too.
+
 ## [0.217.0] - 2026-11-25
 
 ### Fixed: the palace check no longer reads the `mempalace` adapter's drawers as moved and pre-3.7 (issue #1014)

@@ -1199,7 +1199,7 @@ def _unfile(collection, source_file: str, *, provider: str) -> bool:
     """
     try:
         found = collection.get(where={"source_file": source_file}, include=["metadatas"])
-        drawers = list(found.get("ids") or [])
+        drawers = list(found.ids or [])
         if drawers:
             collection.delete(ids=drawers)
         return True

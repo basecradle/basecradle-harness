@@ -617,11 +617,11 @@ def _drawers_by_file(
     offset = 0
     while True:
         page = collection.get(limit=_PAGE, offset=offset, include=["documents", "metadatas"])
-        ids = list(page.get("ids") or [])
+        ids = list(page.ids or [])
         if not ids:
             break
-        documents = list(page.get("documents") or [])
-        metadatas = list(page.get("metadatas") or [])
+        documents = list(page.documents or [])
+        metadatas = list(page.metadatas or [])
         for index, drawer_id in enumerate(ids):
             meta = (metadatas[index] if index < len(metadatas) else None) or {}
             if meta.get("room") == _REGISTRY_ROOM:
@@ -1300,16 +1300,16 @@ def _records(collection, ids: list[str]) -> dict[str, dict]:
     for start in range(0, len(ids), _PAGE):
         batch = ids[start : start + _PAGE]
         page = collection.get(ids=batch, include=["documents", "metadatas", "embeddings"])
-        embeddings = page.get("embeddings")
-        for index, drawer_id in enumerate(page.get("ids") or []):
+        embeddings = page.embeddings
+        for index, drawer_id in enumerate(page.ids or []):
             embedding = None
             if embeddings is not None and index < len(embeddings):
                 embedding = embeddings[index]
                 embedding = None if embedding is None else [float(x) for x in embedding]
             records[drawer_id] = {
                 "id": drawer_id,
-                "document": (page.get("documents") or [])[index],
-                "metadata": (page.get("metadatas") or [])[index],
+                "document": (page.documents or [])[index],
+                "metadata": (page.metadatas or [])[index],
                 "embedding": embedding,
             }
     return records
@@ -1465,7 +1465,7 @@ def restore(
     ids = [row["id"] for row in rows]
     present = set()
     for start in range(0, len(ids), _PAGE):
-        present |= set(collection.get(ids=ids[start : start + _PAGE], include=[]).get("ids") or [])
+        present |= set(collection.get(ids=ids[start : start + _PAGE], include=[]).ids or [])
     view = view or PreviousView(palace)
     targets = {file: view.restore_target(entry) for file, (entry, _) in files.items()}
     conversations = palace / _CONVERSATIONS_WING

@@ -36,6 +36,7 @@ from basecradle_harness._mining import (
 )
 from basecradle_harness._mining import _LEGACY_RECALL_HEADING as LEGACY_HEADING
 from basecradle_harness._wake import _COMPACTION_OBSERVE_NOTE, _STUCK_NOTE
+from tests._palace_results import got
 
 # --- real memories, for the "provably intact" half of the gate ---------------------------------
 
@@ -75,11 +76,11 @@ class FakeCollection:
 
     def get(self, *, limit=None, offset=0, include=None, ids=None, where=None):
         items = list(self.drawers.items())[offset : (offset + limit) if limit else None]
-        return {
-            "ids": [drawer_id for drawer_id, _ in items],
-            "documents": [payload[0] for _, payload in items],
-            "metadatas": [payload[1] for _, payload in items],
-        }
+        return got(
+            ids=[drawer_id for drawer_id, _ in items],
+            documents=[payload[0] for _, payload in items],
+            metadatas=[payload[1] for _, payload in items],
+        )
 
     def delete(self, *, ids=None, where=None):
         self.deleted.append(list(ids or []))

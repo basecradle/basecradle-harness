@@ -23,6 +23,7 @@ import respx.mocks
 from respx.mocks import HTTPCoreMocker
 
 from basecradle_harness import OpenAIProvider, _mempalace, _mining, _openai, _venv
+from tests._palace_results import got
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -244,8 +245,8 @@ def fake_mempalace(monkeypatch):
     ``palace.mine_lock`` records each path it locks in ``convo_miner.locked``, and a writable
     collection answers ``get(where={"source_file": …})`` from ``filed`` and records its deletes in
     ``convo_miner.deleted`` (a test makes either raise by setting ``convo_miner.refuse``). For the
-    adapter issue #1011 built it answers the way MemPalace 3.11's typed results do (attribute access,
-    with the dict style beside it): a ``where`` on that adapter's two keys, under ``$and``, from each
+    adapter issue #1011 built it answers the way MemPalace 3.11's typed results do (attribute access
+    only, issue #1026): a ``where`` on that adapter's two keys, under ``$and``, from each
     filed drawer's ``extra_metadata``, and a ``where_document`` ``$contains`` on the stored text in a
     wing. ``palace.MineAlreadyRunning`` is the library's lock refusal, and
     ``convo_miner.busy`` is how many filings raise it before one goes through. ``search_memories`` records the
@@ -312,13 +313,12 @@ def fake_mempalace(monkeypatch):
     class MineAlreadyRunning(RuntimeError):
         """MemPalace's lock refusal (`mempalace.palace.MineAlreadyRunning`)."""
 
-    class Result:
-        """A typed result: attribute access, and the dict style MemPalace keeps beside it."""
-
-        def __init__(self, drawers):
-            self.ids = [d["id"] for d in drawers]
-            self.documents = [d["stored"] for d in drawers]
-            self.metadatas = [
+    def Result(drawers):
+        """A typed result, read by attribute only (`tests._palace_results`)."""
+        return got(
+            ids=[d["id"] for d in drawers],
+            documents=[d["stored"] for d in drawers],
+            metadatas=[
                 {
                     "source_file": d["source_file"],
                     "wing": d["wing"],
@@ -326,10 +326,8 @@ def fake_mempalace(monkeypatch):
                     **(d.get("extra_metadata") or {}),
                 }
                 for d in drawers
-            ]
-
-        def get(self, key, default=None):
-            return getattr(self, key, default)
+            ],
+        )
 
     def _matches(drawer, where):
         if "$and" in where:

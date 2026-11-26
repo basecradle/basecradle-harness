@@ -21,6 +21,7 @@ import pytest
 from basecradle_harness import _palace_check
 from basecradle_harness._palace_check import _ASK, _VECTOR_ASK
 from basecradle_harness._rerank import RERANK_MODEL_VAR
+from tests._palace_results import got, queried
 
 OLD = "/home/olduser/harness/mempalace/conversations"
 NAMES = [f"{n:032x}.md" for n in range(1, 5)]
@@ -41,13 +42,13 @@ class FakeCollection:
 
     def get(self, *, ids=None, limit=None, offset=0, include=None):
         if ids is not None:
-            return {"ids": list(ids), "embeddings": [[float(len(i)), 1.0] for i in ids]}
+            return got(ids=list(ids), embeddings=[[float(len(i)), 1.0] for i in ids])
         items = list(self.drawers.items())[offset : offset + limit]
-        return {
-            "ids": [drawer_id for drawer_id, _ in items],
-            "documents": [payload[0] for _, payload in items],
-            "metadatas": [payload[1] for _, payload in items],
-        }
+        return got(
+            ids=[drawer_id for drawer_id, _ in items],
+            documents=[payload[0] for _, payload in items],
+            metadatas=[payload[1] for _, payload in items],
+        )
 
     def query(self, *, n_results, query_embeddings=None, query_texts=None, include=None):
         ids = [i for i in self.drawers if i not in self.unindexed]
@@ -59,7 +60,7 @@ class FakeCollection:
                 )
             )
         ids = ids[:n_results]
-        return {"ids": [ids], "distances": [[0.0] * len(ids)]}
+        return queried(ids, distances=[0.0] * len(ids))
 
 
 @pytest.fixture
@@ -151,7 +152,7 @@ def fake(monkeypatch, mempalace_not_installed):
         state.searches.append((query, kwargs))
         n = kwargs["n_results"]
         # MemPalace's union search: the vector half proposes 3n and keeps the n nearest.
-        kept = set(state.collection.query(query_texts=[query], n_results=3 * n)["ids"][0][:n])
+        kept = set(state.collection.query(query_texts=[query], n_results=3 * n).ids[0][:n])
         rows = [
             {
                 "drawer_id": drawer_id,
