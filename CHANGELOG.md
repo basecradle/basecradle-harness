@@ -7,6 +7,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.216.0] - 2026-11-25
+
+### Fixed: a secret a cut-off reply's cut fell inside is redacted as one text with its resume (issue #1020)
+
+A reply cut off at its output budget is resumed (issue #490), and the wake redacted the fragment and the continuation one at a time. A secret the cut fell inside was then in neither: its opening could match a shape and be blanked while the rest opened the continuation, where no shape recognizes it, and was written as it stood, in the transcript, the resume's journal line and the exchange handed to memory. The one definition of a secret (issue #999) was applied to two texts where there is one reply.
+
+- **One redaction of a text held in pieces** (`_redaction.scrub_parts`): the rules read the pieces joined, each redaction is written once, in the last piece it took something from (the next piece when it ends exactly at a cut), and what it took from the pieces before is gone from them, so a saved transcript reads back as itself. Every piece's own reading is taken too, so joining does not cost a piece a redaction it makes alone (a key glued to the last word of the piece before reads as a word when joined). One piece is `scrub` exactly.
+- **A piece that ends in `[redacted]` takes the next piece's opening run with it.** A resume in a later wake has the fragment only as the transcript saved it, redacted alone, so a key it ended inside is already a marker there and nothing is left to recognize the rest by. The run of key and URL characters after the marker (ASCII letters, digits and `._~+/=%&?:@-`) goes with it, erring toward redaction and never taking a quote, a bracket, a comma or a blank; it is added after the rules' own merge, so it only ever adds.
+- **The transcript** redacts every reply it holds in pieces (an assistant text, the truncation note, and the turn's next assistant text, with only system turns between) as one text on every save (`_session.reply_pieces`).
+- **The resume's journal line and its exchange** are redacted with the pieces the session holds of the reply it continues (`Session.continued`): the raw fragment in the wake that cut it off, and the fragment as the transcript kept it in a later wake.
+- **`MemoryExchange` gains `continues`**: for a resumed exchange that picks up a cut text, every earlier piece of the reply as the one redaction left it. The `mempalace` adapter keeps the pieces its held record ends on (`cut_pieces` and `cut_before`, added within format 2: 0.215.0 ignores them) and puts these in their place only when it holds exactly as many, so an exchange that never reached it keeps every word rather than having another piece's text swapped in. It no longer redacts across the seam itself: the wake is the one owner of the redaction memory is handed. `mempalace-previous` files each exchange as it comes and ignores it.
+- **What stays as it was**: the opening of a key no shape knew at that length, where it was written before its resume existed (the fragment's own journal line, a `mempalace-previous` drawer, and a `mempalace` record whose resume called a tool before its last message, or whose piece count does not match).
+- **Proven per registered shape**: every vendor-key prefix, every label family, the heartbeat URL and a configured value, each cut at four points inside the secret, through a real wake and through a resume in a later wake, with nothing either wrote holding the tail, and every saved transcript reading back as itself; each mechanism removed in turn makes it fail.
+
 ## [0.215.0] - 2026-11-25
 
 ### Changed: the `mempalace` adapter holds a reply cut off at its output budget until its resume finishes it (issue #1011)

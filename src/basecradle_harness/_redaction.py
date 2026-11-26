@@ -14,6 +14,10 @@ writes text down asks this module:
 - **the text files a tool saved in its capture folder** (`_mcp.McpTool.run`, after the call that
   wrote them; `redact_file`).
 
+**A text held in pieces is redacted as one** (`scrub_parts`, issue #1020): a reply cut off at its
+output budget and the resume that finished it are one reply in two messages, so the transcript,
+the resume's journal line and the exchange memory is handed redact them together.
+
 **Two halves, and both run everywhere** (`scrub`):
 
 - **By value** (`configured_values`): the agent's own configured secrets, which the harness knows at
@@ -57,7 +61,7 @@ import os
 import re
 import stat
 import unicodedata
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from functools import cache
 from importlib import resources
 from pathlib import Path
@@ -965,7 +969,110 @@ def scrub_counted(text: str) -> tuple[str, int]:
     `kv` sees it calls this first. Linear in `text`: each rule reads it once, and the spans, each
     rule's already in order, are merged in one pass.
     """
-    values: set[int] = set()  # where each credential name's value starts, empty ones included
+    values, spans = _spans(text)
+    out: list[str] = []
+    pos = count = 0
+    for start, end, marker in _redactions(text, values, spans):
+        out += [text[pos:start], marker]
+        count += text[start:end] != marker  # a marker already there is no new redaction
+        pos = end
+    out.append(text[pos:])
+    return "".join(out), count
+
+
+def scrub_parts(parts: Sequence[str]) -> list[str]:
+    """`parts`, one text written in pieces, redacted as that one text: `scrub_parts_counted`'s."""
+    return scrub_parts_counted(parts)[0]
+
+
+def scrub_parts_counted(parts: Sequence[str]) -> tuple[list[str], list[int]]:
+    """Each of `parts` as its share of one redaction of them all, and how many redactions each holds.
+
+    **A text the harness holds in pieces is still one text** (issue #1020). A reply cut off at its
+    output budget and the resume that finished it are one reply in two messages, and a secret the
+    cut fell inside is in neither: its opening may match a shape and be blanked, while the rest opens
+    the continuation, where nothing recognizes it, and is written as it stands. So the pieces are
+    redacted together: the rules read ``"".join(parts)``, and what each piece keeps is what that
+    redaction leaves of it. A redaction is written once, in the **last** piece it took something
+    from, and what it took from the pieces before is gone from them. ``"".join`` of the result is
+    therefore the joined text redacted, and no piece keeps any part of a secret the joined text holds
+    whole. The last piece, never the first, and when the redaction ends exactly where that piece
+    ends, the start of the next piece that holds anything: a piece saved with a marker at its end
+    reads, on the next save, as a cut a redaction already reached (below), so a marker the joint
+    reading wrote there would take the next piece's opening words when the transcript is read back.
+    Written after the cut, it reads back as itself. Only the reply's last piece can end in one.
+
+    **Each piece's own reading is taken too.** Joining can make a rule decline what it takes in a
+    piece (a key glued to the last word of the piece before reads as a word, `_is_word`), so every
+    piece's own spans are added, read where they stand in the joined text: the union `scrub` keeps
+    among its rules, kept across the pieces. One corner stays where `scrub` itself has it: a
+    credential value read on through a marker (`_past_marker`) can end differently in the joined text
+    than in the piece, and the joined reading decides. One piece is `scrub_counted` exactly.
+
+    **A piece that ends in a redaction marker is a cut the redaction already reached**
+    (`_through_the_cut`): a fragment saved before its resume existed was redacted alone, so a key it
+    ended inside is ``[redacted]`` there, and nothing of the key is left to recognize the rest by. So
+    the run of key and URL characters that opens the next piece (`_KEY_RUN`) goes with that marker,
+    added to the redactions the rules made and never changing one of them. It errs toward
+    redaction, and is bounded to that one run: what the model glued onto a marker that ended a key
+    exactly at the cut goes too, once (the marker then stands after the cut and reads back as
+    itself), and a quote, a bracket, a comma, a blank or a letter outside ASCII is never taken.
+
+    A redaction is counted in every piece it took something from, so a secret across a cut counts
+    once in each piece it was split across.
+    """
+    whole = "".join(parts)
+    values, spans = _spans(whole)
+    if len(parts) > 1:
+        streams = [spans]
+        offset = 0
+        for part in parts:
+            own_values, own = _spans(part)
+            values |= {offset + start for start in own_values}
+            streams.append(_shifted(own, offset))
+            offset += len(part)
+        spans = heapq.merge(*streams)
+    redactions: Iterable[tuple[int, int, str]] = _redactions(whole, values, spans)
+    if len(parts) > 1:
+        redactions = _with_runs(list(redactions), _through_the_cut(parts, whole))
+    starts = [0]
+    for part in parts[:-1]:
+        starts.append(starts[-1] + len(part))
+    shares: list[list[str]] = [[] for _ in parts]
+    counts = [0] * len(parts)
+
+    def touched(begin: int, end: int) -> Iterator[int]:
+        """Each piece holding some of ``whole[begin:end]``; an empty piece holds nothing."""
+        return (
+            k
+            for k, first in enumerate(starts)
+            if parts[k] and first < end and begin < first + len(parts[k])
+        )
+
+    def keep(begin: int, end: int) -> None:
+        for k in touched(begin, end):
+            shares[k].append(whole[max(begin, starts[k]) : min(end, starts[k] + len(parts[k]))])
+
+    pos = 0
+    for start, end, marker in redactions:
+        keep(pos, start)
+        pieces = list(touched(start, end))
+        target = pieces[-1]  # the last piece it took from (see above)…
+        if end == starts[target] + len(parts[target]):  # …or, ending at that piece's end, the next
+            target = next((k for k in range(target + 1, len(parts)) if parts[k]), target)
+        shares[target].append(marker)
+        if whole[start:end] != marker:  # a marker already there is no new redaction
+            for k in pieces:
+                counts[k] += 1
+        pos = end
+    keep(pos, len(whole))
+    return ["".join(share) for share in shares], counts
+
+
+def _spans(text: str) -> tuple[set[int], Iterator[tuple[int, int]]]:
+    """Every rule's spans of `text`, in order, and where each credential name's value starts in it,
+    empty values included: what `_redactions` merges (`scrub_counted`)."""
+    values: set[int] = set()
     assignments: list[tuple[int, int]] = []
     for start, end in _credential_spans(text):
         values.add(start)
@@ -982,8 +1089,57 @@ def scrub_counted(text: str) -> tuple[str, int]:
         _bearer_spans(text),
         (match.span() for match in _PREFIX_RULES.finditer(text) if not _is_word(match)),
     )
-    out: list[str] = []
-    pos = count = 0
+    return values, spans
+
+
+#: What `_through_the_cut` takes after a marker that ends a piece: the characters of a key, a token
+#: and a URL, ASCII only, and nothing that closes a quoted value, a list or a sentence's clause.
+_KEY_RUN = re.compile(r"[A-Za-z0-9._~+/=%&?:@-]+")
+
+
+def _through_the_cut(parts: Sequence[str], whole: str) -> list[tuple[int, int]]:
+    """A span from each `REDACTED` a piece ends in through the `_KEY_RUN` that opens the text after
+    it (`scrub_parts_counted`), in order."""
+    spans: list[tuple[int, int]] = []
+    end = 0
+    for part in parts:
+        end += len(part)
+        if part.endswith(REDACTED) and (run := _KEY_RUN.match(whole, end)) is not None:
+            spans.append((end - len(REDACTED), run.end()))
+    return spans
+
+
+def _with_runs(
+    redactions: list[tuple[int, int, str]], runs: list[tuple[int, int]]
+) -> list[tuple[int, int, str]]:
+    """``redactions`` with each of ``runs`` added: a redaction a run overlaps or touches grows to
+    cover it, keeping its own marker (`REDACTED_VALUE` if any it joins had one), and a run that
+    meets none is written as `REDACTED`. Added after the rules' merge, never fed into it, so a run
+    can only add to what the rules took (`_past_marker` is not monotone in a span's end)."""
+    merged: list[tuple[int, int, str]] = []
+    for start, end, marker in sorted([*redactions, *((s, e, REDACTED) for s, e in runs)]):
+        if merged and start <= merged[-1][1]:
+            first, last, kept = merged[-1]
+            value = REDACTED_VALUE if REDACTED_VALUE in (kept, marker) else REDACTED
+            merged[-1] = (first, max(last, end), value)
+        else:
+            merged.append((start, end, marker))
+    return merged
+
+
+def _shifted(spans: Iterable[tuple[int, int]], offset: int) -> Iterator[tuple[int, int]]:
+    """`spans` of a piece, read where the piece stands in the text it is part of."""
+    return ((start + offset, end + offset) for start, end in spans)
+
+
+def _redactions(
+    text: str, values: set[int], spans: Iterator[tuple[int, int]]
+) -> Iterator[tuple[int, int, str]]:
+    """Each redaction `scrub` writes in `text`, in order: where it starts, where it ends, its marker.
+
+    The spans are merged where they overlap or touch, and a span that starts where a credential
+    name's value starts (`values`) is written as `REDACTED_VALUE`, taking what a second reading of
+    that marker would take (`_past_marker`); every other span is written as `REDACTED`."""
     pending = next(spans, None)
     while pending is not None:
         start, end = pending
@@ -996,12 +1152,7 @@ def scrub_counted(text: str) -> tuple[str, int]:
             if not marked or (grown := _past_marker(text, end)) == end:
                 break
             end = grown  # what a second reading of the marker would take, and the spans it meets
-        marker = REDACTED_VALUE if marked else REDACTED
-        out += [text[pos:start], marker]
-        count += text[start:end] != marker  # a marker already there is no new redaction
-        pos = end
-    out.append(text[pos:])
-    return "".join(out), count
+        yield start, end, REDACTED_VALUE if marked else REDACTED
 
 
 def _past_marker(text: str, at: int) -> int:
