@@ -61,7 +61,11 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-from basecradle_harness._exceptions import ProviderError, ProviderTruncatedError
+from basecradle_harness._exceptions import (
+    ProviderError,
+    ProviderResponseError,
+    ProviderTruncatedError,
+)
 from basecradle_harness._redaction import _TOKEN_CHAR, _TRAILING_RUN, bounded, scrub
 
 _log = logging.getLogger("basecradle_harness")
@@ -2131,7 +2135,9 @@ def read_answer(
     afterwards, so an answer that could not be read (tool-call arguments cut off at the output cap,
     a malformed body) was written ``outcome=ok`` and then retried, which is one billed attempt saying
     two contradictory things. Reading first lets the one billed line say what happened: `answered`
-    gives its fields, ``fallback reason=invalid_response`` for an unreadable answer. The harness's
+    gives its fields, ``fallback reason=invalid_response`` for an unreadable answer, and
+    `log_answered_call` writes no line for an unreadable body that carried no bill, because it was
+    no answer (issue #1029). The harness's
     decision (``retrying`` or ``failed``) follows on its own line, which carries no cost. The error
     is returned, stamped with the response's id (`generation_of`), for the adapter to raise once its
     lines are written.
@@ -2166,7 +2172,7 @@ def read_answer(
         written = token_counts(usage).get("tokens_out") if usage is not None else None
         at_cap = cap is not None and written is not None and written >= cap
         if not truncated(stopped) and not at_cap:
-            return None, exc
+            return None, _named_envelope(exc, response, usage)
         why = stopped if truncated(stopped) else f"{written} of {cap} tokens"
         cut = ProviderTruncatedError(
             f"The answer stopped at the output cap ({why}) before it could be read: {exc}"
@@ -2175,12 +2181,94 @@ def read_answer(
         return None, stamp_generation_id(cut, generation_id(response))
 
 
+def _named_envelope(exc: Exception, response: Any, usage: Any) -> Exception:
+    """`exc`, or one that names the vendor's own error when the body was its error envelope (#1029).
+
+    An envelope reaches the read as a body with no answer in it, and the parser's message dumps the
+    whole object (``Malformed Responses payload: {'id': None, 'access_programs': None, …``), so
+    the vendor's code sat past a hundred characters of ``None`` on the decision line's ``detail``.
+    When the body carries an ``error`` and states no usage, the error says so in the vendor's
+    words: its code and its message. Only a `ProviderResponseError` is reworded, so the exception's
+    class, and with it the retry it earns, never changes; the original is chained as its cause.
+    """
+    if type(exc) is not ProviderResponseError or usage_reported(usage):
+        return exc
+    said = _vendor_error(_first(response, (("error",),)))
+    if said is None:
+        return exc
+    named = ProviderResponseError(f"The vendor sent an error in place of an answer: {said}")
+    named.__cause__ = exc
+    return stamp_generation_id(named, getattr(exc, "generation_id", None))
+
+
+def _vendor_error(error: Any) -> str | None:
+    """``code: message`` of a body's ``error`` field, whichever parts it states; else ``None``."""
+    if isinstance(error, str):
+        return error.strip() or None
+    said = [str(part).strip() for part in (_read(error, "code"), _read(error, "message")) if part]
+    return ": ".join(part for part in said if part) or None
+
+
 def answered(error: Exception | None) -> dict[str, Any]:
-    """The verdict fields of an answered call's line, given what `read_answer` returned."""
+    """The verdict fields of an answered call's line, given what `read_answer` returned.
+
+    An adapter writes them through `log_answered_call`, which writes no line at all for an attempt
+    `billed` says was no answer.
+    """
     if error is None:
         return {}
     reason = TRUNCATED if isinstance(error, ProviderTruncatedError) else UNREADABLE
     return {"outcome": FALLBACK, "reason": reason, "level": logging.WARNING}
+
+
+def billed(error: Exception | None, *, usage: Any = None, cost: Any = None) -> bool:
+    """Whether an attempt earns its billed `llm` line, given what `read_answer` returned (#1029).
+
+    A billed line (``ok``, ``refused``, ``fallback``) records what the vendor did with an attempt it
+    **answered**, so it needs evidence of an answer, and the evidence differs by whether the answer
+    could be read:
+
+    - **An answer that was read is its own evidence.** Its line is written whatever its usage says,
+      because usage is a claim about the accounting and never about the answer (issue #491: a
+      vendor reported no usage for complete video describes).
+    - **An answer that could not be read leaves only the vendor's bill**: the usage it stated
+      (`usage_reported`) or a charge it named (`_charged`, xAI's response-level cost). That is the
+      ``fallback`` the contract defines, *"the vendor answered (and billed)"*, tokens and all.
+    - **Or the vendor's word that it stopped at the output cap** (`ProviderTruncatedError`, issue
+      #788): a runaway generated up to the cap, so it was an answer and was billed, even where the
+      vendor states no usage for it (#491's case). Its line is ``fallback reason=truncated``, and
+      the describer reads that verdict off it to give the one larger-budget attempt, never a
+      same-budget retry.
+    - **With neither, the body was not an answer.** Refuseless's Responses ``error`` envelope
+      (``model_unavailable``, ``gateway_error``: no ``id``, no ``output``, no ``usage``) is the
+      vendor declining to serve, and so is a chat body with no ``choices`` and no usage. Each was
+      written as a billed ``fallback`` with no tokens, which the fleet counts as a call whose tokens
+      the extraction lost (`Log Extraction Broken`, three pages on 2026-11-26). It is a fault: the
+      adapter writes no billed line, and the harness's decision follows on its own line
+      (``retrying`` or ``failed``, ``reason=invalid_response``), as every other vendor fault is
+      written. The describer, which writes a captured call's line itself, follows by construction:
+      its `_bill_unreadable` writes nothing for an attempt whose adapter recorded no answer.
+
+    One rule for every adapter, so it is asked once, here (`log_answered_call`), never by an adapter
+    judging a body's shape itself.
+    """
+    return (
+        error is None
+        or isinstance(error, ProviderTruncatedError)
+        or usage_reported(usage)
+        or _charged(cost)
+    )
+
+
+def log_answered_call(error: Exception | None, **fields: Any) -> None:
+    """An adapter's billed `llm` line for an attempt `read_answer` returned, or no line (#1029).
+
+    `fields` are `log_llm_call`'s, less the verdict, which `answered` adds from `error`. The line's
+    own ``usage`` and ``cost`` are the evidence `billed` reads, so what decides whether the line is
+    written is exactly what the line would print.
+    """
+    if billed(error, usage=fields.get("usage"), cost=fields.get("cost")):
+        log_llm_call(**fields, **answered(error))
 
 
 @contextmanager

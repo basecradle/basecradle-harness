@@ -93,11 +93,13 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._faults import routing_refusal
 from basecradle_harness._observability import (
     MEMORY,
+    billed,
     call_outcome,
     generation_id,
     log_llm_call,
     reported_cost,
     serving_endpoint,
+    stamp_generation_id,
     token_counts,
     usage_reported,
 )
@@ -604,6 +606,7 @@ class MemPalaceReranker:
                         response_format={"type": "json_object"},
                         provider=self.routing,
                     )
+                _require_an_answer(response.model_dump())
             except ProviderError as exc:
                 reason, is_config = _fault_of(exc)
                 if retry.again(exc, reason=reason, is_config=is_config, timed_out_after=applied):
@@ -783,6 +786,24 @@ def _messages(query: str, hits: Sequence[dict], k: int) -> list[dict[str, str]]:
         {"role": "system", "content": _SYSTEM_PROMPT.format(k=k)},
         {"role": "user", "content": f"QUERY:\n{query}\n\nCANDIDATES:\n{numbered}"},
     ]
+
+
+def _require_an_answer(data: Any) -> None:
+    """Raise `ProviderResponseError` for a body that is no answer: no reply text and no bill (#1029).
+
+    The reranker reads its own answer, outside `read_answer`, so it asks the shared rule itself
+    (`billed`). A body with no text that the vendor billed is an answer the model left empty, and
+    it stays the caller's ``fallback reason=parse`` with its tokens. A body with no text and no bill
+    (a vendor's error sent in place of an answer) was no answer: it is the retryable
+    ``invalid_response`` fault, written as decision lines only, never a tokenless ``fallback`` the
+    fleet would count as a call whose tokens the extraction lost.
+    """
+    if _reply_text(data):
+        return
+    usage = data.get("usage") if isinstance(data, Mapping) else None
+    unread = ProviderResponseError("The vendor sent a body with no answer in it and no bill.")
+    if not billed(unread, usage=usage, cost=reported_cost(usage)):
+        raise stamp_generation_id(unread, generation_id(data))
 
 
 def _reply_text(data: Any) -> str:

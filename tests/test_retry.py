@@ -24,6 +24,7 @@ import re
 
 import httpx
 import pytest
+import respx
 
 from basecradle_harness._engine import _reason as engine_reason
 from basecradle_harness._exceptions import (
@@ -548,3 +549,92 @@ def test_a_tool_schema_refusal_the_adapter_could_not_recover_from_is_named():
     exc = ProviderToolSchemaError("bad schema", tool_name="get_weather", reason="unsupported")
     assert fault_slug(exc) == "tool_schema"
     assert fault_slug(RuntimeError("adapter bug")) == "provider_error"
+
+
+# === A vendor's error envelope is no call (issue #1029) =========================================
+
+#: The NOC's ``llm_calls`` and ``llm_missing_tokens`` columns, byte for byte as basecradle-noc
+#: ``observability/ai-box.json`` spells their message matches (ClickHouse's ``match`` is
+#: `re.search`). Together they are the *Log Extraction Broken* alert: missing over calls, paged
+#: above 0.5. Unlike `NOT_A_CALL` above, these read ``outcome=`` and ``tokens_in=`` only outside a
+#: quoted value, which is the form the alert runs.
+NOC_LLM_HEAD = (
+    r"^(?:.[^] ]*[]] )?(?:[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:,.]+ )?"
+    r"(?:CRITICAL|ERROR|WARNING|INFO|DEBUG) (?:basecradle_router(?:[.][a-z_]+)* )?(?:PROBE )?"
+    r"(?:[^ -~].[0-9;]*m)?llm provider="
+)
+NOC_NOT_A_CALL = r'^([^"]*"[^"]*")*[^"]*outcome=(retrying|failed)'
+NOC_HAS_TOKENS = r'^([^"]*"[^"]*")*[^"]*tokens_in=[0-9]+'
+
+
+def _noc_columns(journal: list[str]) -> tuple[int, int]:
+    """``(llm_calls, llm_missing_tokens)`` over `journal`, by the NOC's own expressions."""
+    calls = [
+        line
+        for line in journal
+        if re.search(NOC_LLM_HEAD, line) and not re.search(NOC_NOT_A_CALL, line)
+    ]
+    return len(calls), sum(1 for line in calls if not re.search(NOC_HAS_TOKENS, line))
+
+
+@pytest.mark.parametrize("color", ["colored", "no_color"])
+def test_the_burst_of_2026_11_26_replays_as_one_call_with_tokens(color, caplog, monkeypatch):
+    """`count`'s wake at 09:08Z, replayed through the real emitters: the reranker's call answered
+    with tokens, then the brain's three attempts, each answered with Refuseless's
+    ``model_unavailable`` envelope. Before, each attempt wrote a billed ``fallback`` line with no
+    tokens, so the NOC read four calls and three missing their tokens: the 0.75 that paged. Now
+    the attempts write their decision lines only, and the wake is one call with its tokens."""
+    from basecradle_harness import Message, OpenAIProvider, ToolRegistry
+    from basecradle_harness._engine import Engine
+    from tests.test_error_envelope import FAKE_KEY as REFUSELESS_KEY
+    from tests.test_error_envelope import HOST, LIST, MODEL, MODEL_UNAVAILABLE, VENDOR
+    from tests.test_rerank import CHAT_URL as RERANK_CHAT
+    from tests.test_rerank import completion, hits, picks, reranker
+
+    if color == "colored":
+        monkeypatch.delenv(NO_COLOR_ENV, raising=False)
+    else:
+        monkeypatch.setenv(NO_COLOR_ENV, "1")
+    brain = OpenAIProvider(
+        MODEL, api_key=REFUSELESS_KEY, base_url=HOST, provider=VENDOR, surface="responses"
+    )
+    with (
+        caplog.at_level(logging.DEBUG, logger="basecradle_harness"),
+        respx.mock(assert_all_mocked=True, assert_all_called=False) as router,
+    ):
+        router.post(RERANK_CHAT).mock(return_value=httpx.Response(200, json=completion(picks(1))))
+        router.get(f"{HOST}/models").mock(return_value=httpx.Response(200, json=LIST))
+        answered = router.post(f"{HOST}/responses").mock(
+            return_value=httpx.Response(200, json=MODEL_UNAVAILABLE)
+        )
+        reranker().rerank("what is the plan", hits(3), 1, surface="turn0")
+        engine = Engine(brain, ToolRegistry(), response_retries=2, sleep=lambda _s: None)
+        with pytest.raises(ProviderResponseError):
+            engine.run([Message.user("hi")])
+        brain.close()
+
+    journal = [line for line in lines(caplog) if re.search(LLM_CALL_GATE, line)]
+    assert answered.call_count == 3
+    assert _noc_columns(journal) == (1, 0)  # one call, and a missing-token ratio of 0
+    brain_lines = [line for line in journal if f"provider={VENDOR} " in line]
+    assert len(brain_lines) == 3 and all(re.search(NOC_NOT_A_CALL, line) for line in brain_lines)
+    assert "model_unavailable: The model is unavailable." in brain_lines[-1]
+
+
+def test_the_noc_expressions_still_count_a_billed_unreadable_answer():
+    """The other shape, on the same expressions: a billed ``fallback`` with its tokens is a call
+    with its tokens, and the same line without them is the missing-token count the alert exists
+    for. So the replay above reads 0 because the lines changed, not because the columns cannot see
+    a ``fallback``."""
+    billed = record(
+        logging.WARNING,
+        "llm provider=openrouter purpose=main model=z-ai/glm-5.3 duration=3.10s tokens_in=90 "
+        "tokens_out=10 tokens_total=100 outcome=fallback reason=invalid_response",
+    )
+    tokenless = record(
+        logging.WARNING,
+        "llm provider=refuseless purpose=main model=kimi-k3.1-pro-abliterated duration=12.94s "
+        "outcome=fallback reason=invalid_response",
+    )
+    assert _noc_columns([billed]) == (1, 0)
+    assert _noc_columns([tokenless]) == (1, 1)

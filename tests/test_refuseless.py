@@ -1111,13 +1111,15 @@ def test_a_gap_in_the_calls_own_usage_is_counted_and_never_reread(gaps, usage):
 
 
 def test_the_wake_across_the_outage_reads_as_what_it_was(gaps, caplog):
-    """Wake B of issue #876, call by call: a usage-less `fallback` attempt, then answered calls
+    """Wake B of issue #876, call by call: a usage-less unreadable attempt, then answered calls
     priced from a list that answered without a price for the model.
 
-    The fallback reported no usage, so it has no tokens a price is missing for and states no gap.
-    Before, its ``not_reported`` WARNING was written first, and being once per wake it stood for
-    the answered calls' real gap too, with nothing on their lines: 23 unpriced calls read alike to
-    one. Now each answered call says so, and the list is read again until it prices them.
+    The unreadable attempt reported no usage, so it states no gap. Before, its ``not_reported``
+    WARNING was written first, and being once per wake it stood for the answered calls' real gap
+    too, with nothing on their lines: 23 unpriced calls read alike to one. Now each answered call
+    says so, and the list is read again until it prices them. And since issue #1029 a body with no
+    answer in it and no bill is no call at all: it writes no billed line (the engine's decision
+    line is its only one), where it was once a tokenless ``fallback`` the fleet counted.
     """
     caplog.set_level(logging.INFO, logger="basecradle_harness")
     clock = _Clock()
@@ -1142,8 +1144,8 @@ def test_the_wake_across_the_outage_reads_as_what_it_was(gaps, caplog):
         adapter.close()
         assert models.call_count == 2
     llm = [plain(r.getMessage()) for r in caplog.records if r.getMessage().startswith("llm ")]
-    fallback, *lines = llm
-    assert "outcome=fallback" in fallback and "cost_gap" not in fallback
+    lines = llm
+    assert not any("outcome=fallback" in line for line in lines)
     assert [_cost_of(line) for line in lines] == [None, None, 0.00022]
     assert [" cost_gap=not_reported " in line for line in lines] == [True, True, False]
     assert gaps() == [NOT_REPORTED_GAP]

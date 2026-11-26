@@ -93,12 +93,11 @@ from basecradle_harness._observability import (
     UNPRICED_HOST,
     UNPRICED_TIER,
     ServerToolTally,
-    answered,
     finish_reason,
     generation_id,
     generation_id_header,
+    log_answered_call,
     log_cost_unpriced,
-    log_llm_call,
     log_server_tools,
     read_answer,
     reasoning_apart,
@@ -842,7 +841,8 @@ class OpenAIProvider:
         cost, gap = reported_cost(usage), None
         if cost is None:
             cost, gap = self._cost(data, usage)
-        log_llm_call(
+        log_answered_call(
+            unreadable,
             provider=self.provider,
             model=self.model,
             # Timed before the read, so the line measures the vendor's call and nothing of ours.
@@ -858,8 +858,6 @@ class OpenAIProvider:
             # The body's own ``id`` on both surfaces (issue #634): a ``chatcmpl-`` or ``resp_`` id
             # from OpenAI, a uuid from xAI, the ``gen-`` generation id from OpenRouter.
             generation_id=generation_id(data),
-            # An answer the caller could not read says so on this, its one billed line (#782).
-            **answered(unreadable),
         )
 
     def _cost(self, data: Mapping[str, Any], usage: Any) -> tuple[float | None, str | None]:
