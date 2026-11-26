@@ -44,7 +44,7 @@ from basecradle_harness import Message, MessagesTool, Session, Tool, ToolCall
 from basecradle_harness._session import INTERRUPTED, STOPPED, STOPPED_NOTE
 from basecradle_harness._stop import WakeStopped
 from basecradle_harness._wake import ClaimStore, SeenStore
-from tests.conftest import plain
+from tests.conftest import REPO, child_env, plain
 from tests.test_wake import (
     BC_URL,
     M0,
@@ -64,7 +64,6 @@ from tests.test_wake import (
     timeline,
 )
 
-REPO = Path(__file__).resolve().parent.parent
 BODY = "Can you look into the owl sightings for me?"
 
 
@@ -467,7 +466,7 @@ def _child(script: str, home: Path, *, ready_pipe: bool = False) -> subprocess.P
     stderr), so a child that runs `main()` announces readiness on a descriptor the wake never touches,
     named by ``READY_FD``, rather than by printing it.
     """
-    env = {**os.environ, "NO_COLOR": "1", "PYTHONPATH": str(REPO)}
+    env = child_env()
     fds: tuple[int, ...] = ()
     ready = None
     if ready_pipe:

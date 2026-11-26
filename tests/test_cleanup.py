@@ -56,7 +56,7 @@ from basecradle_harness._report import BillingState
 from basecradle_harness._session import Session
 from basecradle_harness._token import write_token_to_env_file
 from basecradle_harness._wake import Claim
-from tests.conftest import plain
+from tests.conftest import child_env, plain
 
 # Real, well-formed UUIDv7 values (never `1111…` junk), per the test-data rule.
 DELETED = "0190a8c1-7f3e-7c2a-9b1d-3e4f5a6b7c8d"
@@ -958,7 +958,7 @@ def test_a_recoverer_backs_off_a_claim_something_live_now_holds(tmp_path):
 def test_the_package_imports_where_there_is_no_fcntl():
     probe = "import sys; sys.modules['fcntl'] = None; import basecradle_harness; print('ok')"
     result = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, check=False
+        [sys.executable, "-c", probe], env=child_env(), capture_output=True, text=True, check=False
     )
 
     assert result.stdout.strip() == "ok", result.stderr
