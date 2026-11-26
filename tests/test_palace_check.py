@@ -1,9 +1,11 @@
 """`basecradle-harness-palace-check`: prove a palace serves from where its home is now (issue #606).
 
-MemPalace is an optional extra and not installed in the test env, so its three modules are faked at
-the ``sys.modules`` boundary, the way `test_mempalace.py` and `test_scrub.py` fake them. The fakes
-model what the check depends on: a paged collection, a searcher that honors ``n_results``, and a
-dry-run mine that prints MemPalace's per-file lines.
+MemPalace is an optional extra, so its modules are faked at the ``sys.modules`` boundary, the way
+`test_mempalace.py` and `test_scrub.py` fake them. The fakes model what the check depends on: a
+paged collection, a searcher that honors ``n_results``, and a dry-run mine that prints MemPalace's
+per-file lines. The extra's distribution is faked absent beside them (`mempalace_not_installed`),
+because its version is read off installed metadata, which no module fake reaches: with the real
+extra installed, a search would take MemPalace 3.9's threshold decision instead (issue #1024).
 """
 
 import contextlib
@@ -94,7 +96,7 @@ def _drawers(home, *, registered_here=0, unhashed=0):
 
 
 @pytest.fixture
-def fake(monkeypatch):
+def fake(monkeypatch, mempalace_not_installed):
     """Install fake ``mempalace.palace`` / ``.searcher`` / ``.convo_miner``; return their records."""
     state = types.SimpleNamespace(
         collection=None,

@@ -159,7 +159,7 @@ def test_both_palace_path_vars_empty_falls_back_to_the_agent_home(
 
 
 def test_each_mempalace_name_binds_its_own_adapter_over_the_one_palace(
-    monkeypatch, tmp_path, mempalace_selector
+    monkeypatch, tmp_path, mempalace_selector, mempalace_not_installed
 ):
     """`mempalace` binds the adapter issue #1011 built; `mempalace-previous` the one before it.
 
@@ -293,14 +293,15 @@ def test_describe_names_the_default_sqlite_provider_with_no_backing_package(tmp_
     )
 
 
-def test_describe_names_a_bound_mempalace_provider_whose_extra_is_missing(tmp_path):
+def test_describe_names_a_bound_mempalace_provider_whose_extra_is_missing(
+    tmp_path, mempalace_not_installed
+):
     """Bound to MemPalace with the extra *not installed* → `("mempalace", None)`.
 
     A real, reachable state: binding is lazy (the adapter imports MemPalace only on the first
     `observe`/`context`), so an agent selects the provider fine and then loses its memory at the
     first wake. `None` on the version of a *named* backing package is the defect signal that
-    catches it off-box — the case the test env genuinely reproduces, since MemPalace is an
-    optional extra this suite never installs.
+    catches it off-box. The extra's absence is faked, so the case holds in a venv that has it.
     """
     assert describe_memory_provider(MemPalaceMemoryProvider(tmp_path / "palace")) == (
         "mempalace",
