@@ -234,6 +234,37 @@ def mempalace_not_installed(monkeypatch):
 
 
 @pytest.fixture
+def mempalace_config(monkeypatch):
+    """A fake ``mempalace.config``: where upstream reads its config, as the test says (issue #1026).
+
+    The publisher and the sweep ask upstream for that directory (`_mempalace.cli_config_dir`,
+    ``MempalaceConfig().config_dir``), and most of the suite runs without the extra. The returned
+    module's ``config_dir`` is the answer: ``None`` (the default) is ``~/.mempalace``, read at the
+    call, the directory upstream reads on every fleet box, where that file already exists; a test of
+    another directory sets it. The real choice is held on real palaces
+    (``test_mempalace_publish_real.py``). An installed MemPalace stays the parent package, so its
+    other submodules still import.
+    """
+    module = types.ModuleType("mempalace.config")
+    module.config_dir = None
+
+    class MempalaceConfig:
+        @property
+        def config_dir(self) -> pathlib.Path:
+            return pathlib.Path(module.config_dir or pathlib.Path.home() / ".mempalace")
+
+    module.MempalaceConfig = MempalaceConfig
+    try:
+        parent = importlib.import_module("mempalace")
+    except ImportError:
+        parent = types.ModuleType("mempalace")
+        monkeypatch.setitem(sys.modules, "mempalace", parent)
+    monkeypatch.setitem(sys.modules, "mempalace.config", module)
+    monkeypatch.setattr(parent, "config", module, raising=False)
+    return module
+
+
+@pytest.fixture
 def fake_mempalace(monkeypatch):
     """Install fake ``mempalace.convo_miner`` / ``.searcher`` / ``.palace`` / ``.normalize``.
 

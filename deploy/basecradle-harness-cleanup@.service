@@ -36,7 +36,7 @@ ExecStart=/home/%i/venv/bin/basecradle-harness-cleanup --sweep
 # Sandboxing — the OS bounds this sweep, not only its code (basecradle-noc#735). The founder's
 # rule: we clean what WE created; an agent's own property in its home — workspace/, scratch/,
 # scripts, repos, wallets, vaults — is never ours to touch, whatever its age. So the write
-# sandbox is EXACTLY the three places `basecradle_harness._cleanup` reaches, read off the
+# sandbox is EXACTLY the places `basecradle_harness._cleanup` reaches, read off the
 # harness source at the fleet's pinned version, and re-verified per agent against that agent's
 # own agent.env by `install-cleanup-timer` before these bytes are ever stamped:
 #
@@ -48,15 +48,20 @@ ExecStart=/home/%i/venv/bin/basecradle-harness-cleanup --sweep
 #                               BASECRADLE_TOKEN), and the in-place token re-mint
 #                               `_token.write_token_to_env_file` performs on a 401.
 #   /home/%i/.mempalace         ONLY its top level, for the stranded `.config.json.<hex>.tmp`
-#                               `_mempalace._write_cli_config` leaves behind. The sweep never
+#   /home/%i/.config/mempalace  `_mempalace._write_cli_config` leaves behind. The sweep never
 #                               walks beneath it, and the palace itself lives under harness/.
+#                               The publisher writes into whichever of the two MemPalace reads
+#                               its config from (`MempalaceConfig().config_dir`, issue #1026):
+#                               ~/.mempalace where that already holds an install, as on every
+#                               box today, else ~/.config/mempalace. The sweep follows the same
+#                               answer, and one it cannot write is reported and skipped.
 #
 # Everything else in the home — workspace/, scratch/, wallets/, .ssh/, the venv, the home
 # directory itself — is READ-ONLY to this unit: a write there fails EROFS. READS stay
 # unrestricted, deliberately: the sweep must read what it classifies, and full transparency
 # is the founder's rule — it is touching, not reading, that is fenced. The `-` prefix makes a
-# missing ~/.mempalace ignored rather than a unit that refuses to start (agents on the sqlite
-# memory provider have none).
+# missing ~/.mempalace or ~/.config/mempalace ignored rather than a unit that refuses to start
+# (agents on the sqlite memory provider have neither, and a MemPalace agent has one or both).
 #
 # `ProtectHome=read-only` IS THE DIRECTIVE THAT ENFORCES ALL OF THAT, and it is not an extra
 # belt beside ReadWritePaths — it is the whole fence. MEASURED on systemd 255, not assumed:
@@ -75,6 +80,7 @@ ProtectHome=read-only
 ReadWritePaths=/home/%i/harness
 ReadWritePaths=/home/%i/.config/basecradle
 ReadWritePaths=-/home/%i/.mempalace
+ReadWritePaths=-/home/%i/.config/mempalace
 PrivateTmp=true
 ProtectControlGroups=true
 ProtectKernelModules=true

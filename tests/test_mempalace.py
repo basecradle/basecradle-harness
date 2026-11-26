@@ -1400,12 +1400,13 @@ def test_missing_mempalace_degrades_to_an_actionable_error(tmp_path, monkeypatch
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
+def home(tmp_path, monkeypatch, mempalace_config):
     """An isolated `$HOME`, so publishing can never touch the developer's real `~/.mempalace`.
 
-    `Path.home()` resolves through `HOME` on POSIX, which is what the publisher uses — and what
-    upstream's `MempalaceConfig` uses for the same directory, so pinning it here moves both halves
-    together, exactly as a real agent's OS user does.
+    `Path.home()` resolves through `HOME` on POSIX, which is what upstream's `MempalaceConfig` uses,
+    so pinning it here moves both halves together, exactly as a real agent's OS user does. Upstream's
+    config directory is the fake's (`mempalace_config`): ``~/.mempalace``, the fleet's, unless a
+    test says otherwise.
     """
     fake = tmp_path / "home"
     fake.mkdir()
@@ -1416,19 +1417,19 @@ def home(tmp_path, monkeypatch):
 def _cli_default_palace(home: Path, *, palace_flag: str | None = None) -> str:
     """The palace a `mempalace` command would operate on — upstream's own resolution order.
 
-    A faithful transcription of `mempalace.config.MempalaceConfig.palace_path` (MemPalace 3.x):
+    A faithful transcription of `mempalace.config.MempalaceConfig.palace_path` (MemPalace 3.11):
     an explicit ``--palace`` wins, then ``MEMPALACE_PALACE_PATH`` / ``MEMPALACE_PALACE`` /
-    ``MEMPAL_PALACE_PATH``, then
-    ``~/.mempalace/config.json``'s ``palace_path`` (expanduser'd), then ``~/.mempalace/palace``.
+    ``MEMPAL_PALACE_PATH``, then the ``palace_path`` (expanduser'd) of the ``config.json`` in
+    upstream's config directory, then the ``palace`` beside it. The directory is the one the
+    `mempalace_config` fake answers; the real choice is held on real palaces.
     Every CLI command resolves through exactly this one property — ``status``, ``search``,
     ``sync``, ``mine``, ``repair-status``, ``migrate``, ``wake-up`` alike — which is why pointing
     it is enough to point all of them.
 
     Transcribed rather than imported because MemPalace is an optional extra that most of the suite
     runs without (it drags ChromaDB and an ONNX runtime in, for one property). A transcription
-    can drift from the package it describes, so it is checked against the **real** package by a
-    live smoke before a change here ships: install the extra, publish, and run bare ``mempalace
-    status`` / ``search`` against a palace the adapter itself mined.
+    can drift from the package it describes, so it is checked against the **real** package by
+    ``test_mempalace_publish_real.py``, which publishes and resolves through upstream itself.
     """
     if palace_flag is not None:
         return os.path.abspath(os.path.expanduser(palace_flag))
@@ -1439,12 +1440,12 @@ def _cli_default_palace(home: Path, *, palace_flag: str | None = None) -> str:
     )
     if env:
         return os.path.abspath(os.path.expanduser(env))
-    config_file = home / ".mempalace" / "config.json"
+    config_dir = Path(sys.modules["mempalace.config"].MempalaceConfig().config_dir)
     try:
-        stored = json.loads(config_file.read_text(encoding="utf-8")).get("palace_path")
-    except (OSError, json.JSONDecodeError, AttributeError):
+        stored = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))["palace_path"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
         stored = None
-    return os.path.expanduser(stored or str(home / ".mempalace" / "palace"))
+    return os.path.expanduser(stored or str(config_dir / "palace"))
 
 
 def _bind(monkeypatch, agent_home: Path, selector: str) -> MemPalaceMemoryProvider:
@@ -1476,6 +1477,26 @@ def test_publishing_points_the_bare_cli_at_the_live_palace(
 
     assert _cli_default_palace(home) == str(provider.palace_path)
     assert _cli_default_palace(home) != str(home / ".mempalace" / "palace")
+
+
+def test_it_publishes_into_the_directory_upstream_reads_and_nowhere_else(
+    home, monkeypatch, tmp_path, mempalace_config, mempalace_selector
+):
+    """Upstream chooses its config directory (issue #1026); the harness asks it and writes there.
+
+    Here upstream reads ``~/.config/mempalace``, as it does on a box whose ``~/.mempalace`` holds no
+    install. Writing ``~/.mempalace/config.json`` anyway would make that a legacy install, which
+    upstream then reads instead, and every setting in the XDG file would stop being read.
+    """
+    mempalace_config.config_dir = home / ".config" / "mempalace"
+    provider = _bind(monkeypatch, tmp_path / "agent", mempalace_selector)
+
+    _publish_palace_binding(provider)
+
+    written = json.loads((home / ".config" / "mempalace" / "config.json").read_text())
+    assert written["palace_path"] == str(provider.palace_path)
+    assert not (home / ".mempalace").exists()
+    assert _cli_default_palace(home) == str(provider.palace_path)
 
 
 def test_the_published_value_is_exactly_what_the_adapter_bound(

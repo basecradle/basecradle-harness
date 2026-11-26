@@ -61,11 +61,11 @@ adapter; a production deployment would compact or rotate them.
 
 **One palace, one mind — including from the CLI** (issue #409). The adapter's palace lives under
 the *agent's* home (``$HARNESS_HOME/mempalace``), which is what keeps two agents on one box from
-sharing a mind; MemPalace's own `mempalace` CLI defaults to ``~/.mempalace/palace``, which is right
+sharing a mind; MemPalace's own `mempalace` CLI defaults to a ``palace`` beside its config, which is right
 for the 1-AI-1-human install upstream ships for. Nothing joined the two, so a bare ``mempalace
 status`` on a provisioned agent reported an empty palace it had never used while the live one sat
 a directory away with thousands of drawers. `publish_palace_binding` closes that: the harness
-*publishes* the path it just bound into ``~/.mempalace/config.json``, so every CLI command that
+*publishes* the path it just bound into the ``config.json`` upstream reads (`cli_config_dir`), so every CLI command that
 defaults its palace lands on the agent's live one. It is a **projection of the binding, never an
 input to it** — the adapter reads that file back at no point, so the file can never redirect the
 agent's mind, and it is rewritten from the live value on every bind so it cannot go stale.
@@ -291,10 +291,10 @@ _MISSING = (
     "provider:  pip install basecradle-harness[mempalace]"
 )
 
-# Where the `mempalace` CLI keeps its config, and the key it reads the default palace from
+# The file the `mempalace` CLI keeps its config in, inside the directory upstream reads it from
+# (`cli_config_dir`), and the key it reads the default palace from
 # (`mempalace.config.MempalaceConfig`). Upstream's own names — the harness publishes into the
 # operator's existing file rather than inventing a parallel one. See `publish_palace_binding`.
-_CLI_CONFIG_DIR = ".mempalace"
 _CLI_CONFIG_FILE = "config.json"
 _CLI_PALACE_KEY = "palace_path"
 
@@ -837,13 +837,32 @@ class MemPalaceSearchTool(PlatformTool):
 # --- the CLI binding: one palace, reachable by both halves (issue #409) -------
 
 
+def cli_config_dir() -> Path:
+    """The directory MemPalace reads its config from: upstream's answer, never ours (issue #1026).
+
+    ``MempalaceConfig().config_dir`` is upstream's public "active config directory (XDG-aware)"
+    property, documented for callers that need the directory "without reaching into
+    ``_config_dir``". Since 3.10 upstream chooses it in an order of its own: ``MEMPALACE_CONFIG_DIR``,
+    then ``~/.mempalace`` when that holds a real install, then ``$XDG_CONFIG_HOME/mempalace``, then
+    ``~/.config/mempalace``. The harness used to assume ``~/.mempalace``, and that copy of the rule
+    fell behind: over an XDG ``config.json`` a publish created ``~/.mempalace/config.json``, which
+    upstream's back-compatibility rule then read instead, so the operator's own settings
+    (``collection_name``, ``embedding_model``) silently stopped being read, by the CLI and by the
+    library in the agent's own wake. Asking upstream is what keeps one rule, upstream's.
+
+    Constructing the config reads its file and writes nothing (measured on 3.11.0), and imports no
+    ChromaDB. It raises `ImportError` naming the extra where MemPalace is not installed.
+    """
+    return Path(_import("config").MempalaceConfig().config_dir)
+
+
 def publish_palace_binding(palace_path: str | Path) -> Path | None:
     """Point the `mempalace` CLI's *default* palace at the one the harness just bound.
 
-    Writes ``palace_path`` into ``~/.mempalace/config.json`` — the file every ``mempalace``
-    command reads when it is given no ``--palace`` — so a bare ``mempalace status`` / ``search`` /
-    ``sync`` / ``repair-status`` operates on the agent's live palace instead of the empty
-    ``~/.mempalace/palace`` default it has never used. Returns the file it wrote, or ``None`` when
+    Writes ``palace_path`` into the ``config.json`` in `cli_config_dir` — the file every
+    ``mempalace`` command reads when it is given no ``--palace`` — so a bare ``mempalace status`` /
+    ``search`` / ``sync`` / ``repair-status`` operates on the agent's live palace instead of the
+    empty ``palace`` beside that file, a default it has never used. Returns the file it wrote, or ``None`` when
     there was nothing to do (already correct) or nothing it *may* do (an unreadable file — see
     below). The caller guards it: publishing is a convenience, and a failure here must never take a
     wake down.
@@ -870,7 +889,7 @@ def publish_palace_binding(palace_path: str | Path) -> Path | None:
     after.)
 
     **Nothing here creates a palace.** It writes one small JSON file; it never runs ``init`` or
-    ``mine``, and it never materializes ``~/.mempalace/palace``. It is reached only when an agent
+    ``mine``, and it never materializes upstream's default palace. It is reached only when an agent
     binds the MemPalace provider (``HARNESS_MEMORY_PROVIDER=mempalace`` or its second name,
     ``mempalace-previous``), so a SQLite-provider agent and a non-harness MemPalace user keep
     upstream's defaults exactly.
@@ -882,7 +901,7 @@ def publish_palace_binding(palace_path: str | Path) -> Path | None:
     never reads it, and ``--palace`` names either one.
     """
     wanted = os.path.abspath(os.path.expanduser(str(palace_path)))
-    config_dir = Path.home() / _CLI_CONFIG_DIR
+    config_dir = cli_config_dir()
     config_file = config_dir / _CLI_CONFIG_FILE
 
     existing = _read_cli_config(config_file)

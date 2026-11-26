@@ -9,8 +9,8 @@ is ``os.path.expanduser("~")``, read on every call. On a fleet box that is right
 the agent's own home and the lock guards its one palace for the life of the account. On a laptop
 every synthetic palace has a fresh temporary path, so every run that writes one adds a lock file
 to the developer's home that nothing will ever remove (issue #630). A local wake writes there too:
-it publishes its palace path into ``~/.mempalace/config.json`` (issue #409), which on a laptop is
-the developer's own file.
+it publishes its palace path into MemPalace's ``config.json`` under ``~`` (issue #409), which on a laptop
+is the developer's own file.
 
 The fix is the premise the harness already runs on: an agent runs in its own home. This wrapper
 makes a temporary directory, runs the command with ``HOME`` pointed at it, and removes it when the

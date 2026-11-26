@@ -595,9 +595,10 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   so a live writer's temp is never touched, and the palace is never walked. *(Mechanics:
   `docs/harness-internals.md`.)*
 - **The OS fences the sweep too, and a refused write fails the run** (issue #536, founder-approved
-  2026-09-19). The fleet unit sandboxes it to exactly the three directories this module writes —
+  2026-09-19). The fleet unit sandboxes it to exactly the directories this module writes —
   `ProtectHome=read-only` plus `ReadWritePaths` for `$HARNESS_HOME`, the config home, and
-  `-/home/%i/.mempalace` — so the boundary above ("only what it staged or wrote") is enforced by
+  MemPalace's config directory (`-/home/%i/.mempalace` and `-/home/%i/.config/mempalace`, whichever
+  `MempalaceConfig().config_dir` names, issue #1026) — so the boundary above ("only what it staged or wrote") is enforced by
   the operating system and not only by an allow-list of filenames. **`ProtectHome=true` is never
   right** (it makes `/home` empty and blinds both the sweep and the founder's read-everything
   supervision), and narrowing `ReadWritePaths` means nothing under `ProtectHome=false`. **The
@@ -610,9 +611,12 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   (errno-agnostic), and **a removal we cannot confirm is a removal we do not claim** (`_present`).
   **Only a refused *write* is judged:** a refused read, an advisory lock the filesystem will not
   give (`LockUnavailable`), a path already gone, and an unparseable watermark stay a `WARNING`
-  and a clean exit. **A run with nothing to remove attempts no write**, so a green run is never
-  proof the `ReadWritePaths` list is right. **Load the `orphan-sweep` skill before editing
-  `_cleanup.py`, the sweep's exit status or log levels, or its unit's sandbox** — it carries the
+  and a clean exit, and so does MemPalace's config directory when the sweep cannot write it at all
+  (the capital's decision on issue #1026: MemPalace chooses it, so an agent can exist before its
+  unit grants it; its temp is named and skipped, never attempted). **A run with nothing to remove
+  attempts no write**, so a green run is never proof the `ReadWritePaths` list is right. **Load
+  the `orphan-sweep` skill before editing `_cleanup.py`, the sweep's exit status or log levels,
+  or its unit's sandbox** — it carries the
   NOC's systemd 255 measurements (basecradle-noc#736), the reason behind each exclusion, and the
   two stdlib traps (`Path.is_dir`'s split across the version matrix, `shutil.rmtree`'s abandoned
   walk) a refactor will undo.

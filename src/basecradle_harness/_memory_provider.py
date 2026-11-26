@@ -430,9 +430,7 @@ def _palace_path(home: str | os.PathLike[str] | None) -> Path:
     ``abspath``-ed exactly as `MempalaceConfig.palace_path` does. The
     one case the two *cannot* be made to agree on is a **relative** value, which upstream resolves
     against the process's cwd — the wake's and the operator's shell's are not the same directory.
-    Set an absolute path. And the list is the current upstream's: MemPalace before 3.11 does not
-    read ``MEMPALACE_PALACE``, so under 3.9 or 3.10 that one variable moves the agent's palace and
-    not the CLI's. Set ``MEMPALACE_PALACE_PATH``, which every version reads.
+    Set an absolute path.
     """
     explicit = next((value for var in PALACE_PATH_VARS if (value := os.environ.get(var))), None)
     if explicit:

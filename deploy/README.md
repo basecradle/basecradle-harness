@@ -41,7 +41,7 @@ in its home — its workspace, the scripts it wrote, the repositories it cloned,
 vaults — is never ours to touch, whatever its age.* The sweep's **code** has always honored that
 (it removes only the harness's own filenames, in the places the harness stages writes), but a
 periodic root-launched unit whose one job is deleting files is where that argument bites hardest,
-so the **OS** enforces it too. The write sandbox is exactly the three places
+so the **OS** enforces it too. The write sandbox is exactly the places
 `basecradle_harness._cleanup` writes:
 
 | Granted write access | Why |
@@ -49,15 +49,16 @@ so the **OS** enforces it too. The write sandbox is exactly the three places
 | `/home/%i/harness` | `$HARNESS_HOME` — the six per-timeline artifact dirs the sweep purges (`sessions`, `marks`, `seen`, `claims`, `breaker`, `billing`), plus the settled claims and `.pruned-through` records it prunes |
 | `/home/%i/.config/basecradle` | the stranded `.basecradle-env.*.tmp` beside `agent.env` (it holds a live `BASECRADLE_TOKEN`), and the in-place token re-mint on a 401 |
 | `-/home/%i/.mempalace` | the stranded `.config.json.<hex>.tmp` at its top level. The *sweep* never walks beneath it; the `-` prefix makes a missing directory ignored rather than a unit that refuses to start |
+| `-/home/%i/.config/mempalace` | the same temp, where MemPalace reads its config from there instead. The publisher and the sweep both ask MemPalace (`MempalaceConfig().config_dir`, issue #1026), which picks `~/.mempalace` when that already holds an install, as on every fleet box today, and `~/.config/mempalace` otherwise. A config directory the sweep cannot write is reported at `WARNING` and skipped, never a failed run. The same `-` prefix |
 
 Everything else in the home is **read-only** to this unit — a write there fails `EROFS`. **Reads
 stay unrestricted, deliberately**: the sweep must read what it classifies, and full transparency is
 the founder's rule — it is *touching* that is fenced, never looking.
 
 **What this does and does not fence, stated precisely.** `ReadWritePaths=` grants a directory **and
-everything beneath it**, so the three rows above are subtrees, not top levels. The sweep's own
+everything beneath it**, so the rows above are subtrees, not top levels. The sweep's own
 restraint is narrower than its sandbox in two places worth naming: it touches only the top level of
-`~/.mempalace`, and it never enumerates `memory.db` (+ `-wal`/`-shm`) or the MemPalace palace, both
+MemPalace's config directory, and it never enumerates `memory.db` (+ `-wal`/`-shm`) or the MemPalace palace, both
 of which live under `$HARNESS_HOME` in the default configuration and are therefore *inside* the
 grant. **The code remains the only thing that keeps this unit off the agent's memory.** The sandbox
 fences the agent's home — its workspace, its scratch, its repos, its wallets, its `.ssh`, the venv —
@@ -75,9 +76,9 @@ Three details are measurements, not preferences, and each was got wrong first:
   it was measured.
 - **Never `ProtectHome=true`.** It makes `/home` inaccessible and empty, which hides the artifacts
   the sweep must classify and blinds the read-everything supervision the founder's rule requires.
-- **The `-` prefix on `.mempalace` is load-bearing.** A `ReadWritePaths` entry naming a missing path
-  fails the unit at namespace setup (exit 226; `ExecStart` never runs), and an agent on the default
-  SQLite memory provider has no `~/.mempalace`.
+- **The `-` prefix on both MemPalace directories is load-bearing.** A `ReadWritePaths` entry naming
+  a missing path fails the unit at namespace setup (exit 226; `ExecStart` never runs), an agent on
+  the default SQLite memory provider has neither directory, and a MemPalace agent may have only one.
 
 A sandbox that is wrong can only fail in the safe direction — a sweep that cannot write, never one
 that writes too much — but a cleanup that silently stops cleaning is worse than a loud one that

@@ -108,14 +108,17 @@ anthropic = ["anthropic>=2.3.0,<3"]
 # otherwise install a vendor SDK it never imports — and a second extra name for one dependency
 # is a second pin the fleet has to keep in step with the first. One dependency, one extra.
 #
-# 3.9.0 is the floor because `search` passes `max_distance` (issue #625), and before 3.9.0
-# (MemPalace#1964) a threshold switches the union pool's lexical half off instead of scoring it.
+# 3.11 is the floor (issue #1026): the harness resolves its palace from the env vars 3.11 reads,
+# `MEMPALACE_PALACE` included, and publishes into the config directory 3.11's public
+# `MempalaceConfig.config_dir` names (3.9 has no such property). Every agent was pinned at 3.11.0
+# when it moved. It subsumes the earlier floor: `search` passes `max_distance` (issue #625), which
+# before 3.9.0 (MemPalace#1964) switches the union pool's lexical half off instead of scoring it.
 #
 # 3.12 is excluded because it removed the cross-file content-hash dedup (MemPalace#2800) that a
 # moved home's recognition rests on: on 3.12 a mine after a home move files every exchange a
 # second time, and the palace check can no longer forecast or relocate it (issue #988). The cap
 # is lifted with the support, in issue #989.
-mempalace = ["mempalace>=3.9.0,<3.12"]
+mempalace = ["mempalace>=3.11,<3.12"]
 
 [project.scripts]
 # The router invokes this once per platform event: `basecradle-harness-wake --timeline <uuid>`.
