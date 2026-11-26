@@ -8,6 +8,7 @@ dry-run mine that prints MemPalace's per-file lines.
 
 import contextlib
 import hashlib
+import re
 import sys
 import types
 from importlib import metadata
@@ -1170,3 +1171,117 @@ def test_relocation_batches_never_split_a_file():
 
     assert [name for batch in batches for name in batch] == list(files)
     assert batches == [["0.md", "1.md"], ["2.md", "3.md"], ["4.md"], ["big.md"]]
+
+
+# --- drawers filed under a BaseCradle name (issue #1014) -------------------------------------------
+
+TIMELINE = "019a3b2c-4d5e-7f60-8a1b-2c3d4e5f6a7b"
+
+#: The NOC's own expressions for the two count lines its re-mine gate reads (`PALACE_DRAWERS_RE` and
+#: `PALACE_ELSEWHERE_RE` in basecradle-noc ``fleetops/rename.py``), copied verbatim: a reword of
+#: either line fails here before it holds a re-mine on a server.
+NOC_DRAWERS_RE = re.compile(
+    r"^drawers: (\d+) total, (\d+) real, (\d+) registry sentinels$", re.MULTILINE
+)
+NOC_ELSEWHERE_RE = re.compile(r"^real drawers filed at another location: (\d+)$", re.MULTILINE)
+
+
+def _named(count, *, piece=1):
+    """Drawers the ``mempalace`` adapter files: a name, our two keys, no ``content_hash``."""
+    return {
+        f"named-{n}": (
+            f"Nova told John named fact number {n}.",
+            _meta(
+                f"basecradle:{TIMELINE}:019e7800-0000-7000-8000-{n:012x}:{piece}",
+                f"2026-11-0{n % 9 + 1}T00:00:00",
+                wing="conversations",
+                extract_mode="exchange",
+                basecradle_timeline=TIMELINE,
+                basecradle_item=f"019e7800-0000-7000-8000-{n:012x}",
+            ),
+        )
+        for n in range(1, count + 1)
+    }
+
+
+def test_the_two_lines_the_noc_reads_keep_their_text_exactly(home, fake, capsys):
+    fake.collection = FakeCollection({**_drawers(home, registered_here=1), **_named(2)})
+
+    _, lines = _run(capsys, home)
+    out = "\n".join(lines)
+
+    drawers, elsewhere = NOC_DRAWERS_RE.search(out), NOC_ELSEWHERE_RE.search(out)
+    assert drawers is not None and drawers.groups() == ("7", "6", "1")
+    assert elsewhere is not None and elsewhere.group(1) == "4"
+    assert "drawers: 7 total, 6 real, 1 registry sentinels" in lines
+    assert "real drawers filed at another location: 4" in lines
+
+
+def test_a_named_drawer_is_counted_on_its_own_line_never_as_moved_or_pre_3_7(home, fake, capsys):
+    """The new adapter's drawers carry a name and no hash; neither makes them moved or pre-3.7."""
+    here = str((home / "mempalace" / "conversations").resolve())
+    odd = {
+        # Neither a path nor a name the parser reads: counted where a reader sees it.
+        "odd-empty": ("Nova told John an odd fact.", _meta("", "2026-09-09T00:00:00")),
+        "odd-name": (
+            "Nova told John a near-name fact.",
+            _meta(f"basecradle:{TIMELINE}:not-a-uuid:1", "2026-09-09T00:00:01"),
+        ),
+        "in-place": (
+            "Nova told John an in-place fact.",
+            _meta(f"{here}/{NAMES[0]}", "2026-09-09T00:00:02", content_hash="ab" * 32),
+        ),
+    }
+    fake.collection = FakeCollection({**_drawers(home, unhashed=1), **_named(5), **odd})
+
+    _, lines = _run(capsys, home)
+
+    at = lines.index("real drawers filed at another location: 6")
+    assert lines[at + 1] == "real drawers filed under a BaseCradle name: 5"
+    # The two odd drawers carry no hash either, so they stay on the pre-3.7 line with the path one.
+    assert lines[at + 2] == "real chunk-0 drawers without content_hash (pre-3.7 schema): 3"
+    # The three kinds add up to the real count: 6 elsewhere + 5 named + 1 in place.
+    assert "drawers: 12 total, 12 real, 0 registry sentinels" in lines
+
+
+def test_the_named_line_is_printed_at_zero(home, fake, capsys):
+    fake.collection = FakeCollection(_drawers(home))
+
+    _, lines = _run(capsys, home)
+
+    at = lines.index("real drawers filed at another location: 4")
+    assert lines[at + 1] == "real drawers filed under a BaseCradle name: 0"
+
+
+def test_a_palace_of_named_drawers_is_not_moved_and_its_probes_say_so(home, fake, capsys):
+    """Probes come from drawers at another location only when there are any; a name is not one."""
+    fake.collection = FakeCollection(_named(4))
+
+    code, lines = _run(capsys, home)
+
+    assert code == 0
+    assert "real drawers filed at another location: 0" in lines
+    assert "real drawers filed under a BaseCradle name: 4" in lines
+    assert "real chunk-0 drawers without content_hash (pre-3.7 schema): 0" in lines
+    assert "probes drawn from drawers any location (none filed elsewhere)" in lines
+    assert sum(line.startswith("PASS: drawer named-") for line in lines) == 3
+
+
+def test_a_named_drawer_takes_no_part_in_the_version_stale_classes(home, fake, monkeypatch):
+    """A version-stale name has no file for a mine to read, so it is neither class's drawer."""
+    monkeypatch.setattr(sys.modules["mempalace.palace"], "CONVO_CHUNKER_VERSION", 2, raising=False)
+    named = _named(2)
+    for _, meta in named.values():
+        meta.update(convo_chunker_version=1, normalize_version=2)
+    moved = _drawers(home)
+    for _, meta in moved.values():
+        meta.update(extract_mode="exchange", convo_chunker_version=1, normalize_version=2)
+    collection = FakeCollection({**moved, **named})
+
+    found = _palace_check.census(collection, home / "mempalace")
+
+    assert found.named == 2
+    assert {drawer_id for drawer_id, _, _ in found.stale_ours + found.stale_theirs} == {
+        f"drawer-{n}" for n in range(4)
+    }
+    assert {drawer_id for drawer_id, _, _ in found.elsewhere} == {f"drawer-{n}" for n in range(4)}

@@ -7,6 +7,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.217.0] - 2026-11-25
+
+### Fixed: the palace check no longer reads the `mempalace` adapter's drawers as moved and pre-3.7 (issue #1014)
+
+`basecradle-harness-palace-check` counted every drawer the `mempalace` adapter files (issue #1011) on two lines that describe something it is not. Its `source_file` is a name, `basecradle:<timeline>:<item>:<piece>`, so the check read it as **filed at another location**; and it carries no `content_hash`, because the adapter writes no field MemPalace's miner owns, so the check read it as **pre-3.7**. After a cutover, a palace whose home never moved would have reported every such drawer on both lines, and the NOC's re-mine gate starts its relocate path on any non-zero location count.
+
+- **The location and pre-3.7 lines keep their text byte for byte** (the NOC reads `drawers: …` and `real drawers filed at another location: <n>` whole) and count only drawers that are not named: a path at another location, or a `source_file` that is neither a path nor a name, which stays on the location line rather than dropping out of the report.
+- **One line is added after the location line, always printed**: `real drawers filed under a BaseCradle name: <n>`, read by `_exchange_records.parse_name`. The three kinds add up to the real count.
+- **A name takes no part in what a mine would do**: it is left out of the version-stale classes, the probes drawn from drawers at another location, and the relocation's count of drawers left at another location. The writing modes already touched none of them.
+
 ## [0.216.0] - 2026-11-25
 
 ### Fixed: a secret a cut-off reply's cut fell inside is redacted as one text with its resume (issue #1020)

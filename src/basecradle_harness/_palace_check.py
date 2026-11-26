@@ -119,6 +119,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from basecradle_harness._exchange_records import parse_name
 from basecradle_harness._memory_provider import (
     MemoryExchange,
     MemoryScope,
@@ -184,6 +185,10 @@ _DIGEST_CHARS = 16
 
 _PAGE = 1000
 
+#: The report line counting drawers filed under a BaseCradle name (issue #1014), printed directly
+#: after the location line, zero included.
+NAMED_LINE = "real drawers filed under a BaseCradle name"
+
 
 @dataclass
 class Census:
@@ -193,10 +198,18 @@ class Census:
     registry: int = 0
     #: Real drawers as ``(drawer_id, metadata, document)``.
     real: list[tuple[str, dict, str]] = field(default_factory=list)
-    #: Real drawers whose ``source_file`` is not in this palace's ``conversations`` directory.
+    #: Real drawers whose ``source_file`` is not in this palace's ``conversations`` directory and
+    #: is not a BaseCradle name: a path at another location (what the previous adapter and
+    #: MemPalace's miner record), or a value that is neither, which is filed somewhere this check
+    #: cannot place, so it is counted here rather than nowhere (issue #1014).
     elsewhere: list[tuple[str, dict, str]] = field(default_factory=list)
-    #: Real chunk-0 drawers with no ``content_hash`` (MemPalace before 3.7). After a move, a mine
-    #: re-files their files as new drawers instead of recognising them.
+    #: Real drawers filed under a BaseCradle name (`parse_name`), the ``mempalace`` adapter's unit
+    #: (issue #1011). A name is not a path: it was never filed at a location, so it is never
+    #: "at another location", and the adapter writes no field the miner owns, so it carries no
+    #: ``content_hash`` by design. No mine of ``conversations/`` reads one either.
+    named: int = 0
+    #: Real chunk-0 drawers with no ``content_hash`` (MemPalace before 3.7), named drawers aside.
+    #: After a move, a mine re-files their files as new drawers instead of recognising them.
     unhashed: int = 0
     files: int = 0
     #: Conversation files on disk with no row recorded under their current path. A mine of the
@@ -259,7 +272,10 @@ def census(collection, palace: Path) -> Census:
             if source.startswith(prefix):
                 recorded.add(source)
             registry = meta.get("room") == _REGISTRY_ROOM
-            if out.chunker is not None and _exchange_mode(meta):
+            # A BaseCradle name has no file for a mine to read, so it takes no part in what a mine
+            # would do: not in the version-stale classes, the location count or the pre-3.7 count.
+            named = parse_name(source) is not None
+            if out.chunker is not None and not named and _exchange_mode(meta):
                 name = Path(source).name
                 if _version_stale(meta, out.chunker, normalize):
                     stale.add(name)
@@ -286,6 +302,9 @@ def census(collection, palace: Path) -> Census:
                     group[1] = meta.get("chunk_total")
             row = (drawer_id, meta, text)
             out.real.append(row)
+            if named:
+                out.named += 1
+                continue
             if not source.startswith(prefix):
                 out.elsewhere.append(row)
             if meta.get("chunk_index", 0) == 0 and not meta.get("content_hash"):
@@ -1025,7 +1044,8 @@ def probes(found: Census) -> tuple[list[tuple[str, dict, str]], bool]:
     """Three real drawers to search for, oldest, middle and newest by ``filed_at``.
 
     Drawn from drawers filed at another location when there are any (after a move, those are the
-    ones that matter), else from all real drawers. The flag says which.
+    ones that matter), else from all real drawers. The flag says which. A drawer filed under a
+    BaseCradle name is never one filed at another location (`Census.named`).
     """
     pool = list(found.elsewhere or found.real)
     pool.sort(key=lambda row: (str(row[1].get("filed_at", "")), row[0]))
@@ -1629,11 +1649,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"FAIL: could not open the palace: {type(error).__name__}{detail}")
             return 1
         found = census(collection, palace)
+        # The first two lines are read whole by the NOC's re-mine gate (`read_palace` in
+        # basecradle-noc), so their text never changes; the named line sits between them and the
+        # pre-3.7 line, and the three kinds of real drawer it and the location line separate add
+        # up to the real count (issue #1014).
         print(
             f"drawers: {found.total} total, {len(found.real)} real, "
             f"{found.registry} registry sentinels"
         )
         print(f"real drawers filed at another location: {len(found.elsewhere)}")
+        print(f"{NAMED_LINE}: {found.named}")
         print(f"real chunk-0 drawers without content_hash (pre-3.7 schema): {found.unhashed}")
         print(
             f"conversation files: {found.files}, "
