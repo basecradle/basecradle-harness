@@ -9,11 +9,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.218.0] - 2026-11-26
 
+### Fixed: the palace binding is published where MemPalace reads its config, and the `mempalace` extra needs 3.11 (issue #1026)
+
+The harness mirrored how MemPalace resolves its palace (`_memory_provider._palace_path`, `_mempalace.publish_palace_binding`, issue #409), and the mirror had fallen behind upstream twice.
+
+- **The config directory is upstream's answer.** Since 3.10 MemPalace chooses where it reads `config.json`: `MEMPALACE_CONFIG_DIR`, else `~/.mempalace` when that holds an install, else `$XDG_CONFIG_HOME/mempalace`, else `~/.config/mempalace`. The harness always wrote `~/.mempalace/config.json`.
+  - Over an existing XDG `config.json` that write turned `~/.mempalace` into an install, which upstream then read instead. The operator's settings (`collection_name`, `embedding_model`, `backend`) silently stopped being read, by the CLI and by the library in the agent's own wake. This was measured on 3.11.0: `collection_name` fell back from `operator_drawers` to `mempalace_drawers`.
+  - With `MEMPALACE_CONFIG_DIR` set, upstream never read the publication.
+  - The publisher now writes into `MempalaceConfig().config_dir`, upstream's public property, still merged, never replaced (`_mempalace.cli_config_dir`). On every fleet box today that is `~/.mempalace`, where the file already exists, so nothing moves.
+- **The sweep follows the same answer.** The stranded-temp pass looks for the publisher's `.config.json.<hex>.tmp` in that directory.
+  - By the capital's decision, a config directory the sweep cannot write to is named at WARNING, with the directory, the temp and the remedy, and skipped, never a failed run: MemPalace chooses the directory, so an agent can exist before its unit grants it.
+  - Where MemPalace is not installed, the pass has nothing to look at.
+- **The cleanup unit template grants `ReadWritePaths=-/home/%i/.config/mempalace`** beside `~/.mempalace` (`deploy/`), with the same `-` prefix for a directory that does not exist.
+- **The palace path reads MemPalace 3.11's short alias.** `MEMPALACE_PALACE` sits between `MEMPALACE_PALACE_PATH` and the legacy `MEMPAL_PALACE_PATH` in upstream's order, and the harness read only the two, so with it set the agent and the CLI resolved different palaces.
+  - One list, `PALACE_PATH_VARS`, now serves every reader, the palace check's cleared variables included.
+  - The suite clears all three variables for every test, so a developer's shell never moves a test's palace.
+- **`mempalace>=3.11,<3.12`** (was `>=3.9.0`): 3.10 added the public `config_dir` property and 3.11 the alias, and every agent was already pinned at 3.11.0.
+- **Each is held to upstream on real palaces.**
+  - `test_memory_provider.py` reads the variable names off upstream's `palace_path` property.
+  - `test_mempalace_publish_real.py` publishes a fresh home, an existing XDG config, a named config directory and an existing install, and asks upstream's own `MempalaceConfig` what it reads after each.
+
 ### Changed: MemPalace's results are read by attribute everywhere, never through the shim upstream will remove (issue #1026)
 
 MemPalace keeps the dict style on its typed collection results (`result.get("ids")`, `result["ids"]`) only as "a migration shim … scheduled for removal in a follow-up cleanup. New code MUST use attribute access" (`mempalace.backends.base`, unchanged from 3.9.0 to 3.11.0). The previous adapter, the scrub, the prune and the palace check made twenty-two reads that way, one of them on the observe's rollback, so the release that removes the shim would have broken each on upgrade, the rollback silently (its failure is logged and swallowed).
 
-- **Every read is by attribute** (`page.ids`, `got.metadatas`), the form upstream documents and the `mempalace` adapter already used. Attribute access works across the whole supported range, 3.9.0 through 3.11.
+- **Every read is by attribute** (`page.ids`, `got.metadatas`), the form upstream documents and the `mempalace` adapter already used. Attribute access works on every version the extra has allowed, 3.9.0 through 3.11.
 - **The suite can no longer pass on the old form.** Every fake collection returns results with MemPalace's fields and no dict protocol (`tests/_palace_results.py`, held to upstream's field lists when the extra is installed), and `tests/test_palace_results.py` fails on a dict-style read of a result anywhere in the package or the suite, read from the syntax tree, so a path no test drives and a real-palace test that runs only with the extra are held too.
 
 ## [0.217.0] - 2026-11-25
