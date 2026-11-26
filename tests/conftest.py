@@ -38,6 +38,25 @@ def plain(text: str) -> str:
     return _ANSI.sub("", text)
 
 
+#: The repository root, and the directory holding the package: what a child process must import.
+REPO = pathlib.Path(__file__).resolve().parent.parent
+SRC_ROOT = REPO / "src"
+
+
+def child_env(**extra: str) -> dict[str, str]:
+    """The environment for a child Python process that imports the harness: the code under test.
+
+    A child inherits the parent's environment but never its ``sys.path``, so a child handed the
+    repository root alone imports whatever harness is *installed* — in CI that is this checkout, so
+    the gap is invisible, while a suite run from one checkout against another install runs two
+    versions at once and fails on the difference (issue #1016). ``src`` comes first so it shadows
+    any install; the root follows so a child can import ``tests``; an inherited ``PYTHONPATH`` is
+    kept after both. Every test that spawns a Python child importing the harness uses this.
+    """
+    path = [str(SRC_ROOT), str(REPO), *filter(None, [os.environ.get("PYTHONPATH")])]
+    return {**os.environ, "NO_COLOR": "1", **extra, "PYTHONPATH": os.pathsep.join(path)}
+
+
 #: The NOC's log-store canary rule `credential_assignment`, byte for byte as basecradle-noc spells it
 #: (`observability/log-canary.json`, read at 4ca50868bd219493c0290b62d89f267915c8d70f, the squash
 #: of basecradle-noc#1560, 2026-11-18; `docs/observability.md` §10), and as basecradle-router holds

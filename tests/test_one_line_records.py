@@ -29,7 +29,6 @@ import re
 import subprocess
 import sys
 import textwrap
-from pathlib import Path
 
 import pytest
 
@@ -45,9 +44,9 @@ from basecradle_harness._observability import (
     log_handler,
     log_unspoken,
 )
+from tests.conftest import REPO, SRC_ROOT, child_env
 
-REPO = Path(__file__).resolve().parent.parent
-SRC = REPO / "src" / "basecradle_harness"
+SRC = SRC_ROOT / "basecradle_harness"
 
 #: A well-formed model-call line, fabricated: what a forgery would plant at a record's start.
 FORGED = (
@@ -353,7 +352,7 @@ _WAKE = """
 def wake_journal(tmp_path_factory):
     """The bytes a real wake process wrote: its stderr (the journal) and its stdout."""
     home = tmp_path_factory.mktemp("wake")
-    env = {**os.environ, "NO_COLOR": "1", "PYTHONPATH": str(REPO)}
+    env = child_env()
     env.pop("HARNESS_LOG_LEVEL", None)
     done = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(_WAKE), str(home)],
@@ -424,7 +423,7 @@ def _owned(script: str, **popen) -> subprocess.CompletedProcess:
         log = logging.getLogger("basecradle_harness")
         handler = _configure_logging()
     """
-    env = {**os.environ, "NO_COLOR": "1", "PYTHONPATH": str(REPO)}
+    env = child_env()
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(prelude) + textwrap.dedent(script)],
         cwd=REPO,
