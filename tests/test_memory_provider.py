@@ -312,7 +312,7 @@ def test_describe_names_a_bound_mempalace_provider_whose_extra_is_missing(
 def test_describe_reports_the_mempalace_extras_installed_version(tmp_path, monkeypatch):
     """With the extra installed, the version is ground truth read off its distribution — the
     field basecradle-noc#195's `pinned_extra_versions` drift axis compares against the pin.
-    MemPalace is not installed here, so its distribution metadata is the one thing faked."""
+    The distribution metadata is faked, so the version is the test's whatever is installed."""
     monkeypatch.setattr(metadata, "version", lambda dist: {"mempalace": "3.5.0"}[dist])
 
     assert describe_memory_provider(MemPalaceMemoryProvider(tmp_path / "palace")) == (

@@ -1,7 +1,7 @@
 """`basecradle-harness-scrub-palace`: find harness scaffolding in a mined palace, then delete it.
 
-MemPalace is an optional extra and not installed in the test env, so its library is faked at the
-``sys.modules`` boundary exactly as `tests/test_mempalace.py` does — here the fake is a small
+MemPalace is an optional extra, so its library is faked at the ``sys.modules`` boundary, whatever
+is installed, exactly as `tests/test_mempalace.py` does — here the fake is a small
 in-memory drawer collection with the `get`/`delete` surface upstream's backend protocol defines
 (`mempalace.backends.base`).
 

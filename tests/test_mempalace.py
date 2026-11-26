@@ -1,7 +1,7 @@
 """The MemPalace reference adapter, against a mocked MemPalace library.
 
-MemPalace is an optional extra and not installed in the test env, so its library is
-faked at the ``sys.modules`` boundary (the adapter imports ``mempalace.convo_miner`` /
+MemPalace is an optional extra, so its library is faked at the ``sys.modules`` boundary,
+whatever is installed, (the adapter imports ``mempalace.convo_miner`` /
 ``mempalace.searcher`` lazily). These pin the contract the adapter relies on: `observe`
 writes a quote-formatted exchange file and files it whole, `context` retrieves and renders top-K hits, the
 provider exposes one **read-only** `memory_search` tool over that same retrieval call, and a
@@ -1423,8 +1423,8 @@ def _cli_default_palace(home: Path, *, palace_flag: str | None = None) -> str:
     ``sync``, ``mine``, ``repair-status``, ``migrate``, ``wake-up`` alike — which is why pointing
     it is enough to point all of them.
 
-    Transcribed rather than imported because MemPalace is an optional extra this suite never
-    installs (it would drag ChromaDB and an ONNX runtime into CI for one property). A transcription
+    Transcribed rather than imported because MemPalace is an optional extra that most of the suite
+    runs without (it drags ChromaDB and an ONNX runtime in, for one property). A transcription
     can drift from the package it describes, so it is checked against the **real** package by a
     live smoke before a change here ships: install the extra, publish, and run bare ``mempalace
     status`` / ``search`` against a palace the adapter itself mined.

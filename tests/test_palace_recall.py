@@ -14,7 +14,7 @@ oracle that reads the request the reranker actually sent: it picks the candidate
 query, and never one marked ``IGNORED``.
 
 **MemPalace is faked at the ``sys.modules`` boundary**, as ``test_palace_check.py`` does, because it
-is an optional extra and not installed here. The fake honours ``n_results`` and ``max_distance``,
+is an optional extra, whatever is installed. The fake honours ``n_results`` and ``max_distance``,
 and answers the two private helpers the drop count asks.
 """
 
