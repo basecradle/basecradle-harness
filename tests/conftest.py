@@ -23,6 +23,7 @@ import respx.mocks
 from respx.mocks import HTTPCoreMocker
 
 from basecradle_harness import OpenAIProvider, _mempalace, _mining, _openai, _venv
+from basecradle_harness._memory_provider import PALACE_PATH_VARS
 from tests._palace_results import got
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -233,6 +234,37 @@ def mempalace_not_installed(monkeypatch):
 
 
 @pytest.fixture
+def mempalace_config(monkeypatch):
+    """A fake ``mempalace.config``: where upstream reads its config, as the test says (issue #1026).
+
+    The publisher and the sweep ask upstream for that directory (`_mempalace.cli_config_dir`,
+    ``MempalaceConfig().config_dir``), and most of the suite runs without the extra. The returned
+    module's ``config_dir`` is the answer: ``None`` (the default) is ``~/.mempalace``, read at the
+    call, the directory upstream reads on every fleet box, where that file already exists; a test of
+    another directory sets it. The real choice is held on real palaces
+    (``test_mempalace_publish_real.py``). An installed MemPalace stays the parent package, so its
+    other submodules still import.
+    """
+    module = types.ModuleType("mempalace.config")
+    module.config_dir = None
+
+    class MempalaceConfig:
+        @property
+        def config_dir(self) -> pathlib.Path:
+            return pathlib.Path(module.config_dir or pathlib.Path.home() / ".mempalace")
+
+    module.MempalaceConfig = MempalaceConfig
+    try:
+        parent = importlib.import_module("mempalace")
+    except ImportError:
+        parent = types.ModuleType("mempalace")
+        monkeypatch.setitem(sys.modules, "mempalace", parent)
+    monkeypatch.setitem(sys.modules, "mempalace.config", module)
+    monkeypatch.setattr(parent, "config", module, raising=False)
+    return module
+
+
+@pytest.fixture
 def fake_mempalace(monkeypatch):
     """Install fake ``mempalace.convo_miner`` / ``.searcher`` / ``.palace`` / ``.normalize``.
 
@@ -253,7 +285,8 @@ def fake_mempalace(monkeypatch):
     kwargs it was *passed* (not their defaults — the `max_distance` tests turn on that
     distinction) and returns whatever the test stashes on it.
 
-    The palace is the fleet's (issue #625): MemPalace 3.10.0, a drawers collection that declares
+    The palace is the fleet's when issue #625 was decided: MemPalace 3.10.0 (below today's floor of
+    3.11, and kept because the threshold rule reads the same from 3.9), a drawers collection that declares
     the cosine metric, so `search` passes ``max_distance=2.0`` by default. A test that needs
     another palace sets ``searcher.metric`` (the collection's ``distance_metric``; an exception
     instance is raised on read) or patches ``_mempalace.mempalace_version``. ``searcher.opened``
@@ -405,6 +438,18 @@ def _isolated_commands_dir(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_inherited_palace_path(monkeypatch):
+    """Clear MemPalace's palace-path variables, so a developer's shell never picks a test's palace.
+
+    The adapter honors every one of them ahead of ``$HARNESS_HOME`` (`PALACE_PATH_VARS`), so one
+    left exported in the shell that runs the suite would move every palace a test resolves. A test
+    that exercises them sets its own.
+    """
+    for var in PALACE_PATH_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_config_home(tmp_path_factory, monkeypatch):
     """Point the config home at an empty temp dir so no test reads the real ``$HOME``.
 
@@ -531,6 +576,8 @@ def _isolated_mempalace_home(request, monkeypatch):
     """
     if request.node.get_closest_marker("mempalace") is not None:
         monkeypatch.setenv("HOME", str(request.getfixturevalue("_mempalace_home")))
+        for name in isolated_home.HOME_RELATIVE:  # the wrapper drops them for the same reason
+            monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture

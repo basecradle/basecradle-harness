@@ -104,6 +104,24 @@ def test_the_rest_of_the_environment_passes_through(real, tmp_path, monkeypatch)
     assert record.read_text() == "/srv/nova/harness"
 
 
+def test_xdg_config_home_is_dropped_so_mempalaces_config_stays_in_the_temporary_home(
+    real, tmp_path, monkeypatch
+):
+    """MemPalace reads its config from ``$XDG_CONFIG_HOME/mempalace`` when ``~/.mempalace`` holds no
+    install, and a wake publishes there (issue #1026): kept, it is the developer's own config."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "developer-config"))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", "/srv/nova/mempalace-config")  # explicit: kept
+    record = tmp_path / "seen"
+    code = (
+        "import os, pathlib; pathlib.Path("
+        f"{str(record)!r}).write_text(repr((os.environ.get('XDG_CONFIG_HOME'), "
+        "os.environ.get('MEMPALACE_CONFIG_DIR'))))"
+    )
+
+    assert isolated_home.main(_python(code)) == 0
+    assert record.read_text() == repr((None, "/srv/nova/mempalace-config"))
+
+
 def test_the_exit_status_is_the_commands(real):
     assert isolated_home.main(_python("import sys; sys.exit(3)")) == 3
 

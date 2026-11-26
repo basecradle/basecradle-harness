@@ -53,11 +53,11 @@ remove it: a copy of a conversation beside a live transcript, a copy of a live t
 ``agent.env``. `prune_stranded_temps` removes those — by exact name, in the exact places the
 harness stages writes, and only once `STRANDED_AFTER` has passed and any pid the writer stamped is
 dead — so no live writer's temp is ever touched. It reaches outside ``$HARNESS_HOME`` in two places
-and only by name: the env file's directory and the top level of ``~/.mempalace`` (never the palace
-beneath it).
+and only by name: the env file's directory and the top level of the directory MemPalace reads its
+config from (`_mempalace.cli_config_dir`, never the palace beneath it).
 
 **A refused write fails the run, loudly** (issue #536). The fleet unit sandboxes this sweep to
-exactly the three places it writes — ``ProtectHome=read-only`` plus three ``ReadWritePaths``, so
+exactly the places it writes — ``ProtectHome=read-only`` plus a ``ReadWritePaths`` for each, so
 the OS enforces the founder's boundary that an agent's own property in its home is never ours to
 touch. That fence can only be *wrong* in the safe direction: a sweep that cannot write, never one
 that writes too much. But a cleanup that silently stops cleaning is the Green-While-Absent shape
@@ -94,7 +94,7 @@ from basecradle._exceptions import BaseCradleError, ForbiddenError, NotFoundErro
 
 from basecradle_harness._basecradle import _as_uuid, _client_from_env, _configure_logging
 from basecradle_harness._install import config_home
-from basecradle_harness._mempalace import _CLI_CONFIG_DIR, _CLI_CONFIG_FILE
+from basecradle_harness._mempalace import _CLI_CONFIG_FILE, cli_config_dir
 from basecradle_harness._observability import RED, Rendered, head, kv, last_word
 from basecradle_harness._token import TEMP_PREFIX, TEMP_SUFFIX
 from basecradle_harness._version import __version__
@@ -158,8 +158,8 @@ _CLAIM_LINK_TEMP = re.compile(r"^\..+\.new$")
 #: the whole env file, **live ``BASECRADLE_TOKEN`` included** (mode 600).
 _ENV_TEMP = re.compile(rf"^{re.escape(TEMP_PREFIX)}.+{re.escape(TEMP_SUFFIX)}$")
 
-#: ``~/.mempalace/.config.json.<hex>.tmp`` — `_mempalace._write_cli_config`. It holds the MemPalace
-#: CLI config, which can carry an embeddings API key.
+#: ``<MemPalace's config dir>/.config.json.<hex>.tmp`` — `_mempalace._write_cli_config`. It holds
+#: the MemPalace CLI config, which can carry an embeddings API key.
 _MEMPALACE_TEMP = re.compile(rf"^\.{re.escape(_CLI_CONFIG_FILE)}\.[0-9a-f]+\.tmp$")
 
 
@@ -321,8 +321,8 @@ def _remove(path: Path, *, blocked: list[Path]) -> bool:
 
     **A removal the sweep decided to make and could not is a failure of the run** (issue #536),
     and this is the one function that decides so. The fleet's cleanup unit is sandboxed to
-    exactly the three places this module writes — ``ProtectHome=read-only`` plus three
-    ``ReadWritePaths`` (``deploy/basecradle-harness-cleanup@.service``) — so a sandbox that is
+    exactly the places this module writes — ``ProtectHome=read-only`` plus a
+    ``ReadWritePaths`` for each (``deploy/basecradle-harness-cleanup@.service``) — so a sandbox that is
     *wrong*, because ``$HARNESS_HOME`` moved or the path list went stale, surfaces here and
     nowhere else: reads are deliberately unrestricted, so the enumeration still finds every
     artifact and the classify still says "deleted", and only the unlink comes back ``EROFS``.
@@ -560,27 +560,45 @@ def prune_stranded_temps(
     ``claims/…/.pruned-through.<pid>.tmp``          `ClaimStore.advance_pruned_through`  yes
     ``claims/…/.<uuid>.<wake>[.takeover].new``      `ClaimStore.claim` / ``reclaim``     no
     ``.basecradle-env.<random>.tmp``                `_token._atomic_write`               no
-    ``~/.mempalace/.config.json.<hex>.tmp``         `_mempalace._write_cli_config`       no
+    ``<cli_config_dir>/.config.json.<hex>.tmp``     `_mempalace._write_cli_config`       no
     ==============================================  ===================================  =======
 
     A temp is removed when it is older than `STRANDED_AFTER` **and**, where it carries one, its pid
     is not a live process. The env temp is looked for beside ``BASECRADLE_ENV_FILE`` and in the
-    config home (where ``agent.env`` lives); the MemPalace one only at the top level of
-    ``~/.mempalace``, which is never walked, so the palace beneath it is never reached. Nothing that
-    does not match one of those names is ever touched, and a temp that cannot be *read* is left for
-    the next run — while one that cannot be **removed** is a refused write, so it is named at ERROR
-    and recorded in `blocked`, exactly as a purge is (issue #536).
+    config home (where ``agent.env`` lives); the MemPalace one only at the top level of the
+    directory upstream reads its config from (`_mempalace.cli_config_dir`, the publisher's own
+    answer), which is never walked, so the palace beneath it is never reached. Nothing that does not
+    match one of those names is ever touched, and a temp that cannot be *read* is left for the next
+    run — while one that cannot be **removed** is a refused write, so it is named at ERROR and
+    recorded in `blocked`, exactly as a purge is (issue #536).
+
+    **One exception, by the capital's decision on issue #1026:** a MemPalace config directory the
+    sweep cannot write to is reported at WARNING, naming the directory and its temp, and skipped,
+    never a failed run. Since upstream chooses that directory (``~/.config/mempalace`` on a box
+    whose ``~/.mempalace`` holds no install), a new agent can be stood up before its unit's
+    ``ReadWritePaths`` names it, and a sweep failed on every run until then pages for a temp it can
+    say plainly it cannot reach. Where MemPalace is not installed nothing published through it, so
+    there is no such temp and the pass skips it, and a lookup that fails any other way is named at
+    WARNING and skipped too.
     """
     now = time.time() if now is None else now
     removed: list[Path] = []
 
-    def consider(path: Path, pid: int | None) -> None:
+    def consider(path: Path, pid: int | None, *, writable: bool = True) -> None:
         try:
             age = now - path.stat().st_mtime
         except OSError:
             return  # gone already, or unreadable: nothing to decide
         if age < STRANDED_AFTER or (pid is not None and _writer_alive(pid)):
             return  # young enough to be mid-write, or its writer is still alive
+        if not writable:  # MemPalace's config directory only, by the decision on issue #1026
+            _log.warning(
+                "cleanup: cannot write MemPalace's config directory %s, so its stranded temp %s is "
+                "skipped; the sweep's unit needs that directory in ReadWritePaths",
+                path.parent,
+                path.name,
+            )
+            return
         try:
             path.unlink(missing_ok=True)
         except OSError as error:
@@ -617,11 +635,33 @@ def prune_stranded_temps(
             if _ENV_TEMP.match(path.name):
                 consider(path, None)
 
-    for path in _entries(Path.home() / _CLI_CONFIG_DIR):
-        if _MEMPALACE_TEMP.match(path.name):
-            consider(path, None)
+    for path in _mempalace_temps():
+        consider(path, None, writable=os.access(path.parent, os.W_OK))
 
     return removed
+
+
+def _mempalace_temps() -> list[Path]:
+    """The publisher's staged temps, in the directory it publishes to: upstream's, never ours.
+
+    Asking can fail, and by the decision on issue #1026 it never fails the sweep: without MemPalace
+    nothing was published through it, so there is nothing to look for; any other failure (a
+    ``PermissionError`` from upstream's look at ``~/.mempalace``, a MemPalace older than its
+    ``config_dir`` property) is named at WARNING and the pass skipped.
+    """
+    try:
+        folder = cli_config_dir()
+    except ImportError:
+        return []  # MemPalace is not installed, so nothing was ever published through it
+    except Exception as error:  # noqa: BLE001 - upstream's answer must never fail the sweep
+        _log.warning(
+            "cleanup: could not ask MemPalace where it reads its config (%s: %s), so its "
+            "stranded temps are not looked for",
+            type(error).__name__,
+            error,
+        )
+        return []
+    return [path for path in _entries(folder) if _MEMPALACE_TEMP.match(path.name)]
 
 
 def _entries(folder: Path) -> list[Path]:

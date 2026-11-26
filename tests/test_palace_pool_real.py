@@ -42,6 +42,7 @@ pytestmark = pytest.mark.mempalace
 mempalace = pytest.importorskip("mempalace")
 
 from basecradle_harness import _palace_check, _palace_pool  # noqa: E402
+from basecradle_harness._memory_provider import PALACE_PATH_VARS  # noqa: E402
 from basecradle_harness._mempalace import (  # noqa: E402
     _REGISTRY_ROOM,
     MemPalaceMemoryProvider,
@@ -236,7 +237,7 @@ def root(tmp_path_factory, monkeypatch_module):
 @pytest.fixture(scope="module")
 def monkeypatch_module():
     mp = pytest.MonkeyPatch()
-    for name in ("MEMPALACE_PALACE_PATH", "MEMPAL_PALACE_PATH", "HARNESS_MEMPALACE_RERANK_MODEL"):
+    for name in (*PALACE_PATH_VARS, "HARNESS_MEMPALACE_RERANK_MODEL"):
         mp.delenv(name, raising=False)
     yield mp
     mp.undo()

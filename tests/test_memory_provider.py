@@ -35,6 +35,8 @@ from basecradle_harness import (
 )
 from basecradle_harness._context import Compactor, ContextBudget
 from basecradle_harness._memory_provider import (
+    PALACE_PATH_VARS,
+    _palace_path,
     configured_mempalace_name,
     describe_memory_provider,
     memory_provider_named,
@@ -133,29 +135,60 @@ def test_palace_path_prefers_mempalaces_own_env_var(monkeypatch, tmp_path, mempa
     assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "elsewhere"
 
 
-def test_palace_path_honors_the_legacy_spelling_and_the_order_between_them(
+def test_the_palace_path_vars_are_upstreams_three_in_upstreams_order():
+    """The documented name, the 3.11 short alias (MemPalace#2366), the legacy spelling (#1026)."""
+    assert PALACE_PATH_VARS == ("MEMPALACE_PALACE_PATH", "MEMPALACE_PALACE", "MEMPAL_PALACE_PATH")
+
+
+@pytest.mark.parametrize("rank", range(len(PALACE_PATH_VARS)))
+def test_each_palace_path_var_wins_over_those_after_it_and_an_empty_one_falls_through(
+    monkeypatch, tmp_path, mempalace_selector, rank
+):
+    """Every var before ``rank`` is set but **empty**, so it falls through rather than winning as
+    "set"; the one at ``rank`` names a palace; every one after it names another, and loses."""
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
+    for index, var in enumerate(PALACE_PATH_VARS):
+        monkeypatch.setenv(var, "" if index < rank else str(tmp_path / var))
+
+    winner = tmp_path / PALACE_PATH_VARS[rank]
+    assert memory_provider_from_env(home=tmp_path).palace_path == winner
+
+
+def test_every_palace_path_var_empty_falls_back_to_the_agent_home(
     monkeypatch, tmp_path, mempalace_selector
 ):
-    """Upstream reads ``MEMPALACE_PALACE_PATH`` *or* ``MEMPAL_PALACE_PATH``, in that order — and a
-    set-but-**empty** first var falls through to the second rather than winning as "set"."""
     monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
-    monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
-    monkeypatch.setenv("MEMPAL_PALACE_PATH", str(tmp_path / "legacy"))
-
-    assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "legacy"
-
-    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "current"))
-    assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "current"
-
-
-def test_both_palace_path_vars_empty_falls_back_to_the_agent_home(
-    monkeypatch, tmp_path, mempalace_selector
-):
-    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", mempalace_selector)
-    monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
-    monkeypatch.setenv("MEMPAL_PALACE_PATH", "")
+    for var in PALACE_PATH_VARS:
+        monkeypatch.setenv(var, "")
 
     assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "mempalace"
+
+
+@pytest.mark.mempalace
+def test_the_palace_path_vars_are_the_ones_upstream_reads_and_resolve_as_upstream_does(
+    monkeypatch, tmp_path
+):
+    """The mirror held to its source (issue #1026): it fell behind once, when 3.11 added an alias.
+
+    The names are read off the property upstream resolves the palace with, so a variable upstream
+    adds, drops or reorders fails here on the next lock bump rather than splitting the agent's
+    palace from the CLI's. Then each one, alone and set over the ones after it, resolves to the
+    same palace on both sides, a ``~`` included.
+    """
+    import inspect
+    import re
+
+    config = pytest.importorskip("mempalace.config")
+    source = inspect.getsource(config.MempalaceConfig.palace_path.fget)
+
+    assert tuple(re.findall(r'os\.environ\.get\("([A-Z_]+)"\)', source)) == PALACE_PATH_VARS
+
+    for rank in range(len(PALACE_PATH_VARS)):
+        for index, var in enumerate(PALACE_PATH_VARS):
+            monkeypatch.setenv(var, "" if index < rank else f"~/palaces/{var}")
+        upstream = config.MempalaceConfig(config_dir=str(tmp_path / "config")).palace_path
+
+        assert str(_palace_path(tmp_path / "home")) == upstream
 
 
 def test_each_mempalace_name_binds_its_own_adapter_over_the_one_palace(

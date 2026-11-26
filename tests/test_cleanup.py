@@ -411,8 +411,9 @@ def _killed_at_publish():
 
 
 @pytest.fixture(autouse=True)
-def _isolated_home(tmp_path_factory, monkeypatch):
-    """The temp pass looks in `~/.mempalace` and beside the env file, so neither may be the real one."""
+def _isolated_home(tmp_path_factory, monkeypatch, mempalace_config):
+    """The temp pass looks in MemPalace's config directory (the fake's: `~/.mempalace` unless a test
+    says otherwise) and beside the env file, so neither may be the real one."""
     monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
     monkeypatch.delenv("BASECRADLE_ENV_FILE", raising=False)
 
@@ -1342,3 +1343,124 @@ def test_an_artifact_dir_the_box_will_not_list_fails_cleanly_rather_than_with_a_
     line = next(m for m in (r.getMessage() for r in caplog.records) if "cleanup failed" in m)
     assert line.startswith(f"{RED}cleanup failed{RESET} ")
     assert "basecradle-harness-cleanup:" in capsys.readouterr().err
+
+
+# --- MemPalace's config directory is upstream's choice (issue #1026) ---------------------------
+
+
+def _strand_a_cli_config_temp(folder: Path) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    before = set(folder.iterdir())
+    with _killed_at_publish():
+        _write_cli_config(folder, folder / "config.json", {"palace_path": "/p"})
+    (found,) = set(folder.iterdir()) - before
+    _age(found, STRANDED_AFTER + 60)
+    return found
+
+
+def test_the_publishers_temp_is_swept_from_the_directory_upstream_reads(tmp_path, mempalace_config):
+    """Where upstream reads ``~/.config/mempalace``, the publisher writes there, and so the sweep
+    looks there: the one answer, asked of upstream, never a directory of the harness's own."""
+    mempalace_config.config_dir = Path.home() / ".config" / "mempalace"
+    temp = _strand_a_cli_config_temp(mempalace_config.config_dir)
+    decoy = _strand_a_cli_config_temp(Path.home() / ".mempalace")  # upstream does not read it
+
+    assert prune_stranded_temps(tmp_path, blocked=[]) == [temp]
+    assert not temp.exists() and decoy.exists()
+
+
+@_not_root
+def test_a_config_directory_the_sweep_cannot_write_is_reported_and_skipped_never_a_failed_run(
+    tmp_path, mempalace_config, caplog
+):
+    """The capital's decision on issue #1026: a new agent can be stood up before its unit's
+    ``ReadWritePaths`` names upstream's directory, so that directory is named at WARNING and
+    skipped, and the run stays green. Every other refused write still fails it."""
+    mempalace_config.config_dir = Path.home() / ".config" / "mempalace"
+    temp = _strand_a_cli_config_temp(mempalace_config.config_dir)
+    blocked: list[Path] = []
+
+    with (
+        _read_only(mempalace_config.config_dir),
+        caplog.at_level(logging.INFO, "basecradle_harness"),
+    ):
+        removed = prune_stranded_temps(tmp_path, blocked=blocked)
+
+    assert removed == [] and blocked == [] and temp.exists()
+    (line,) = [r for r in caplog.records if "MemPalace's config directory" in r.getMessage()]
+    assert line.levelno == logging.WARNING
+    assert str(mempalace_config.config_dir) in line.getMessage() and temp.name in line.getMessage()
+    assert "ReadWritePaths" in line.getMessage()
+    assert _blocked_lines(caplog) == []
+
+
+def test_without_mempalace_installed_the_config_temp_pass_has_nothing_to_look_at(
+    tmp_path, monkeypatch, caplog
+):
+    """Nothing publishes without MemPalace, so there is no temp of its to strand, and no directory
+    to guess at: the pass skips, silently, and the rest of the sweep runs."""
+    stranded = _strand_a_cli_config_temp(Path.home() / ".mempalace")
+
+    def not_installed():
+        raise ImportError("MemPalace is not installed")
+
+    monkeypatch.setattr(cleanup, "cli_config_dir", not_installed)
+
+    with caplog.at_level(logging.INFO, "basecradle_harness"):
+        assert prune_stranded_temps(tmp_path, blocked=[]) == []
+
+    assert stranded.exists()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PermissionError(13, "Permission denied", "/home/nova/.mempalace"),
+        AttributeError("config_dir"),
+    ],
+)
+def test_a_lookup_of_mempalaces_config_directory_that_fails_never_fails_the_sweep(
+    tmp_path, monkeypatch, caplog, failure
+):
+    """Upstream's look at ``~/.mempalace`` can be refused (a root-owned directory), and a MemPalace
+    older than the floor has no ``config_dir``: either is named at WARNING, and every other pass,
+    and the run, go on as if the pass had found nothing."""
+    monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
+    stranded = _strand_every_kind(tmp_path)
+    for path in stranded.values():
+        _age(path, STRANDED_AFTER + 60)
+
+    def refused():
+        raise failure
+
+    monkeypatch.setattr(cleanup, "cli_config_dir", refused)
+    blocked: list[Path] = []
+
+    with caplog.at_level(logging.INFO, "basecradle_harness"):
+        removed = prune_stranded_temps(tmp_path, blocked=blocked)
+
+    assert stranded["mempalace"].exists() and stranded["mempalace"] not in removed
+    assert all(not path.exists() for kind, path in stranded.items() if kind != "mempalace")
+    assert blocked == []
+    (line,) = [r for r in caplog.records if "could not ask MemPalace" in r.getMessage()]
+    assert line.levelno == logging.WARNING and type(failure).__name__ in line.getMessage()
+
+
+@_not_root
+def test_a_young_temp_in_an_unwritable_config_directory_is_not_called_stranded(
+    tmp_path, mempalace_config, caplog
+):
+    """A publish in progress is neither removed nor reported: the age rule comes first."""
+    mempalace_config.config_dir = Path.home() / ".config" / "mempalace"
+    temp = _strand_a_cli_config_temp(mempalace_config.config_dir)
+    _age(temp, 1)
+
+    with (
+        _read_only(mempalace_config.config_dir),
+        caplog.at_level(logging.INFO, "basecradle_harness"),
+    ):
+        assert prune_stranded_temps(tmp_path, blocked=[]) == []
+
+    assert temp.exists()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

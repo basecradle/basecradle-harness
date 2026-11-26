@@ -9,8 +9,8 @@ is ``os.path.expanduser("~")``, read on every call. On a fleet box that is right
 the agent's own home and the lock guards its one palace for the life of the account. On a laptop
 every synthetic palace has a fresh temporary path, so every run that writes one adds a lock file
 to the developer's home that nothing will ever remove (issue #630). A local wake writes there too:
-it publishes its palace path into ``~/.mempalace/config.json`` (issue #409), which on a laptop is
-the developer's own file.
+it publishes its palace path into MemPalace's ``config.json`` under ``~`` (issue #409), which on a laptop
+is the developer's own file.
 
 The fix is the premise the harness already runs on: an agent runs in its own home. This wrapper
 makes a temporary directory, runs the command with ``HOME`` pointed at it, and removes it when the
@@ -32,9 +32,11 @@ exists, so the wrapper creates nothing in the real home. Removing the temporary 
 link and never what it points to, because ``shutil.rmtree`` unlinks a symlink rather than
 following it.
 
-Every other variable passes through unchanged, so one that names a path explicitly
-(``HARNESS_HOME``, ``BASECRADLE_CONFIG_HOME``, ``MEMPALACE_PALACE_PATH``) still wins over the
-temporary ``~``. The exit status is the command's own, and a command killed by a signal exits
+``XDG_CONFIG_HOME`` is dropped (`HOME_RELATIVE`): it moves the ``~/.config`` default out of the
+temporary home, and MemPalace reads its config there when ``~/.mempalace`` holds no install, so a
+local wake would publish into the developer's own. Every other variable passes through unchanged,
+so one that names a path explicitly (``HARNESS_HOME``, ``BASECRADLE_CONFIG_HOME``,
+``MEMPALACE_PALACE_PATH``, ``MEMPALACE_CONFIG_DIR``) still wins over the temporary ``~``. The exit status is the command's own, and a command killed by a signal exits
 ``128 + signal``, as a shell reports it. The test suite runs every test marked ``mempalace`` under
 the same `isolated_home` (``tests/conftest.py``).
 
@@ -56,6 +58,12 @@ from pathlib import Path
 #: model a run would otherwise fetch again, never state a run writes.
 SHARED_CACHES = (Path(".cache") / "chroma",)
 
+#: Variables that move a home-relative default *out of* the temporary ``~``, so a run would write the
+#: developer's own files through them: they are dropped from the command's environment. MemPalace
+#: reads its config from ``$XDG_CONFIG_HOME/mempalace`` when no ``~/.mempalace`` holds an install
+#: (issue #1026), and a wake publishes its palace into that config.
+HOME_RELATIVE = ("XDG_CONFIG_HOME",)
+
 
 @contextlib.contextmanager
 def isolated_home(real_home: Path | None = None) -> Iterator[Path]:
@@ -72,6 +80,11 @@ def isolated_home(real_home: Path | None = None) -> Iterator[Path]:
         yield home
 
 
+def environment() -> dict[str, str]:
+    """The command's environment: this one, without `HOME_RELATIVE`."""
+    return {name: value for name, value in os.environ.items() if name not in HOME_RELATIVE}
+
+
 def main(argv: list[str] | None = None) -> int:
     command = sys.argv[1:] if argv is None else argv
     if not command:
@@ -80,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     with isolated_home() as home:
         try:
             status = subprocess.run(
-                command, env={**os.environ, "HOME": str(home)}, check=False
+                command, env={**environment(), "HOME": str(home)}, check=False
             ).returncode
         except FileNotFoundError:
             print(f"isolated_home: command not found: {command[0]}", file=sys.stderr)

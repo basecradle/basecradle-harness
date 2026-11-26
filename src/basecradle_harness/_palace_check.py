@@ -121,6 +121,7 @@ from typing import Any
 
 from basecradle_harness._exchange_records import parse_name
 from basecradle_harness._memory_provider import (
+    PALACE_PATH_VARS,
     MemoryExchange,
     MemoryScope,
     _palace_path,
@@ -145,7 +146,7 @@ PROG = "basecradle-harness-palace-check"
 #: Cleared for this process before anything is resolved: the reranker's switch (the only model
 #: call a search can make) and MemPalace's own palace-path variables, which would otherwise outrank
 #: the ``HARNESS_HOME`` the caller named.
-_CLEARED_ENV = (RERANK_MODEL_VAR, "MEMPALACE_PALACE_PATH", "MEMPAL_PALACE_PATH")
+_CLEARED_ENV = (RERANK_MODEL_VAR, *PALACE_PATH_VARS)
 
 #: The exchange ``--practice-observe`` writes. It says what wrote it, so a reader of the practice
 #: palace can never take it for something a peer said.
