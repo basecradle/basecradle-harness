@@ -27,6 +27,7 @@ from basecradle_harness import _prune
 from basecradle_harness._memory_provider import MemoryExchange, MemoryScope
 from basecradle_harness._mempalace import _exchange_markdown
 from basecradle_harness._wake import _task_dialogue
+from tests._palace_results import got
 
 TIMELINE = "019a3b2c-4d5e-7f60-8a1b-2c3d4e5f6a7b"
 START = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
@@ -103,14 +104,12 @@ class FakeCollection:
             items = [(i, self.drawers[i]) for i in ids if i in self.drawers]
         else:
             items = list(self.drawers.items())[offset : (offset + limit) if limit else None]
-        page = {
-            "ids": [i for i, _ in items],
-            "documents": [p[0] for _, p in items],
-            "metadatas": [p[1] for _, p in items],
-        }
-        if include and "embeddings" in include:
-            page["embeddings"] = [p[2] for _, p in items]
-        return page
+        return got(
+            ids=[i for i, _ in items],
+            documents=[p[0] for _, p in items],
+            metadatas=[p[1] for _, p in items],
+            embeddings=[p[2] for _, p in items] if include and "embeddings" in include else None,
+        )
 
     def delete(self, *, ids=None, where=None):
         for drawer_id in ids or []:

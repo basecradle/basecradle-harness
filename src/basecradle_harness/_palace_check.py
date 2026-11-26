@@ -259,11 +259,11 @@ def census(collection, palace: Path) -> Census:
     offset = 0
     while True:
         page = collection.get(limit=_PAGE, offset=offset, include=["metadatas", "documents"])
-        ids = list(page.get("ids") or [])
+        ids = list(page.ids or [])
         if not ids:
             break
-        metadatas = list(page.get("metadatas") or [])
-        documents = list(page.get("documents") or [])
+        metadatas = list(page.metadatas or [])
+        documents = list(page.documents or [])
         for index, drawer_id in enumerate(ids):
             out.total += 1
             meta = (metadatas[index] if index < len(metadatas) else None) or {}
@@ -783,7 +783,7 @@ def stamp_chunker_version(palace: Path, *, dry_run: bool) -> int:
     for start in range(0, len(ids), _PAGE):
         batch = ids[start : start + _PAGE]
         got = collection.get(ids=batch, include=["metadatas"])
-        back = dict(zip(got.get("ids") or [], got.get("metadatas") or []))
+        back = dict(zip(got.ids or [], got.metadatas or []))
         wrong += sum(back.get(drawer_id) != expected[drawer_id] for drawer_id in batch)
     print(
         f"stamp chunker version: WROTE to this palace: drawers stamped {len(ids) - wrong} in "
@@ -1022,7 +1022,7 @@ def _write_relocation(
     for start in range(0, len(ids), _PAGE):
         batch = ids[start : start + _PAGE]
         got = collection.get(ids=batch, include=["metadatas"])
-        back = dict(zip(got.get("ids") or [], got.get("metadatas") or []))
+        back = dict(zip(got.ids or [], got.metadatas or []))
         wrong += sum(back.get(drawer_id) != expected[drawer_id] for drawer_id in batch)
     fresh = census(collection, palace)
     after = (len(fresh.real), fresh.registry)
@@ -1135,13 +1135,13 @@ def _self_query(open_collection: Callable[[], Any], drawer_id: str) -> str:
     try:
         collection = open_collection()
         got = collection.get(ids=[drawer_id], include=["embeddings"])
-        embeddings = got.get("embeddings")
+        embeddings = got.embeddings
         if embeddings is None or len(embeddings) == 0 or embeddings[0] is None:
             return "no stored embedding"
         result = collection.query(
             query_embeddings=[list(embeddings[0])], n_results=_DEEP, include=["distances"]
         )
-        ids = (result.get("ids") or [[]])[0]
+        ids = (result.ids or [[]])[0]
         return "yes" if drawer_id in ids else f"no (not in its own top {_DEEP})"
     except Exception as error:  # noqa: BLE001 - a diagnosis line, never a crash of the check
         return f"unknown ({type(error).__name__})"
@@ -1163,7 +1163,7 @@ def _vector_rank(
         )
     except Exception as error:  # noqa: BLE001 - a diagnosis line, never a crash of the check
         return None, f"vector rank unknown ({type(error).__name__})"
-    ids = (result.get("ids") or [[]])[0]
+    ids = (result.ids or [[]])[0]
     if drawer_id not in ids:
         return None, f"vector rank: not in the {_VECTOR_ASK} candidates"
     rank = ids.index(drawer_id) + 1

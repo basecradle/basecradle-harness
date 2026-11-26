@@ -18,6 +18,7 @@ import pytest
 from basecradle_harness import _palace_check, _palace_pool, _palace_recall
 from basecradle_harness._palace_pool import NEAR_TWIN, VERDICTS, Facts, overlap, render, verdict
 from basecradle_harness._palace_recall import HEAD, Probe
+from tests._palace_results import got
 
 SECRET = "Nova confided vaultcode zq7781x beside quasar lighthouse"
 PROBE = Probe(HEAD, "drawer-probe", SECRET, SECRET[:400])
@@ -247,7 +248,7 @@ def test_pool_diagnosis_runs_with_the_sample_flags_and_no_reranker(home, monkeyp
 
     class Collection:
         def get(self, **kwargs):
-            return {"ids": []}
+            return got(ids=[])
 
     def get_collection(path, **kwargs):
         opened.append(kwargs)

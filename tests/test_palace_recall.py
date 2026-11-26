@@ -47,6 +47,7 @@ from basecradle_harness._rerank import (
     MemPalaceReranker,
     reranker_from_env,
 )
+from tests._palace_results import got
 
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 FAKE_KEY = "sk-or-v1-0123456789abcdef0123456789abcdef"
@@ -120,11 +121,11 @@ class FakeCollection:
 
     def get(self, *, limit=None, offset=0, include=None, ids=None):
         page = self.rows[offset : offset + (limit or len(self.rows))]
-        return {
-            "ids": [drawer for drawer, _ in page],
-            "documents": [text for _, text in page],
-            "metadatas": [{"room": "general", "filed_at": "2026-09-01T00:00:00"} for _ in page],
-        }
+        return got(
+            ids=[drawer for drawer, _ in page],
+            documents=[text for _, text in page],
+            metadatas=[{"room": "general", "filed_at": "2026-09-01T00:00:00"} for _ in page],
+        )
 
     def lexical_search(self, *, query, n_results, where=None):
         found = self.lookup(query)

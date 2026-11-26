@@ -339,11 +339,11 @@ def scan(collection, palace: Path, reader: PreviousReader | NamedReader | None =
     offset = 0
     while True:
         page = collection.get(limit=_PAGE, offset=offset, include=["documents", "metadatas"])
-        ids = list(page.get("ids") or [])
+        ids = list(page.ids or [])
         if not ids:
             break
-        documents = list(page.get("documents") or [])
-        metadatas = list(page.get("metadatas") or [])
+        documents = list(page.documents or [])
+        metadatas = list(page.metadatas or [])
         for index, drawer_id in enumerate(ids):
             report.total += 1
             text = documents[index] if index < len(documents) else None

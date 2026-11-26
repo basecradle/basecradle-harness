@@ -121,14 +121,14 @@ def _age(palace: Path) -> None:
     page = collection.get(include=["documents", "metadatas", "embeddings"])
     metas = [
         {k: v for k, v in (meta or {}).items() if k != "convo_chunker_version"}
-        for meta in page["metadatas"]
+        for meta in page.metadatas
     ]
-    collection.delete(ids=list(page["ids"]))
+    collection.delete(ids=list(page.ids))
     collection.add(
-        ids=list(page["ids"]),
-        documents=list(page["documents"]),
+        ids=list(page.ids),
+        documents=list(page.documents),
         metadatas=metas,
-        embeddings=[list(e) for e in page["embeddings"]],
+        embeddings=[list(e) for e in page.embeddings],
     )
 
 
@@ -137,7 +137,7 @@ def _drawers(palace: Path) -> dict[str, tuple[str, dict]]:
     page = collection.get(include=["documents", "metadatas"])
     return {
         drawer_id: (text, meta or {})
-        for drawer_id, text, meta in zip(page["ids"], page["documents"], page["metadatas"])
+        for drawer_id, text, meta in zip(page.ids, page.documents, page.metadatas)
     }
 
 
@@ -679,7 +679,7 @@ def _mangles_a_field(collection, ids, metadatas):
 def _deletes_a_row(collection, ids, metadatas):
     collection.update(ids=ids, metadatas=metadatas)
     row = collection.get(where={"room": _REGISTRY_ROOM}, limit=1, include=[])
-    collection.delete(ids=list(row["ids"]))
+    collection.delete(ids=list(row.ids))
 
 
 @needs_version

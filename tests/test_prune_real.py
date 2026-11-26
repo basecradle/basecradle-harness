@@ -45,7 +45,7 @@ def _drawers(palace: Path) -> dict[str, tuple[str, str]]:
     page = collection.get(include=["documents", "metadatas"])
     return {
         drawer_id: (document, Path(meta.get("source_file", "")).name)
-        for drawer_id, document, meta in zip(page["ids"], page["documents"], page["metadatas"])
+        for drawer_id, document, meta in zip(page.ids, page.documents, page.metadatas)
         if (meta or {}).get("room") != _REGISTRY_ROOM
     }
 

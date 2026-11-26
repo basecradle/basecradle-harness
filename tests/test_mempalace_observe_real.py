@@ -57,7 +57,7 @@ def _rows(palace: Path) -> tuple[list[tuple[str, dict]], int]:
     collection = mp.get_collection(str(palace), create=False, read_only=True)
     page = collection.get(include=["documents", "metadatas"])
     real, registry = [], 0
-    for text, meta in zip(page["documents"], page["metadatas"]):
+    for text, meta in zip(page.documents, page.metadatas):
         if (meta or {}).get("room") == _REGISTRY_ROOM:
             registry += 1
         else:
@@ -122,7 +122,7 @@ def test_a_filing_short_of_its_drawers_is_never_read_as_filed(tmp_path):
     provider = MemPalaceMemoryProvider(palace, agent="nova")
     _observe(provider, "Go on.", "\n\n".join(f"Step {n}. " + "do it " * 40 for n in range(6)))
     collection = mp.get_collection(str(palace))
-    ids = collection.get()["ids"]
+    ids = collection.get().ids
     assert len(ids) > 1
     collection.delete(ids=ids[:1])
 
