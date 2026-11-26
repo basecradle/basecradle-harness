@@ -423,11 +423,10 @@ def _owned(script: str, **popen) -> subprocess.CompletedProcess:
         log = logging.getLogger("basecradle_harness")
         handler = _configure_logging()
     """
-    env = child_env()
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(prelude) + textwrap.dedent(script)],
         cwd=REPO,
-        env=env,
+        env=child_env(),
         timeout=60,
         check=False,
         **popen,

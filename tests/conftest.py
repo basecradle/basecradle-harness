@@ -51,9 +51,14 @@ def child_env(**extra: str) -> dict[str, str]:
     the gap is invisible, while a suite run from one checkout against another install runs two
     versions at once and fails on the difference (issue #1016). ``src`` comes first so it shadows
     any install; the root follows so a child can import ``tests``; an inherited ``PYTHONPATH`` is
-    kept after both. Every test that spawns a Python child importing the harness uses this.
+    kept after both, without its empty entries (each would put the child's working directory on its
+    path). ``PYTHONPATH`` is this helper's alone, so one passed in `extra` is replaced, never used.
+    The suite itself imports ``src`` too (``pythonpath`` in ``pyproject.toml``), so the parent and
+    the child run the same code. Every test that spawns a Python child importing the harness uses
+    this.
     """
-    path = [str(SRC_ROOT), str(REPO), *filter(None, [os.environ.get("PYTHONPATH")])]
+    inherited = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    path = [str(SRC_ROOT), str(REPO), *filter(None, inherited)]
     return {**os.environ, "NO_COLOR": "1", **extra, "PYTHONPATH": os.pathsep.join(path)}
 
 
