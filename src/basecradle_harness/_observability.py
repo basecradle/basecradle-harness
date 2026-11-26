@@ -2234,6 +2234,11 @@ def billed(error: Exception | None, *, usage: Any = None, cost: Any = None) -> b
     - **An answer that could not be read leaves only the vendor's bill**: the usage it stated
       (`usage_reported`) or a charge it named (`_charged`, xAI's response-level cost). That is the
       ``fallback`` the contract defines, *"the vendor answered (and billed)"*, tokens and all.
+    - **Or the vendor's word that it stopped at the output cap** (`ProviderTruncatedError`, issue
+      #788): a runaway generated up to the cap, so it was an answer and was billed, even where the
+      vendor states no usage for it (#491's case). Its line is ``fallback reason=truncated``, and
+      the describer reads that verdict off it to give the one larger-budget attempt, never a
+      same-budget retry.
     - **With neither, the body was not an answer.** Refuseless's Responses ``error`` envelope
       (``model_unavailable``, ``gateway_error``: no ``id``, no ``output``, no ``usage``) is the
       vendor declining to serve, and so is a chat body with no ``choices`` and no usage. Each was
@@ -2247,7 +2252,12 @@ def billed(error: Exception | None, *, usage: Any = None, cost: Any = None) -> b
     One rule for every adapter, so it is asked once, here (`log_answered_call`), never by an adapter
     judging a body's shape itself.
     """
-    return error is None or usage_reported(usage) or _charged(cost)
+    return (
+        error is None
+        or isinstance(error, ProviderTruncatedError)
+        or usage_reported(usage)
+        or _charged(cost)
+    )
 
 
 def log_answered_call(error: Exception | None, **fields: Any) -> None:

@@ -177,7 +177,8 @@ def test_the_evidence_of_an_answer():
     assert billed(unread, cost=0.0021)  # xAI states its charge on the response
     assert not billed(unread)
     assert not billed(unread, usage={"prompt_tokens": 0, "completion_tokens": 0}, cost=0)
-    assert not billed(ProviderTruncatedError("cut off"), usage=None)
+    # Stopped at the cap: the vendor's own word that it generated, even with no usage (#788, #491).
+    assert billed(ProviderTruncatedError("cut off"), usage=None)
 
 
 def test_log_answered_call_reads_the_lines_own_usage_and_cost(caplog):
@@ -217,3 +218,88 @@ def test_the_describer_writes_only_its_decisions_for_an_envelope(caplog):
     assert lines and all("outcome=retrying" in m or "outcome=failed" in m for m in lines)
     assert not any("tokens_in=" in m or "cost=" in m for m in lines)
     assert "model_unavailable" in lines[-1]
+
+
+def test_an_answer_cut_off_at_the_cap_keeps_its_line_with_no_usage(caplog):
+    """The vendor's word that it stopped at the output cap is evidence of an answer (issue #788): a
+    runaway generated up to the cap and was billed, even where the vendor states no usage (#491).
+    So it keeps its ``fallback reason=truncated`` line, which the describer reads its verdict off."""
+    cut = {"id": "call_0", "type": "function", "function": {"name": "f", "arguments": '{"a": "x'}}
+    body = {
+        "id": "chatcmpl-0123456789abcdef",
+        "object": "chat.completion",
+        "model": MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "length",
+                "message": {"role": "assistant", "content": None, "tool_calls": [cut]},
+            }
+        ],
+    }
+    caplog.set_level(logging.DEBUG, logger="basecradle_harness")
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        router.get(f"{HOST}/models").mock(return_value=httpx.Response(200, json=LIST))
+        router.post(f"{HOST}/chat/completions").mock(return_value=httpx.Response(200, json=body))
+        provider = _refuseless("chat")
+        with pytest.raises(ProviderTruncatedError):
+            provider.chat([Message.user("hi")])
+        provider.close()
+    (line,) = _llm_lines(caplog)
+    assert line.endswith(
+        " outcome=fallback reason=truncated generation_id=chatcmpl-0123456789abcdef"
+    )
+
+
+# === the reranker, which reads its own answer ====================================
+
+
+def _rerank_body(**fields):
+    from .test_rerank import completion as rerank_completion
+
+    body = rerank_completion("unused")
+    body["choices"] = []
+    body.pop("usage")
+    return {**body, **fields}
+
+
+def test_a_rerank_answered_with_no_answer_and_no_bill_is_a_fault(caplog):
+    """The reranker's body with no reply text and no bill was its ``fallback reason=parse`` with no
+    tokens: the same false call through another emitter. It is the retryable ``invalid_response``
+    now, decision lines only, and recall falls back to unranked as on any fault."""
+    from .test_rerank import CHAT_URL as RERANK_CHAT
+    from .test_rerank import hits, reranker
+
+    caplog.set_level(logging.DEBUG, logger="basecradle_harness")
+    with respx.mock(assert_all_mocked=True) as router:
+        sent = router.post(RERANK_CHAT).mock(
+            return_value=httpx.Response(200, json=_rerank_body(**MODEL_UNAVAILABLE))
+        )
+        # Recall falls back to the unranked order, the first `k` hits.
+        assert reranker().rerank("what is the plan", hits(3), 1, surface="turn0") == hits(1)
+    assert sent.call_count == 3  # retried, as every invalid_response is
+    lines = _llm_lines(caplog)
+    assert [("outcome=retrying" in m, "outcome=failed" in m) for m in lines] == [
+        (True, False),
+        (True, False),
+        (False, True),
+    ]
+    assert all(" reason=invalid_response " in m and "tokens_in=" not in m for m in lines)
+
+
+def test_a_rerank_the_vendor_billed_with_no_text_stays_the_parse_fallback(caplog):
+    """The control: the same empty answer with a bill is the model's empty answer, billed, so it
+    keeps its ``fallback reason=parse`` line with its tokens."""
+    from .test_rerank import CHAT_URL as RERANK_CHAT
+    from .test_rerank import hits, reranker
+
+    usage = {"prompt_tokens": 4812, "completion_tokens": 3, "total_tokens": 4815, "cost": 0.0007}
+    caplog.set_level(logging.DEBUG, logger="basecradle_harness")
+    with respx.mock(assert_all_mocked=True) as router:
+        router.post(RERANK_CHAT).mock(
+            return_value=httpx.Response(200, json=_rerank_body(usage=usage))
+        )
+        # Recall falls back to the unranked order, the first `k` hits.
+        assert reranker().rerank("what is the plan", hits(3), 1, surface="turn0") == hits(1)
+    (line,) = _llm_lines(caplog)
+    assert " tokens_in=4812 " in line and " outcome=fallback reason=parse " in line

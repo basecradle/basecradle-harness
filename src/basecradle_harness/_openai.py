@@ -858,7 +858,6 @@ class OpenAIProvider:
             # The body's own ``id`` on both surfaces (issue #634): a ``chatcmpl-`` or ``resp_`` id
             # from OpenAI, a uuid from xAI, the ``gen-`` generation id from OpenRouter.
             generation_id=generation_id(data),
-            # An answer the caller could not read says so on this, its one billed line (#782).
         )
 
     def _cost(self, data: Mapping[str, Any], usage: Any) -> tuple[float | None, str | None]:

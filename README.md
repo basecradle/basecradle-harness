@@ -1547,7 +1547,7 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
   WARNING llm provider=openrouter purpose=main model=z-ai/glm-5.3 outcome=retrying attempt=1/3 reason=invalid_response next_in=0.50s timeline=019a4e2c-7b1d-7f3e-9c2a-5d8e1f6a3b40 step=7/24 generation_id=gen-1791025202-Qm4xT7pL2vNc9RkA8sDe
   ```
 
-  A body that states no bill at all, no usage and no charge, was never an answer. A vendor's error sent in place of one (Refuseless's `model_unavailable`) writes no billed line, only the decisions, and the give-up's `detail` quotes the vendor's code and message ([issue #1029](https://github.com/basecradle/basecradle-harness/issues/1029)):
+  A body that states no bill (no usage, no charge) and did not stop at the output cap was never an answer. A vendor's error sent in place of one (Refuseless's `model_unavailable`) writes no billed line, only the decisions, and the give-up's `detail` quotes the vendor's code and message ([issue #1029](https://github.com/basecradle/basecradle-harness/issues/1029)):
 
   ```
   WARNING llm provider=refuseless purpose=main model=kimi-k3.1-pro-abliterated outcome=retrying attempt=1/3 reason=invalid_response next_in=0.50s timeline=019a4e2c-7b1d-7f3e-9c2a-5d8e1f6a3b40 step=1/48
