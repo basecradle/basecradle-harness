@@ -15,6 +15,7 @@ import pathlib
 import re
 import sys
 import types
+from importlib import metadata
 
 import pytest
 import respx
@@ -208,6 +209,26 @@ MEMPALACE_SELECTORS = ("mempalace", "mempalace-previous")
 def mempalace_selector(request) -> str:
     """One name that selects the MemPalace adapter; the test runs once per name."""
     return request.param
+
+
+@pytest.fixture
+def mempalace_not_installed(monkeypatch):
+    """The ``mempalace`` distribution absent, whatever this venv holds (issue #1024).
+
+    A MemPalace fake stands in at ``sys.modules``, but the harness reads the extra's version off
+    the installed distribution's metadata (`importlib.metadata.version`), which no fake reaches. A
+    test whose premise is "the extra is not installed" takes this fixture, so the premise holds in
+    a venv with every extra installed too, rather than only where CI happens to leave it out. Every
+    other distribution reads as installed.
+    """
+    real = metadata.version
+
+    def version(distribution: str) -> str:
+        if distribution == "mempalace":
+            raise metadata.PackageNotFoundError(distribution)
+        return real(distribution)
+
+    monkeypatch.setattr(metadata, "version", version)
 
 
 @pytest.fixture

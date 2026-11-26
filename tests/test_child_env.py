@@ -40,6 +40,11 @@ def test_the_suite_imports_this_checkouts_harness():
 def test_a_child_imports_this_checkouts_harness_first():
     env = child_env()
 
+    # The shape assertion is the guard, not a redundant twin of the location one below it. Where
+    # the harness is installed editable from this same checkout (CI), a child handed the root
+    # alone, the form issue #1016 fixed, still finds this package, so the location assertion
+    # passes and only the shape fails (both tests here, shown by reverting `child_env`, issue
+    # #1024). Keep both.
     assert env["PYTHONPATH"].split(os.pathsep)[:2] == [str(SRC_ROOT), str(REPO)]
     assert _imported(env).is_relative_to(PACKAGE)
 
@@ -53,7 +58,9 @@ def test_the_checkout_comes_before_an_inherited_path(monkeypatch, tmp_path):
 
     env = child_env()
 
-    # The stray separator's empty entry is dropped: it would put the child's cwd on its path.
+    # The stray separator's empty entry is dropped: it would put the child's cwd on its path. As in
+    # the test above, only the shape fails if `child_env` hands the root alone: that form drops
+    # the inherited path, stray harness and all, so the location assertion still passes. Keep it.
     assert env["PYTHONPATH"].split(os.pathsep) == [str(SRC_ROOT), str(REPO), str(tmp_path)]
     assert _imported(env).is_relative_to(PACKAGE)
 

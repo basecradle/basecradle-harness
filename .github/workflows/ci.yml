@@ -30,13 +30,23 @@ jobs:
       - name: Check formatting
         run: uv run ruff format --check .
 
+  # The default suite, once more with the MemPalace extra installed (issue #1024): a developer's
+  # venv and an agent's own checkout tend to hold every extra, and a test whose premise is the
+  # extra's absence went red there unseen, because no job ran the default suite with it. Not
+  # path-gated like the `mempalace` job, because such a test can live anywhere in the suite.
   test:
-    name: test (${{ matrix.python-version }})
+    name: test (${{ matrix.python-version }}${{ matrix.extra && format(', {0}', matrix.extra) || '' }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        # The empty value is load-bearing: an `include` that only adds a key merges into the
+        # matching cell instead of adding one, so plain 3.12 would silently stop running.
+        extra: [""]
+        include:
+          - python-version: "3.12"
+            extra: mempalace
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,7 +56,9 @@ jobs:
           version-file: uv.lock
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: uv sync --locked
+        env:
+          EXTRA: ${{ matrix.extra }}
+        run: uv sync --locked ${EXTRA:+--extra "$EXTRA"}
       - name: Test
         run: uv run pytest
 

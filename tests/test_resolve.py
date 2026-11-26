@@ -662,10 +662,12 @@ def test_every_shipped_stem_appears_in_the_map():
         assert entry["status"] in {"active", "inactive", "excluded"}
 
 
-def test_either_mempalace_name_resolves_the_same_memory_axis(capsys, mempalace_selector):
+def test_either_mempalace_name_resolves_the_same_memory_axis(
+    capsys, mempalace_selector, mempalace_not_installed
+):
     """`--memory-provider mempalace-previous` resolves exactly what `mempalace` does (issue #1010):
     the adapter's `memory_search` in place of `memory`, through the library call and the command
-    line alike. Each reports the name it was given."""
+    line alike. Each reports the name it was given, and no version, because the extra is absent."""
     report = resolve_stems(provider="openai", memory_provider=mempalace_selector)
 
     assert report["memory"] == {
