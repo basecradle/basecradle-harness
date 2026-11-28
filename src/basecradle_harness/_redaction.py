@@ -288,30 +288,46 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: and that inner string loses its close. A quote escaped at every level
 #: is a run of exactly ``2**d - 1``, a set no regular expression states for every depth.
 _ESCAPE = r"(?:\\(?:\\\\)*)?"
+
+#: **A gap is skipped wherever a rule skips a blank, and after every separator a value is anchored
+#: to** (issue #1035): a run of whitespace (`str.isspace`, a non-breaking space and the Unicode
+#: line separators included) and C0 and C1 control characters, DEL among them. That is exactly what
+#: the log renderer flattens to one space before it scrubs (`_observability._flatten`), so a rule
+#: reads a value the same whether its writer flattened the text first (a log line) or scrubbed it
+#: first (memory, the transcript, a capture file). Until #1035 the assignment rule took a value only
+#: when it followed the ``=`` directly, so ``A_TOKEN=<TAB>…`` was redacted where it was scrubbed raw
+#: and written in full on a log line, whose renderer had made the tab a space first; and the rules
+#: that skipped blanks skipped no control character, so a scrub-first path left ``Bearer <ESC>eyJ…``
+#: whole. The cost is stated: a word of prose after a separator and a gap is read as its value
+#: (``set PASSWORD= then restart`` loses ``then``), as it always was with no gap.
+_GAP_CHAR = r"[\s\x00-\x1f\x7f-\x9f]"
+_GAP = re.compile(_GAP_CHAR + "*")
 _BEARER_SHAPE = _section("bearer")
 _SCHEME_LETTERS = _BEARER_SHAPE["scheme"]
 _SCHEME = f"(?i:{_SCHEME_LETTERS})"
 _TOKEN = f"{_BEARER_SHAPE['token']}{{{_BEARER_SHAPE['minimum_token']},}}"
-_X_API_LABEL = rf"(?i:{_names('headers')})(?:{_ESCAPE}[\"']\s*(?:=>|[:=,])|\s*(?::|=>))"
-_X_API_OPENER = rf"\s*(?:b?{_ESCAPE}[\"'])?"
+_X_API_LABEL = (
+    rf"(?i:{_names('headers')})(?:{_ESCAPE}[\"']{_GAP_CHAR}*(?:=>|[:=,])|{_GAP_CHAR}*(?::|=>))"
+)
+_X_API_OPENER = rf"{_GAP_CHAR}*(?:b?{_ESCAPE}[\"']{_GAP_CHAR}*)?"
 _X_API_RUN = r"[^\s\"'&\\]"
-_SCHEME_WORDS = rf"(?:{_SCHEME}\s+)*"
+_SCHEME_WORDS = rf"(?:{_SCHEME}{_GAP_CHAR}+)*"
 _X_API_KEY = re.compile(
     f"{_X_API_LABEL}(?P<opener>{_X_API_OPENER})(?P<value>{_SCHEME_WORDS}"
-    rf"(?:{_X_API_RUN}*?(?P<glued>{_SCHEME})\s+{_TOKEN}|{_X_API_RUN}+))"
+    rf"(?:{_X_API_RUN}*?(?P<glued>{_SCHEME}){_GAP_CHAR}+{_TOKEN}|{_X_API_RUN}+))"
 )
 _QUERY_LABEL = rf"[?&](?i:{_names('query_parameters')})="
 _QUERY_RUN = r"[^&\s]"
 _QUERY = re.compile(
-    f"(?P<label>{_QUERY_LABEL})(?P<value>{_SCHEME_WORDS}"
-    rf"(?:{_QUERY_RUN}*?(?P<glued>{_SCHEME})\s+{_TOKEN}|{_QUERY_RUN}+))"
+    f"(?P<label>{_QUERY_LABEL}){_GAP_CHAR}*(?P<value>{_SCHEME_WORDS}"
+    rf"(?:{_QUERY_RUN}*?(?P<glued>{_SCHEME}){_GAP_CHAR}+{_TOKEN}|{_QUERY_RUN}+))"
 )
 _API_KEY_LABEL = rf"(?i:(?:{_names('api_key_assignment')})=)"
-_API_KEY_OPENER = f'(?:{_ESCAPE}")?'
+_API_KEY_OPENER = f'{_GAP_CHAR}*(?:{_ESCAPE}"{_GAP_CHAR}*)?'
 _API_KEY_RUN = r"[^&\s\"]"
 _API_KEY = re.compile(
     f"(?P<label>{_API_KEY_LABEL})(?P<opener>{_API_KEY_OPENER})(?P<value>{_SCHEME_WORDS}"
-    rf"(?:{_API_KEY_RUN}*?(?P<glued>{_SCHEME})\s+{_TOKEN}|{_API_KEY_RUN}+))"
+    rf"(?:{_API_KEY_RUN}*?(?P<glued>{_SCHEME}){_GAP_CHAR}+{_TOKEN}|{_API_KEY_RUN}+))"
 )
 
 #: **A credential-named JSON member's string value** (issue #943, @origin, 2026-11-19): a member
@@ -326,8 +342,20 @@ _API_KEY = re.compile(
 #: object, an array) is left alone, and only ``"`` quotes a member: a Python ``repr``'s
 #: ``{'password': '…'}`` is no JSON member.
 _MEMBER_NAME = f"(?i:{_names('json_members')})"
-_MEMBER = re.compile(rf'(?<!\\)(?P<escape>{_ESCAPE})"{_MEMBER_NAME}(?P=escape)"\s*:\s*(?P=escape)"')
-_STRING_STOP = re.compile(r'["\\\x00-\x1f]')
+_MEMBER = re.compile(
+    rf'(?<!\\)(?P<escape>{_ESCAPE})"{_MEMBER_NAME}(?P=escape)"{_GAP_CHAR}*:{_GAP_CHAR}*(?P=escape)"'
+)
+#: What ends a JSON string's reading (`_string_close`): its quote, a backslash to weigh, or a C0
+#: record break, where one that never closed ends. **Never another control character** (issue
+#: #1035): a colored dump on a path that scrubs raw text holds an ESC inside the value
+#: (``"password": "<ESC>[1m<ESC>[33mK9…"``), and a reading that ended at it kept the rest. A record
+#: break outside C0 (``\x85``, U+2028, U+2029) was always read as the string's text, and still is.
+_STRING_STOP = re.compile(r'["\\\n\r\x00\x0b\x0c\x1c-\x1e]')
+
+#: Where a member's reading stopped before #1035 (`_members`): at a C0 control character in its
+#: value, or, in its separator, at a gap character that is no whitespace, which matched nothing.
+_CONTROL_CHAR = re.compile(r"[\x00-\x1f]")
+_UNSKIPPED = re.compile(r"[\x00-\x08\x0e-\x1b\x7f-\x84\x86-\x9f]")
 _BACKSLASHES = re.compile(r"\\*")
 
 
@@ -335,7 +363,7 @@ def _string_close(text: str, at: int, escape: int, stop: int | None = None) -> t
     """Where the JSON string whose value starts at `at` ends, and where the text after it resumes:
     the start of the run of `escape` backslashes before its closing quote and the place past that
     quote, or, when the string never closes, `stop` (the text's end when ``None``) or the first
-    control character before it, twice, since no JSON string holds one raw.
+    C0 record break before it (`_STRING_STOP`), twice.
 
     A string ``d`` levels deep opens with a quote escaped by ``escape = 2**d - 1`` backslashes. One
     encoding pass turns a run of ``n`` before a quote into ``2n + 1``, so its close is a quote after
@@ -348,8 +376,8 @@ def _string_close(text: str, at: int, escape: int, stop: int | None = None) -> t
     end = len(text) if stop is None else stop
     while (found := _STRING_STOP.search(text, at, end)) is not None:
         i = found.start()
-        if text[i] < " ":
-            return i, i
+        if text[i] not in '"\\':
+            return i, i  # a record break
         run_end = _BACKSLASHES.match(text, i, end).end()
         run = run_end - i
         if run_end < end and text[run_end] == '"':
@@ -365,12 +393,29 @@ def _members(text: str, stop: int | None = None) -> Iterator[tuple[int, int, int
     where its value starts and where the value's close begins (`_string_close`). Each search goes
     on past the last close, so a name inside a value is that value's text, a closing quote never
     opens the next name (the backslashes the value loses before it would let a second scrub read
-    one there), and the text is read once."""
+    one there), and the text is read once.
+
+    **A value that opens with a gap is read past it** (`_GAP`, issue #1035): a C0 control
+    character once ended a string's reading, so one right after the opening quote
+    (``"password": "<ESC>[33mK9…"``, a colored dump on a path that scrubs raw text) ended the value
+    before its first character. The gap goes with the value; a value that is all gap is
+    empty. **The next search goes on from where the reading before #1035 did**, when that was
+    earlier: at the first C0 control character in the value, or the first gap character in the
+    separator that no ``\\s`` matched. A value read past one can end at a quote that also opens the
+    next member's name (``"api_key": "<TAB>x"password": "K9…``), and a member the old reading found
+    must still be found, whichever way a malformed text parses."""
     end = len(text) if stop is None else stop
     pos = 0
     while (match := _MEMBER.search(text, pos, end)) is not None:
-        close, pos = _string_close(text, match.end(), len(match.group("escape")), end)
-        yield match.start(), match.end(), close
+        begin = _GAP.match(text, match.end(), end).end()
+        close, pos = _string_close(text, begin, len(match.group("escape")), end)
+        diverged = (
+            _UNSKIPPED.search(text, match.start(), match.end()),
+            _CONTROL_CHAR.search(text, match.end(), close),
+        )
+        if places := [found.start() for found in diverged if found is not None]:
+            pos = min(places)
+        yield match.start(), match.end(), close if close > begin else match.end()
 
 
 def _member_spans(text: str) -> Iterator[tuple[int, int]]:
@@ -399,9 +444,9 @@ _LITERAL_REACH = {
 #: (`_shell_word_end`), as a credential's value is read. Quoted, a token is no run of token
 #: characters, and ``Bearer 'eyJ…'`` once matched nothing. **A run of scheme words goes with the
 #: token after it** (`_bearer_end`).
-_BEARER = re.compile(rf"(?P<scheme>{_SCHEME}\s+)(?:{_TOKEN}|[\"'`]|\$['({{]|\\+[\"'])")
+_BEARER = re.compile(rf"(?P<scheme>{_SCHEME}{_GAP_CHAR}+)(?:{_TOKEN}|[\"'`]|\$['({{]|\\+[\"'])")
 _BEARER_TOKEN = re.compile(_TOKEN)
-_BEARER_GAP = re.compile(r"\s+")
+_BEARER_GAP = re.compile(_GAP_CHAR + "+")
 _TOKEN_OPENERS = ("'", '"', "`", "$'", "$(", "${")
 
 #: A bearer token in escaped quotes (``"Bearer \\"eyJ…\\""``, JSON inside a JSON string, escaped
@@ -654,8 +699,6 @@ _LEAD_PIECE = (
 )
 _LEAD_WORD = re.compile(f"(?:{_LEAD_PIECE}+\\\\?|\\\\)\t+")
 
-#: The tabs a value may open with: the canary's run crosses them to its first word.
-_TABS = re.compile("\t*")
 
 #: Where a marker at a value's head ends it: a blank, a canary stop or a record break after it (the
 #: canary's own run ends inside the marker, at its space), so a value redacted where it is bounded
@@ -668,21 +711,30 @@ _MARKER_ENDS = frozenset("\t" + CANARY_VALUE_STOPS + _BREAK_CHARS)
 #: quoted piece.
 _UNREACHED = frozenset(CANARY_VALUE_STOPS.replace('"', "") + _BREAK_CHARS)
 
+#: The tabs a value may open with: the canary's run crosses them to its first word.
+_TABS = re.compile("\t*")
+
 
 def _reached(text: str, at: int) -> bool:
     return at < len(text) and text[at] not in _UNREACHED
 
 
-def _token_after_a_scheme_word(text: str, floor: int, end: int) -> int | None:
+def _token_after_a_scheme_word(text: str, floor: int, end: int, gaps: bool = True) -> int | None:
     """Where the token starts, when what was read from `floor` ends at `end` in a bearer scheme word
     (`_SCHEME_WORD`), with a word on its record after its blanks; else ``None``. A value never ends
     between a scheme word and its token, whatever the scheme word is glued to: a word the shell
     reads (``x"q"bearer``), or one a tab glues to the value (``(a)<TAB>Bearer``, the canary's run
-    taking the scheme word, basecradle-router#502's review)."""
+    taking the scheme word, basecradle-router#502's review).
+
+    **A gap stands between a scheme word and its token as blanks do** (`_GAP`, issue #1035), so
+    ``A_TOKEN=Bearer<NEWLINE>eyJ…`` loses the token on a path that scrubs raw text, as the line a
+    renderer flattened it into does; where the gap reaches no token, the router's blanks decide."""
     if end - floor < _SCHEME_WORD_LENGTH or not _SCHEME_WORD.fullmatch(
         text, end - _SCHEME_WORD_LENGTH, end
     ):
         return None
+    if gaps and (gap := _GAP.match(text, end).end()) > end and _reached(text, gap):
+        return gap
     if (blanks := _SCHEME_BLANKS.match(text, end)) is None or not _reached(text, blanks.end()):
         return None
     return blanks.end()
@@ -693,12 +745,18 @@ def _run_end(text: str, at: int, stop: int) -> int:
     return _CANARY_RUN.match(text, at, stop).end() if at < stop else stop
 
 
-def _value_end(text: str, start: int, limit: int | None = None) -> int:
+def _value_end(text: str, start: int, limit: int | None = None, *, gaps: bool = True) -> int:
     """Where a credential's value from `start` ends: past every word the value reaches, each read
     whole as a shell word, and past the canary's run.
 
-    A value reaches its first word, after any tabs it opens with, unless it opens with a marker
-    where the canary's run would end after it, which is the whole value. From a word it reaches:
+    A value reaches its first word, after any gap it opens with (`_GAP`: whitespace and control
+    characters, which the router's reading crosses only as tabs, issue #1035), unless it opens with
+    a marker where the canary's run would end after it, which is the whole value. Where a ``,``, a
+    ``}`` or the text's end follows the gap, the router's reading decides, from the gap's first
+    character (``A_TOKEN=<CR>}eyJ…`` is one shell word to it), so this reading never takes less than
+    the router's. The gap goes with the value, as a tab the canary's run crosses always did, so
+    ``A_TOKEN= K9…`` and ``A_TOKEN=<NEWLINE>K9…`` are redacted to the same bytes as the line a
+    renderer flattened them into. From a word it reaches:
 
     1. **Across a tab** to the next word, while the word is a lead word (`_LEAD_WORD`): the canary's
        run crosses a tab, so a word after one is still the value's (basecradle-router#502). The next
@@ -726,7 +784,9 @@ def _value_end(text: str, start: int, limit: int | None = None) -> int:
             after = at + len(REDACTED_VALUE)
             if after == len(text) or text[after] in _MARKER_ENDS:
                 return min(max(end, after), stop)
-        if (tabs := _TABS.match(text, at).end()) > at:
+        if gaps and (gap := _GAP.match(text, at).end()) > at and _reached(text, gap):
+            at = gap  # a value after the gap (issue #1035)
+        elif (tabs := _TABS.match(text, at).end()) > at:  # else the router's reading, exactly
             if not _reached(text, tabs):
                 return end  # nothing after the tabs is the value's: a blank, a stop or a break
             at = tabs
@@ -735,7 +795,7 @@ def _value_end(text: str, start: int, limit: int | None = None) -> int:
             end = max(end, word_end)
             if at_a_name or end >= stop:
                 break  # a credential name's `=`: its value is read as one from here
-            if (token := _token_after_a_scheme_word(text, at, word_end)) is not None:
+            if (token := _token_after_a_scheme_word(text, at, word_end, gaps)) is not None:
                 at = token  # a word after the blanks, on the same record
                 if at >= run_end:
                     run_end = _run_end(text, at, stop)
@@ -745,7 +805,7 @@ def _value_end(text: str, start: int, limit: int | None = None) -> int:
             if lead is None or word_end > lead.end() or not _reached(text, lead.end()):
                 # No lead word, one the shell reads past, or nothing after its tabs: the value ends,
                 # unless it ends just after a scheme word.
-                if (token := _token_after_a_scheme_word(text, floor, end)) is None:
+                if (token := _token_after_a_scheme_word(text, floor, end, gaps)) is None:
                     return end
                 at = floor = token
                 if at >= run_end:
@@ -760,17 +820,28 @@ def _value_end(text: str, start: int, limit: int | None = None) -> int:
     return stop
 
 
-def _credential_spans(text: str) -> Iterator[tuple[int, int]]:
-    """Every credential-named assignment's value, as its start (the character after the ``=``) and
-    its end (`_value_end`), in order; an empty value's two are equal. Each name is found once, and
-    the next search starts where its value ends."""
+def _credential_spans(text: str, limit: int | None = None) -> Iterator[tuple[int, int, int]]:
+    """Every credential-named assignment before `limit`: where its name starts, where its value
+    starts (the character after the ``=``) and where the value ends (`_value_end`, read no further
+    than `limit`), in order of their names; an empty value's two are equal.
+
+    **The names are found as the router finds them** (issue #1035): each search starts where the
+    router's reading of the last value ends (``gaps=False``), so every name that reading takes for
+    one of its own is read here too, and its value is this reading's, which never ends earlier. A
+    value read past a gap can take a name the router reads as its own (``A_TOKEN= "B_TOKEN=x`` up
+    to a record break), so the values can overlap; a name standing inside a value this reading has
+    already taken has its value read the router's way, which keeps the walk linear."""
     if "=" not in text:
         return
-    pos = 0
-    while (match := _CREDENTIAL_NAME.search(text, pos)) is not None:
+    stop = len(text) if limit is None else min(limit, len(text))
+    pos = reach = 0
+    while (match := _CREDENTIAL_NAME.search(text, pos, stop)) is not None:
         start = match.end()
-        pos = _value_end(text, start)
-        yield start, pos
+        routers = _value_end(text, start, limit, gaps=False)
+        end = routers if start < reach else _value_end(text, start, limit)
+        reach = max(reach, end)
+        yield match.start(), start, end
+        pos = routers
 
 
 def redact_credentials(text: str) -> str:
@@ -788,7 +859,10 @@ def redact_credentials(text: str) -> str:
     (basecradle-router#506), and one of the rules `scrub` takes the union of."""
     out: list[str] = []
     pos = 0
-    for start, end in _credential_spans(text):
+    for _, start, end in _credential_spans(text):
+        if start <= pos:  # a value inside the last one's, or one it touches (`_credential_spans`)
+            pos = max(pos, end)
+            continue
         out.append(text[pos:start])
         if end > start:
             out.append(REDACTED_VALUE)
@@ -856,7 +930,7 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
 #: since the box's rule reads any run holding one, and the marker, as the URL's secret.
 _OPEN_LABELS = (
     re.compile(f"(?P<label>{_X_API_LABEL}){_X_API_OPENER}{_SCHEME_WORDS}{_X_API_RUN}*"),
-    re.compile(f"(?P<label>{_QUERY_LABEL}){_SCHEME_WORDS}{_QUERY_RUN}*"),
+    re.compile(f"(?P<label>{_QUERY_LABEL}){_GAP_CHAR}*{_SCHEME_WORDS}{_QUERY_RUN}*"),
     re.compile(f"(?P<label>{_API_KEY_LABEL}){_API_KEY_OPENER}{_SCHEME_WORDS}{_API_KEY_RUN}*"),
     re.compile(r"(?<!\S)(?P<label>\S*?" + re.escape(_HEARTBEAT) + r")\S*"),
 )
@@ -894,12 +968,10 @@ def _whole_values(text: str, cut: int) -> tuple[int, int | None]:
     glued before it), never keep a label that should go. Returns the cut and where the value of the last assignment it keeps ends, or
     ``None`` when it keeps none."""
     found: list[tuple[int, int, int]] = []  # an assignment's name start, -1 and its value end
-    pos = 0
-    while (name := _CREDENTIAL_NAME.search(text, pos, cut)) is not None:
-        pos = _value_end(text, name.end(), cut)
-        found.append((name.start(), -1, pos))
-        if pos >= cut:
-            break  # this value reaches the cut, so no name after it stands before the cut
+    for name_start, _, end in _credential_spans(text, cut):
+        found.append((name_start, -1, end))
+        if end >= cut:
+            break  # this value reaches the cut, so any name after it goes with this one
     labels = (
         ((m.start(), m.end("label"), m.end()) for m in rule.finditer(text, 0, cut))
         for rule in _OPEN_LABELS
@@ -1074,7 +1146,7 @@ def _spans(text: str) -> tuple[set[int], Iterator[tuple[int, int]]]:
     empty values included: what `_redactions` merges (`scrub_counted`)."""
     values: set[int] = set()
     assignments: list[tuple[int, int]] = []
-    for start, end in _credential_spans(text):
+    for _, start, end in _credential_spans(text):
         values.add(start)
         if end > start:
             assignments.append((start, end))
@@ -1194,6 +1266,11 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
       (``api_key=\\"api_key=bearer<TAB>X-API-KEY=``): that label reads the scheme word as its own
       and then its run, which is wider than a token and goes on past it.
 
+    A label's value may open with a gap (`_GAP`, issue #1035), and a control character is also a
+    character of the value's run, so a label in the value can stand before a gap of any length the
+    value took. Each place is therefore taken before the backslashes **and** the gap characters
+    that end the value there, and `_LITERAL_REACH` is searched before that.
+
     So only `_LITERAL_REACH` before each is searched, and the rule stays linear. In order, since each
     span starts no earlier than the one before it ends."""
     reach, labelled = _LITERAL_REACH[rule], "label" in rule.groupindex
@@ -1201,12 +1278,12 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
     while (match := _literal_search(rule, text, pos)) is not None:
         last, end = match, _literal_end(match)
         while True:
-            floor, stop = last.start("value"), end
-            while stop > floor and text[stop - 1] == "\\":
-                stop -= 1
+            floor = last.start("value")
+            stop = _before_escapes_and_gaps(text, end, floor)
             places: list[Iterable[int]] = [range(max(floor, stop - reach), end)]
             if (glued := last.start("glued")) >= 0:
-                places.append(range(max(floor, glued - reach), glued))
+                start = _before_escapes_and_gaps(text, glued, floor)
+                places.append(range(max(floor, start - reach), glued))
             inner = next(
                 (
                     m
@@ -1222,6 +1299,18 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
         label_end = match.end("label") if labelled else -1
         yield (label_end if label_end in values else match.start()), end
         pos = end
+
+
+_ONE_GAP_CHAR = re.compile(_GAP_CHAR)
+_GAP_AFTER = re.compile(_GAP_CHAR + r"+\Z")
+
+
+def _before_escapes_and_gaps(text: str, at: int, floor: int) -> int:
+    """Where the run of backslashes and gap characters (`_GAP_CHAR`) that ends at `at` starts, read
+    backwards no further than `floor` (`_literal_spans`)."""
+    while at > floor and (text[at - 1] == "\\" or _ONE_GAP_CHAR.match(text, at - 1)):
+        at -= 1
+    return at
 
 
 def _literal_search(rule: re.Pattern[str], text: str, pos: int) -> re.Match[str] | None:
@@ -1243,7 +1332,7 @@ def _closes(match: re.Match[str]) -> bool:
     (``api_key=\\"\\\\"``, a quote and an escaped backslash), since structure, never a backslash,
     follows a close. The query rule's value has no opener (issue #939 left it as it was), so this
     never judges it."""
-    opener = match.groupdict().get("opener")
+    opener = _GAP_AFTER.sub("", match.groupdict().get("opener") or "")  # its quote, not its gap
     if not opener or opener[-1] != '"':
         return False
     value = match.group("value").rstrip("\\")

@@ -795,7 +795,8 @@ FAKE_JWT = "eyJfabricatedSecretValue01"
         ("api_key=x,api_key=Bearer abc n", "[redacted] n"),
         ("?token=x?token=Bearer abc n", "[redacted] n"),
         # A label just before the glued scheme word a value ended in, with its wider run after it.
-        ('api_key=\\"api_key=bearer\tX-API-KEY= n', "[redacted] n"),
+        # (Its credential name's value ends at the `&`: after a blank, ` n` would be the value.)
+        ('api_key=\\"api_key=bearer\tX-API-KEY=& n', "[redacted] n"),
         # A label inside a value in escaped quotes reads to the same stop and leaves the same escape
         # (issue #937: until then it took the escape, and the line no longer parsed).
         (f'api_key=\\"api-key={SHAPELESS_KEY}\\" n', '[redacted]\\" n'),
@@ -1255,9 +1256,16 @@ def test_a_bound_cuts_a_label_whole_when_the_marker_would_be_its_value(text, cap
 
 
 def test_a_bound_keeps_a_label_whose_value_the_cut_does_not_reach():
-    # The blank after `?token=` ends its value before the cut, so the scrub reads none there.
-    assert bounded("see ?token= then more", 17) == "see ?token= then…"
-    assert scrub("see ?token= then…") == "see ?token= then…"
+    # The `&` after `?token=` ends its value before the cut, so the scrub reads none there.
+    assert bounded("see ?token=& then more", 18) == "see ?token=& then…"
+    assert scrub("see ?token=& then…") == "see ?token=& then…"
+
+
+def test_a_bound_reads_a_label_on_across_a_gap():
+    # A blank after `?token=` no longer ends its value (issue #1035): `then` is the value, the cut
+    # reaches it, and the label goes whole, as it does for a value with no gap.
+    assert bounded("see ?token= then more", 17) == "see…"
+    assert bounded("see api_key=\tthen more", 18) == "see…"
 
 
 @pytest.mark.parametrize("marker", ["…", " […]"])

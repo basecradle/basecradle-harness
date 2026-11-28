@@ -245,15 +245,24 @@ def test_the_name_stays_and_the_value_goes_whole(text, scrubbed, canary):
 
 
 @pytest.mark.parametrize(
-    "text", ["GH_TOKEN=", "GH_TOKEN= next", "GH_TOKEN=\nnext", "no=credential"]
+    "text", ["GH_TOKEN=", "GH_TOKEN= ", "GH_TOKEN=\n", "GH_TOKEN= ,next", "GH_TOKEN= }", "no=x"]
 )
 def test_an_empty_value_has_nothing_to_hide_and_is_left_alone(text):
+    # Nothing after the `=` but a gap, or a gap and then a `,` or a `}`, is no value.
     assert scrub(text) == text
+
+
+@pytest.mark.parametrize("text", ["GH_TOKEN= next", "GH_TOKEN=\nnext", "GH_TOKEN=\t \r\nnext"])
+def test_a_word_after_a_gap_is_the_value(text):
+    # Issue #1035: a gap after the `=` is skipped, so the word after it goes. Over-redacting a word
+    # of prose is the accepted cost; a credential written in full is not.
+    assert scrub(text) == "GH_TOKEN='<a redacted value>'"
 
 
 @pytest.mark.parametrize("brk", list(_BREAK_CHARS))
 def test_the_canarys_run_ends_at_every_record_break(brk):
-    assert scrub(f"A_TOKEN=\t{brk}next") == f"A_TOKEN='<a redacted value>'{brk}next"
+    # The run crosses the tab after the lead word `x`, and stops at the break.
+    assert scrub(f"A_TOKEN=x\t{brk}next") == f"A_TOKEN='<a redacted value>'{brk}next"
 
 
 def test_the_marker_is_no_value_to_the_canary_whatever_follows_it(canary):
@@ -343,10 +352,13 @@ FAKE_JWT = "eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig"
         (f"A_TOKEN=(a)Bearer {FAKE_JWT} next=1", "A_TOKEN='<a redacted value>' next=1"),
         ("A_TOKEN='a Bearer' next=1", "A_TOKEN='<a redacted value>' next=1"),
         ("A_TOKEN=a\\ Bearer next=1", "A_TOKEN='<a redacted value>'"),
-        # A scheme word with no word after it on its line is the value.
+        # A scheme word with no word after it is the value.
         ("A_TOKEN=Bearer", "A_TOKEN='<a redacted value>'"),
         ("A_TOKEN=Bearer ", "A_TOKEN='<a redacted value>' "),
-        ("A_TOKEN=Bearer \nnext=1", "A_TOKEN='<a redacted value>' \nnext=1"),
+        ("A_TOKEN=Bearer \n}", "A_TOKEN='<a redacted value>' \n}"),
+        # A gap stands between a scheme word and its token as blanks do (issue #1035), so the word
+        # on the next line is the token, as it is once a renderer has made the line one.
+        ("A_TOKEN=Bearer \nnext=1", "A_TOKEN='<a redacted value>'"),
         # A marker after a scheme word is the token, already redacted: one marker stands.
         ("A_TOKEN=Bearer '<a redacted value>' next=1", "A_TOKEN='<a redacted value>' next=1"),
     ],
@@ -506,17 +518,39 @@ _ROUTED_PIECES = [
 ]  # fmt: skip
 
 
+#: A gap that holds anything but tabs (issue #1035): the one place the two readings part.
+_WIDE_GAP = re.compile(
+    r"[\s\x00-\x1f\x7f-\x9f]*[^\S\t]|[\s\x00-\x1f\x7f-\x9f]*[\x00-\x08\x0e-\x1f\x7f-\x9f]"
+)
+
+
+def _wide_gap_at(text: str, at: int) -> bool:
+    return _WIDE_GAP.match(text, at) is not None
+
+
 def test_redact_credentials_is_the_routers_on_fuzzed_text():
+    # Issue #1035: a value that opens with a gap holding anything but tabs, and a token after a
+    # scheme word and such a gap, are read past it, where the router's reading crosses only tabs. Everywhere else the two readings are one, byte for
+    # byte; and everywhere, this one ends no earlier than the router's.
     rng = random.Random(929)
+    compared = 0
     for _ in range(3000):
         text = "".join(rng.choice(_ROUTED_PIECES) for _ in range(rng.randint(1, 14)))
-        assert redact_credentials(text) == router_reading.redact_credentials(text), repr(text)
+        separators = [i + 1 for i, c in enumerate(text) if c == "="]
+        separators += [m.end() for m in re.finditer("(?i)bearer", text)]
+        wide = any(_wide_gap_at(text, at) for at in separators)
+        if not wide:
+            assert redact_credentials(text) == router_reading.redact_credentials(text), repr(text)
         for start in range(len(text) + 1):
-            routers = router_reading._value_end(text, start)
-            assert _value_end(text, start) == routers, (repr(text), start)
-            # A limit is the reading's only addition: the router's end, or the limit if that is less.
+            routers, ours = router_reading._value_end(text, start), _value_end(text, start)
+            assert ours >= routers, (repr(text), start)
+            if not wide and not _wide_gap_at(text, start):
+                assert ours == routers, (repr(text), start)
+                compared += 1
+            # A limit is the reading's only addition: its own end, or the limit if that is less.
             limit = rng.randint(start, len(text) + 1)
-            assert _value_end(text, start, limit) == min(routers, limit), (repr(text), start, limit)
+            assert _value_end(text, start, limit) == min(ours, limit), (repr(text), start, limit)
+    assert compared > 10_000  # the router's domain is most of the fuzz, never a corner of it
 
 
 @pytest.mark.parametrize(

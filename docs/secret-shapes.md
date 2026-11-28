@@ -33,7 +33,11 @@ You can also read it straight out of the wheel PyPI publishes for a version, as 
 - **A field is added, but never renamed, removed or repurposed, without a `format_version` change.** A reader must ignore fields it does not know. A new field does not change the version, so it never breaks a reader that ignores it.
 - **Rules change without a format change.** A new vendor key, a new label name, or a different minimum ships in a release as an edit to the file, in a reviewed PR. The file a release carries is exactly what the harness at that version redacts.
 - **Regular-expression fragments use the syntax Python's `re`, RE2 and VRL share**: character classes, alternation, `{m,n}` and `(?:…)`, never lookaround or backreferences. A label name is a literal, never a pattern.
-- **The file defines what a secret is, not how a text is read for one.** How a value is found once its label is (a quoted value, an escaped quote at any depth, a JSON string's close) is each reader's own. The harness's reading is in its code, and the fleet's log pipeline has its own.
+- **The file defines what a secret is, not how a text is read for one.** How a value is found once its label is (a quoted value, an escaped quote at any depth, a JSON string's close, a gap after the label) is each reader's own. The harness's reading is in its code, and the fleet's log pipeline has its own.
+
+## A Gap Before a Value
+
+**Wherever a section below says a value follows its label, a gap may stand between them** (issue [#1035](https://github.com/basecradle/basecradle-harness/issues/1035)): a run of whitespace (a non-breaking space and the Unicode line separators included) and C0 and C1 control characters, DEL among them. The harness skips it and redacts the value, and the gap goes with the value, so `A_TOKEN=<TAB>K9…`, `A_TOKEN=<ESC>K9…` and `A_TOKEN=<CR><LF>K9…` are each written `A_TOKEN='<a redacted value>'`. A gap is exactly what a log renderer that flattens a line before scrubbing it makes one space, so a reader that flattens first and one that scrubs raw text find the same value. A gap followed by nothing a value starts with (a `,`, a `}` or the text's end) opens no value. The cost is stated: a word of prose after a label and a gap is read as its value.
 
 ## What Neither Half Catches
 
@@ -105,13 +109,13 @@ A key is `(?:prefix)run{minimum_run,}`. A match glued to a letter, digit or comb
 | `value_stops` | The characters the fleet's log canary ends a value at. |
 | `value_minimum_length` | The canary's shortest value. |
 
-A name is `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?` followed by `=`. Its value is redacted whatever it looks like, and the name is kept. This is the fleet log canary's `credential_assignment` rule, `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}`.
+A name is `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?` followed by `=`. Its value, after any gap, is redacted whatever it looks like, and the name is kept. This is the fleet log canary's `credential_assignment` rule, `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}`.
 
 ### `bearer`
 
 | Field | Meaning |
 |---|---|
-| `scheme` | The scheme word, matched in any case. |
+| `scheme` | The scheme word, matched in any case, followed by a gap. |
 | `token` | A character class: the token's characters. |
 | `minimum_token` | The shortest token. A shorter one is a word (`Bearer token missing`). |
 
@@ -121,10 +125,10 @@ Each holds `names`: literal label names, matched in any case.
 
 | Section | Where the label stands, and what goes |
 |---|---|
-| `query_parameters` | After `?` or `&`, then `=`: the value, to the next `&` or whitespace. |
-| `api_key_assignment` | Anywhere, then `=`: the value, to the next `&`, `"` or whitespace. |
-| `headers` | Followed by `:` or `=>`, or by a quote and then `:`, `=`, `=>` or `,`: the value, to the next whitespace, quote, backslash or `&`. |
-| `json_members` | As the whole name of a JSON member whose value is a string: the string's contents, its quotes kept. |
+| `query_parameters` | After `?` or `&`, then `=`: the value, after any gap, to the next `&` or whitespace. |
+| `api_key_assignment` | Anywhere, then `=`: the value, after any gap and any opening quote and the gap after it, to the next `&`, `"` or whitespace. |
+| `headers` | Followed by `:` or `=>`, or by a quote and then `:`, `=`, `=>` or `,`, a gap allowed before each: the value, after any gap and any opening quote and the gap after it, to the next whitespace, quote, backslash or `&`. |
+| `json_members` | As the whole name of a JSON member whose value is a string, a gap allowed around its `:`: the string's contents, its quotes kept, read to its close past any control character but a C0 line break. |
 
 ### `heartbeat_url`
 

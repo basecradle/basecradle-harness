@@ -1162,6 +1162,23 @@ def test_an_exchange_is_filed_with_its_secrets_blanked_and_the_rest_kept(
     assert _CONFIGURED_SECRET not in caplog.text  # the count never carries the text
 
 
+@pytest.mark.parametrize("gap", ["", " ", "\t", "\xa0", "\x1b", "\x00", "\n", "\r\n"], ids=repr)
+def test_an_exchange_is_filed_without_a_value_a_gap_stands_before(
+    platform, tmp_path, monkeypatch, gap
+):
+    """Issue #1035: a gap between a credential's name and its value never keeps the value, in the
+    exchange memory is handed as on every other path."""
+    secret = "secretsecret12345"
+    body = f"Deploy with A_TOKEN={gap}{secret} and tell me when it is done."
+    _serve_messages(platform, {"messages": [_message(uuid=M0, body=body)], "next_cursor": None})
+    provider = RecordingProvider()
+    _wake(tmp_path, provider).wake()
+
+    (exchange,) = provider.observed
+    assert secret not in exchange.user
+    assert "A_TOKEN='<a redacted value>' and tell me when it is done." in exchange.user
+
+
 def test_an_exchange_the_redaction_cannot_run_on_is_never_filed(
     platform, tmp_path, monkeypatch, caplog
 ):
