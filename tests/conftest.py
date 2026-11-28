@@ -69,11 +69,16 @@ def child_env(**extra: str) -> dict[str, str]:
 #: (`observability/log-canary.json`, read at 4ca50868bd219493c0290b62d89f267915c8d70f, the squash
 #: of basecradle-noc#1560, 2026-11-18; `docs/observability.md` §10), and as basecradle-router holds
 #: it in its own `tests/conftest.py` (its widened copy moves in basecradle-router#504). Widened by `@origin`'s decision on basecradle-noc#1547
-#: (2026-11-17, issue #927): a bare word is a name, and `_BASE` is the one tail after the word. The
+#: (2026-11-17, issue #927): a bare word is a name, and `_BASE` is the one tail after the word.
+#: Widened again on basecradle-noc#1849 (live 2026-11-28 04:16Z, adopted with issue #1035, as the
+#: capital's comment on it gives the bytes): a run of spaces may stand between the `=` and the value,
+#: so a writer that still writes `NAME= value` fails its own tests. The
 #: scrub's definition of a credential's name (`_redaction.CREDENTIAL_NAME`, issue #918) is held
 #: to these bytes, and every credential-assignment test uses this pattern as its oracle. Moving it is
 #: a change to the NOC's rule: move it here with it.
-NOC_CREDENTIAL_ASSIGNMENT = r'[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}'
+NOC_CREDENTIAL_ASSIGNMENT = (
+    r'[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[ ]*[^ ",}]{8,}'
+)
 
 
 @pytest.fixture
