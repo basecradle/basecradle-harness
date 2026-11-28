@@ -415,14 +415,17 @@ def _members(text: str, stop: int | None = None) -> Iterator[tuple[int, int, int
         )
         if places := [found.start() for found in diverged if found is not None]:
             pos = min(places)
-        open_gap = begin >= end > match.end()  # all gap to the stop: open there, a cut reaches it
-        yield match.start(), match.end(), close if close > begin or open_gap else match.end()
+        yield match.start(), match.end(), close  # a value all gap ends where its gap does
 
 
 def _member_spans(text: str) -> Iterator[tuple[int, int]]:
     """Every credential-named JSON member's string value in `text`, from where it starts to where
-    its close begins, an empty value giving no span."""
-    return ((start, end) for _, start, end in _members(text) if end > start)
+    its close begins, a value that is empty or all gap giving no span."""
+    return (
+        (start, end)
+        for _, start, end in _members(text)
+        if end > start and _GAP.match(text, start, end).end() < end
+    )
 
 
 #: What follows the close of a JSON string, at any depth of nesting: a ``,`` or a ``:`` before the
@@ -437,6 +440,13 @@ _LITERAL_REACH = {
     _X_API_KEY: _longest("headers") + len("=>") + len(_SCHEME_LETTERS),
     _QUERY: len("?") + _longest("query_parameters") + len("=") + len(_SCHEME_LETTERS),
     _API_KEY: _longest("api_key_assignment") + len("=") + len(_SCHEME_LETTERS),
+}
+
+#: Each literal rule's value run, which `_past_scheme_gaps` reads after a scheme word's gap.
+_LITERAL_RUNS = {
+    _X_API_KEY: re.compile(_X_API_RUN + "*"),
+    _QUERY: re.compile(_QUERY_RUN + "*"),
+    _API_KEY: re.compile(_API_KEY_RUN + "*"),
 }
 
 #: A bearer header: the scheme word in any case and its token, which is eight or more token
@@ -729,13 +739,18 @@ def _token_after_a_scheme_word(text: str, floor: int, end: int, gaps: bool = Tru
 
     **A gap stands between a scheme word and its token as blanks do** (`_GAP`, issue #1035), so
     ``A_TOKEN=Bearer<NEWLINE>eyJ…`` loses the token on a path that scrubs raw text, as the line a
-    renderer flattened it into does; where the gap reaches no token, the router's blanks decide."""
-    if end - floor < _SCHEME_WORD_LENGTH or not _SCHEME_WORD.fullmatch(
-        text, end - _SCHEME_WORD_LENGTH, end
+    renderer flattened it into does; where the gap reaches no token, the router's blanks decide.
+    The shell reads a gap character that is no blank as part of the word (``Bearer<CR><LF>,K9…``
+    ends its word at the ``<CR>``), so the scheme word is looked for before the gap the word ends in."""
+    core = _before_escapes_and_gaps(text, end, floor, escapes=False) if gaps else end
+    if core - floor < _SCHEME_WORD_LENGTH or not _SCHEME_WORD.fullmatch(
+        text, core - _SCHEME_WORD_LENGTH, core
     ):
         return None
-    if gaps and (gap := _GAP.match(text, end).end()) > end and gap < len(text):
+    if gaps and (gap := _GAP.match(text, core).end()) > core and gap < len(text):
         return gap
+    if core < end:
+        return None  # the router's reading: this word ends in no scheme word
     if (blanks := _SCHEME_BLANKS.match(text, end)) is None or not _reached(text, blanks.end()):
         return None
     return blanks.end()
@@ -1301,7 +1316,12 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
                 None,
             )
             if inner is None:
-                break
+                # A scheme word the value ends in takes the run after its gap, and a label that run
+                # holds is read on in turn.
+                if (grown := _past_scheme_gaps(text, floor, end, _LITERAL_RUNS[rule])) == end:
+                    break
+                end = grown
+                continue
             last, end = inner, _literal_end(inner)
         label_end = match.end("label") if labelled else -1
         yield (label_end if label_end in values else match.start()), end
@@ -1312,12 +1332,27 @@ _ONE_GAP_CHAR = re.compile(_GAP_CHAR)
 _GAP_AFTER = re.compile(_GAP_CHAR + r"+\Z")
 
 
-def _before_escapes_and_gaps(text: str, at: int, floor: int) -> int:
-    """Where the run of backslashes and gap characters (`_GAP_CHAR`) that ends at `at` starts, read
-    backwards no further than `floor` (`_literal_spans`)."""
-    while at > floor and (text[at - 1] == "\\" or _ONE_GAP_CHAR.match(text, at - 1)):
+def _before_escapes_and_gaps(text: str, at: int, floor: int, *, escapes: bool = True) -> int:
+    """Where the run of gap characters (`_GAP_CHAR`), and of backslashes unless `escapes` is false,
+    that ends at `at` starts, read backwards no further than `floor`."""
+    while at > floor and ((escapes and text[at - 1] == "\\") or _ONE_GAP_CHAR.match(text, at - 1)):
         at -= 1
     return at
+
+
+def _past_scheme_gaps(text: str, floor: int, end: int, run: re.Pattern[str]) -> int:
+    """Where a literal rule's value from `floor` ends once each scheme word it ends in has the run
+    after its gap (issue #1035): flattened, ``api_key=Kbearer<ESC>,K9…`` is ``api_key=Kbearer ,K9…``,
+    whose value would end at the scheme word, where the raw text's run took ``,K9…`` too. Each
+    step reads new text, so the walk is linear."""
+    while end - floor >= _SCHEME_WORD_LENGTH and _SCHEME_WORD.fullmatch(
+        text, end - _SCHEME_WORD_LENGTH, end
+    ):
+        gap = _GAP.match(text, end).end()
+        if gap == end or (after := run.match(text, gap).end()) == gap:
+            break
+        end = after
+    return end
 
 
 def _literal_search(rule: re.Pattern[str], text: str, pos: int) -> re.Match[str] | None:

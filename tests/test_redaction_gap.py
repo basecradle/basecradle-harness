@@ -42,6 +42,7 @@ from basecradle_harness._redaction import (
     redact_file,
     scrub,
     scrub_parts,
+    stable_cut,
 )
 from basecradle_harness._report import verbatim
 from basecradle_harness._server_tools import bound
@@ -213,6 +214,49 @@ def test_a_bound_on_an_empty_value_before_a_gap_is_a_fixed_point(text):
     head = bounded(scrub(text), 20)
     assert scrub(head) == head
     assert head in ("ok…", "ok {…")  # the name goes with its value; a brace before it stays
+
+
+_KEY = "K9xQ2mZ7pL4vB8nR"
+
+
+@pytest.mark.parametrize(
+    "gap", ["\r\n", "\x1b ", "\x00 ", "\x9b ", "\xa0 ", "\x7f ", "\r\n\x1b[33m"]
+)
+@pytest.mark.parametrize("after", [",", "}", ""])
+@pytest.mark.parametrize("scheme", ["Bearer", "abc-bearer"])
+def test_a_scheme_word_the_shell_glues_a_gap_to_still_takes_its_token(scheme, gap, after):
+    # The shell reads `Bearer<CR>` as one word, which no longer ends in the scheme word (the second
+    # review of #1035); flattened, the same text is `Bearer ,K9…`.
+    text = f"A_TOKEN={scheme}{gap}{after}{_KEY}"
+    _absent(scrub(text), _KEY)
+    _absent(scrub(_flatten(text)), _KEY)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"api_key=Kbearer\x1b,{_KEY}",
+        f"?token=abcbearer\x1b[33m{_KEY}",
+        f"x-api-key: abcbearer\x00}}{_KEY}",
+        f"?token=abcbearer\x1bbearer\x1b{JWT}abcdef%2F{_KEY}",
+    ],
+)
+def test_a_glued_scheme_word_in_a_literal_value_takes_the_run_after_its_gap(text):
+    # Raw, the value's run takes the control character and what follows; flattened, the value would
+    # end at the scheme word, so the run after its gap goes with it.
+    _absent(scrub(text), _KEY)
+    _absent(scrub(_flatten(text)), _KEY)
+
+
+def test_a_bound_on_a_member_value_that_is_all_gap_is_a_fixed_point():
+    # Malformed: the first value's close is also the second member's opening quote.
+    text = '"password": "\x01"password": "[redacted]"'
+    assert scrub(text) == text
+    head = bounded(text, 28)
+    assert scrub(head) == head
+    head_end, tail = stable_cut(text, 27, len(text))
+    excerpt = text[:head_end] + "…" + text[tail:]
+    assert scrub(excerpt) == excerpt
 
 
 def test_an_opener_quote_with_a_gap_after_it_at_a_strings_close_opens_nothing():
