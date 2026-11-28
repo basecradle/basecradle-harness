@@ -420,12 +420,18 @@ def _members(text: str, stop: int | None = None) -> Iterator[tuple[int, int, int
 
 def _member_spans(text: str) -> Iterator[tuple[int, int]]:
     """Every credential-named JSON member's string value in `text`, from where it starts to where
-    its close begins, a value that is empty or all gap giving no span."""
+    its close begins, a value that is empty, or all gap and closed, giving no span."""
     return (
         (start, end)
         for _, start, end in _members(text)
-        if end > start and _GAP.match(text, start, end).end() < end
+        if end > start and not (_GAP.match(text, start, end).end() == end and _closes_at(text, end))
     )
+
+
+def _closes_at(text: str, at: int) -> bool:
+    """Whether a member value `_members` read ends at its closing quote (or the backslashes that
+    escape it), not at a record break or the text's end, where it is open and goes."""
+    return text[at : at + 1] in ('"', "\\")
 
 
 #: What follows the close of a JSON string, at any depth of nesting: a ``,`` or a ``:`` before the
@@ -502,7 +508,7 @@ _TRAILING_BEARER = re.compile(rf"(?<![A-Za-z0-9]){_SCHEME}\Z")
 # a credential" is the NOC's log-store canary's definition, its `credential_assignment` rule
 # (basecradle-noc `observability/log-canary.json`), never a list of this package's own:
 #
-#     [A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}
+#     [A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[ ]*[^ ",}]{8,}
 #
 # `tests/conftest.py` holds that pattern byte for byte, and the tests hold the pieces below to it:
 # the words, the tail, the value's stop characters and its floor must spell it exactly, the name
@@ -1344,15 +1350,19 @@ def _past_scheme_gaps(text: str, floor: int, end: int, run: re.Pattern[str]) -> 
     """Where a literal rule's value from `floor` ends once each scheme word it ends in has the run
     after its gap (issue #1035): flattened, ``api_key=Kbearer<ESC>,K9…`` is ``api_key=Kbearer ,K9…``,
     whose value would end at the scheme word, where the raw text's run took ``,K9…`` too. Each
-    step reads new text, so the walk is linear."""
-    while end - floor >= _SCHEME_WORD_LENGTH and _SCHEME_WORD.fullmatch(
-        text, end - _SCHEME_WORD_LENGTH, end
-    ):
-        gap = _GAP.match(text, end).end()
-        if gap == end or (after := run.match(text, gap).end()) == gap:
-            break
+    step reads new text, so the walk is linear. A control character the run took after the scheme
+    word is part of its gap (``api_key=Kbearer<ESC><TAB>,K9…``), so the word is looked for before
+    the gap characters the run ends in."""
+    while True:
+        core = _before_escapes_and_gaps(text, end, floor, escapes=False)
+        if core - floor < _SCHEME_WORD_LENGTH or not _SCHEME_WORD.fullmatch(
+            text, core - _SCHEME_WORD_LENGTH, core
+        ):
+            return end
+        gap = _GAP.match(text, core).end()
+        if gap <= end or (after := run.match(text, gap).end()) == gap:
+            return end
         end = after
-    return end
 
 
 def _literal_search(rule: re.Pattern[str], text: str, pos: int) -> re.Match[str] | None:

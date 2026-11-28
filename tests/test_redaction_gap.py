@@ -248,6 +248,29 @@ def test_a_glued_scheme_word_in_a_literal_value_takes_the_run_after_its_gap(text
     _absent(scrub(_flatten(text)), _KEY)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"api_key=Kbearer\x1b\t,{_KEY}",
+        f"x-api-key: abcbearer\x00\t,{_KEY}",
+        f"?token=.Bearer\x9b :{_KEY}",
+    ],
+)
+def test_a_scheme_word_a_literal_run_took_a_control_character_after_still_reaches_on(text):
+    # The run takes the control character after the scheme word, so the word is looked for before
+    # it (the third review of #1035).
+    _absent(scrub(text), _KEY)
+    _absent(scrub(_flatten(text)), _KEY)
+
+
+@pytest.mark.parametrize(
+    "text", ['"password":"Bearer ""password":" ', '{"password": "Bearer ""password": " ']
+)
+def test_an_open_member_value_that_is_all_gap_goes_and_reads_back_as_itself(text):
+    once = scrub(text)
+    assert scrub(once) == once
+
+
 def test_a_bound_on_a_member_value_that_is_all_gap_is_a_fixed_point():
     # Malformed: the first value's close is also the second member's opening quote.
     text = '"password": "\x01"password": "[redacted]"'

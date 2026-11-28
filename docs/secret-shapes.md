@@ -109,7 +109,7 @@ A key is `(?:prefix)run{minimum_run,}`. A match glued to a letter, digit or comb
 | `value_stops` | The characters the fleet's log canary ends a value at. |
 | `value_minimum_length` | The canary's shortest value. |
 
-A name is `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?` followed by `=`. Its value, after any gap, is redacted whatever it looks like, and the name is kept. This is the fleet log canary's `credential_assignment` rule, `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[^ ",}]{8,}`.
+A name is `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?` followed by `=`. Its value, after any gap, is redacted whatever it looks like, and the name is kept. This is the fleet log canary's `credential_assignment` rule, `[A-Z0-9_]*(KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE)(_BASE)?=[ ]*[^ ",}]{8,}`.
 
 ### `bearer`
 

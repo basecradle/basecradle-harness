@@ -81,7 +81,9 @@ def silent(canary: re.Pattern[str], *lines: str) -> bool:
 
 def test_the_pieces_spell_the_canarys_rule_byte_for_byte():
     words, stops, tail = "|".join(CREDENTIAL_WORDS), CANARY_VALUE_STOPS, CREDENTIAL_TAIL
-    spelled = f"[A-Z0-9_]*({words})({tail})?=[^{stops}]{{{CANARY_VALUE_FLOOR},}}"
+    # The canary's `[ ]*` (basecradle-noc#1849) is a gap narrower than the one the scrub skips
+    # before a value (`_redaction._GAP`, issue #1035), so it is spelled here, not taken from a piece.
+    spelled = f"[A-Z0-9_]*({words})({tail})?=[ ]*[^{stops}]{{{CANARY_VALUE_FLOOR},}}"
     assert spelled == NOC_CREDENTIAL_ASSIGNMENT
 
 
