@@ -314,20 +314,20 @@ _X_API_RUN = r"[^\s\"'&\\]"
 _SCHEME_WORDS = rf"(?:{_SCHEME}{_GAP_CHAR}+)*"
 _X_API_KEY = re.compile(
     f"{_X_API_LABEL}(?P<opener>{_X_API_OPENER})(?P<value>{_SCHEME_WORDS}"
-    rf"(?:{_X_API_RUN}*?(?P<glued>{_SCHEME}){_GAP_CHAR}+{_TOKEN}|{_X_API_RUN}+))"
+    rf"(?:{_X_API_RUN}*?(?P<glued>{_SCHEME}){_GAP_CHAR}+{_TOKEN}{_X_API_RUN}*|{_X_API_RUN}+))"
 )
 _QUERY_LABEL = rf"[?&](?i:{_names('query_parameters')})="
 _QUERY_RUN = r"[^&\s]"
 _QUERY = re.compile(
     f"(?P<label>{_QUERY_LABEL}){_GAP_CHAR}*(?P<value>{_SCHEME_WORDS}"
-    rf"(?:{_QUERY_RUN}*?(?P<glued>{_SCHEME}){_GAP_CHAR}+{_TOKEN}|{_QUERY_RUN}+))"
+    rf"(?:{_QUERY_RUN}*?(?P<glued>{_SCHEME}){_GAP_CHAR}+{_TOKEN}{_QUERY_RUN}*|{_QUERY_RUN}+))"
 )
 _API_KEY_LABEL = rf"(?i:(?:{_names('api_key_assignment')})=)"
 _API_KEY_OPENER = f'{_GAP_CHAR}*(?:{_ESCAPE}"{_GAP_CHAR}*)?'
 _API_KEY_RUN = r"[^&\s\"]"
 _API_KEY = re.compile(
     f"(?P<label>{_API_KEY_LABEL})(?P<opener>{_API_KEY_OPENER})(?P<value>{_SCHEME_WORDS}"
-    rf"(?:{_API_KEY_RUN}*?(?P<glued>{_SCHEME}){_GAP_CHAR}+{_TOKEN}|{_API_KEY_RUN}+))"
+    rf"(?:{_API_KEY_RUN}*?(?P<glued>{_SCHEME}){_GAP_CHAR}+{_TOKEN}{_API_KEY_RUN}*|{_API_KEY_RUN}+))"
 )
 
 #: **A credential-named JSON member's string value** (issue #943, @origin, 2026-11-19): a member
@@ -415,7 +415,8 @@ def _members(text: str, stop: int | None = None) -> Iterator[tuple[int, int, int
         )
         if places := [found.start() for found in diverged if found is not None]:
             pos = min(places)
-        yield match.start(), match.end(), close if close > begin else match.end()
+        open_gap = begin >= end > match.end()  # all gap to the stop: open there, a cut reaches it
+        yield match.start(), match.end(), close if close > begin or open_gap else match.end()
 
 
 def _member_spans(text: str) -> Iterator[tuple[int, int]]:
@@ -733,7 +734,7 @@ def _token_after_a_scheme_word(text: str, floor: int, end: int, gaps: bool = Tru
         text, end - _SCHEME_WORD_LENGTH, end
     ):
         return None
-    if gaps and (gap := _GAP.match(text, end).end()) > end and _reached(text, gap):
+    if gaps and (gap := _GAP.match(text, end).end()) > end and gap < len(text):
         return gap
     if (blanks := _SCHEME_BLANKS.match(text, end)) is None or not _reached(text, blanks.end()):
         return None
@@ -751,9 +752,10 @@ def _value_end(text: str, start: int, limit: int | None = None, *, gaps: bool = 
 
     A value reaches its first word, after any gap it opens with (`_GAP`: whitespace and control
     characters, which the router's reading crosses only as tabs, issue #1035), unless it opens with
-    a marker where the canary's run would end after it, which is the whole value. Where a ``,``, a
-    ``}`` or the text's end follows the gap, the router's reading decides, from the gap's first
-    character (``A_TOKEN=<CR>}eyJ…`` is one shell word to it), so this reading never takes less than
+    a marker where the canary's run would end after it, which is the whole value. Anything but the
+    text's end after the gap opens the value, a ``,`` and a ``}`` included (raw, ``A_TOKEN=<ESC>,K9…``
+    is one shell word; flattened, a blank and ``,K9…``); a gap to the text's end opens nothing, and
+    the router's reading decides from its first character, so this reading never takes less than
     the router's. The gap goes with the value, as a tab the canary's run crosses always did, so
     ``A_TOKEN= K9…`` and ``A_TOKEN=<NEWLINE>K9…`` are redacted to the same bytes as the line a
     renderer flattened them into. From a word it reaches:
@@ -784,7 +786,7 @@ def _value_end(text: str, start: int, limit: int | None = None, *, gaps: bool = 
             after = at + len(REDACTED_VALUE)
             if after == len(text) or text[after] in _MARKER_ENDS:
                 return min(max(end, after), stop)
-        if gaps and (gap := _GAP.match(text, at).end()) > at and _reached(text, gap):
+        if gaps and (gap := _GAP.match(text, at).end()) > at and gap < len(text):
             at = gap  # a value after the gap (issue #1035)
         elif (tabs := _TABS.match(text, at).end()) > at:  # else the router's reading, exactly
             if not _reached(text, tabs):
@@ -968,7 +970,9 @@ def _whole_values(text: str, cut: int) -> tuple[int, int | None]:
     glued before it), never keep a label that should go. Returns the cut and where the value of the last assignment it keeps ends, or
     ``None`` when it keeps none."""
     found: list[tuple[int, int, int]] = []  # an assignment's name start, -1 and its value end
-    for name_start, _, end in _credential_spans(text, cut):
+    for name_start, start, end in _credential_spans(text, cut):
+        if end == start < cut and _GAP.match(text, start, cut).end() >= cut:
+            end = cut  # nothing but a gap to the cut: a later scrub reads the `…` as the value
         found.append((name_start, -1, end))
         if end >= cut:
             break  # this value reaches the cut, so any name after it goes with this one
@@ -1289,7 +1293,10 @@ def _literal_spans(rule: re.Pattern[str], text: str, values: set[int]) -> Iterat
                     m
                     for place in places
                     for i in place
-                    if (m := rule.match(text, i)) and not _closes(m) and _literal_end(m) > end
+                    if (m := rule.match(text, i))
+                    and not _closes(m)
+                    and not _a_marker(m)
+                    and _literal_end(m) > end
                 ),
                 None,
             )
@@ -1315,9 +1322,21 @@ def _before_escapes_and_gaps(text: str, at: int, floor: int) -> int:
 
 def _literal_search(rule: re.Pattern[str], text: str, pos: int) -> re.Match[str] | None:
     """The first match of a literal rule from `pos` whose opener opens a value (`_closes`)."""
-    while (match := rule.search(text, pos)) is not None and _closes(match):
-        pos = match.end("opener")
+    while (match := rule.search(text, pos)) is not None and (_closes(match) or _a_marker(match)):
+        pos = match.end("opener") if _closes(match) else match.end()
     return match
+
+
+def _a_marker(match: re.Match[str]) -> bool:
+    """Whether a literal rule's `match` read a value that is a `REDACTED` a gap stands before
+    (issue #1035): ``api_key= [redacted]`` is what `scrub` wrote for ``api_key= &key=K9…``, and
+    reading the marker as the label's value would make a second scrub change the text."""
+    at = match.start("value")
+    return (
+        match.group("value") == REDACTED
+        and at > 0
+        and bool(_ONE_GAP_CHAR.match(match.string, at - 1))
+    )
 
 
 def _closes(match: re.Match[str]) -> bool:

@@ -132,8 +132,6 @@ def test_a_colored_member_value_is_read_to_its_close(gap):
         "GH_TOKEN= ",
         "GH_TOKEN=\n",
         "GH_TOKEN= \r\n",
-        "GH_TOKEN= ,next=1",
-        "GH_TOKEN= }",
         '{"password": "  "}',
         '{"password": "\x1b"}',
     ],
@@ -179,6 +177,42 @@ def test_a_label_after_a_long_gap_inside_a_value_is_read_on():
     # than a label's length before the blank where that value stops.
     text = "api_key=x,api_key=" + "\x1b" * 40 + " " + JWT
     _absent(scrub(text), JWT)
+
+
+@pytest.mark.parametrize("after", [",", "}", "\r}", "\x00}"])
+@pytest.mark.parametrize("gap", ["\x1b", "\r", "\x00", " "])
+def test_a_gap_before_a_comma_or_a_brace_still_opens_the_value(gap, after):
+    # Raw, `\x1b,K9…` is one shell word; flattened, it is a blank and then `,K9…`. Both are the
+    # value, so the two orders write the same bytes (the review of #1035).
+    text = f"A_TOKEN={gap}{after}{JWT}"
+    assert scrub(text) == scrub(_flatten(text)) == "A_TOKEN=" + REDACTED_VALUE
+
+
+@pytest.mark.parametrize("label", ["?token=", "url api_key=", "x-api-key: "])
+@pytest.mark.parametrize("gap", ["\x1b", "\x7f", "\x00", "\x9b"])
+@pytest.mark.parametrize("glue", ["%2F", ":", ","])
+def test_a_glued_scheme_word_across_a_control_character_takes_the_whole_run(label, gap, glue):
+    # The glued alternative once ended at the token's last character, where the run went on.
+    text = f"{label}abcbearer{gap}{JWT}{glue}K9q7Zr2LmX4pV8nT"
+    _absent(scrub(text), "K9q7Zr2LmX4pV8nT")
+
+
+@pytest.mark.parametrize("label", ["api_key= ", "?token= ", "x-api-key: "])
+def test_a_marker_after_a_label_and_a_gap_is_no_value(label):
+    # `api_key= &key=K9…` scrubs to `api_key= [redacted]`; a second scrub changes nothing.
+    once = scrub(f"{label}&key=K9q7Zr2LmX4pV8nT")
+    _absent(once, "K9q7Zr2LmX4pV8nT")
+    assert scrub(once) == once
+
+
+@pytest.mark.parametrize(
+    "text", ["ok DB_PASSWORD=" + " " * 40, 'ok {"api_key":"\x9b' + "\x9b" * 40]
+)
+def test_a_bound_on_an_empty_value_before_a_gap_is_a_fixed_point(text):
+    # Cut inside the gap, a head ending in the name would have its `…` read as the value.
+    head = bounded(scrub(text), 20)
+    assert scrub(head) == head
+    assert head in ("ok…", "ok {…")  # the name goes with its value; a brace before it stays
 
 
 def test_an_opener_quote_with_a_gap_after_it_at_a_strings_close_opens_nothing():

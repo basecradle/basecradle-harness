@@ -37,7 +37,7 @@ You can also read it straight out of the wheel PyPI publishes for a version, as 
 
 ## A Gap Before a Value
 
-**Wherever a section below says a value follows its label, a gap may stand between them** (issue [#1035](https://github.com/basecradle/basecradle-harness/issues/1035)): a run of whitespace (a non-breaking space and the Unicode line separators included) and C0 and C1 control characters, DEL among them. The harness skips it and redacts the value, and the gap goes with the value, so `A_TOKEN=<TAB>K9…`, `A_TOKEN=<ESC>K9…` and `A_TOKEN=<CR><LF>K9…` are each written `A_TOKEN='<a redacted value>'`. A gap is exactly what a log renderer that flattens a line before scrubbing it makes one space, so a reader that flattens first and one that scrubs raw text find the same value. A gap followed by nothing a value starts with (a `,`, a `}` or the text's end) opens no value. The cost is stated: a word of prose after a label and a gap is read as its value.
+**Wherever a section below says a value follows its label, a gap may stand between them** (issue [#1035](https://github.com/basecradle/basecradle-harness/issues/1035)): a run of whitespace (a non-breaking space and the Unicode line separators included) and C0 and C1 control characters, DEL among them. The harness skips it and redacts the value, and the gap goes with the value, so `A_TOKEN=<TAB>K9…`, `A_TOKEN=<ESC>K9…` and `A_TOKEN=<CR><LF>K9…` are each written `A_TOKEN='<a redacted value>'`. A gap is exactly what a log renderer that flattens a line before scrubbing it makes one space, so a reader that flattens first and one that scrubs raw text find the same value. A gap that runs to the text's end opens no value. The cost is stated: a word of prose after a label and a gap is read as its value.
 
 ## What Neither Half Catches
 
@@ -128,7 +128,7 @@ Each holds `names`: literal label names, matched in any case.
 | `query_parameters` | After `?` or `&`, then `=`: the value, after any gap, to the next `&` or whitespace. |
 | `api_key_assignment` | Anywhere, then `=`: the value, after any gap and any opening quote and the gap after it, to the next `&`, `"` or whitespace. |
 | `headers` | Followed by `:` or `=>`, or by a quote and then `:`, `=`, `=>` or `,`, a gap allowed before each: the value, after any gap and any opening quote and the gap after it, to the next whitespace, quote, backslash or `&`. |
-| `json_members` | As the whole name of a JSON member whose value is a string, a gap allowed around its `:`: the string's contents, its quotes kept, read to its close past any control character but a C0 line break. |
+| `json_members` | As the whole name of a JSON member whose value is a string, a gap allowed around its `:`: the string's contents, its quotes kept, read to its close past any control character but a C0 record break (a line break, NUL, `\v`, `\f`, `\x1c`–`\x1e`). |
 
 ### `heartbeat_url`
 

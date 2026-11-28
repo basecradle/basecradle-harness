@@ -245,10 +245,10 @@ def test_the_name_stays_and_the_value_goes_whole(text, scrubbed, canary):
 
 
 @pytest.mark.parametrize(
-    "text", ["GH_TOKEN=", "GH_TOKEN= ", "GH_TOKEN=\n", "GH_TOKEN= ,next", "GH_TOKEN= }", "no=x"]
+    "text", ["GH_TOKEN=", "GH_TOKEN= ", "GH_TOKEN=\n", "GH_TOKEN= \r\n", "no=x"]
 )
 def test_an_empty_value_has_nothing_to_hide_and_is_left_alone(text):
-    # Nothing after the `=` but a gap, or a gap and then a `,` or a `}`, is no value.
+    # Nothing after the `=` but a gap is no value.
     assert scrub(text) == text
 
 
@@ -355,7 +355,7 @@ FAKE_JWT = "eyJhbGciOiJIUzI1NiJ9.e30.fabricatedSig"
         # A scheme word with no word after it is the value.
         ("A_TOKEN=Bearer", "A_TOKEN='<a redacted value>'"),
         ("A_TOKEN=Bearer ", "A_TOKEN='<a redacted value>' "),
-        ("A_TOKEN=Bearer \n}", "A_TOKEN='<a redacted value>' \n}"),
+        ("A_TOKEN=Bearer \n", "A_TOKEN='<a redacted value>' \n"),
         # A gap stands between a scheme word and its token as blanks do (issue #1035), so the word
         # on the next line is the token, as it is once a renderer has made the line one.
         ("A_TOKEN=Bearer \nnext=1", "A_TOKEN='<a redacted value>'"),
@@ -400,10 +400,12 @@ def test_scrub_ships_no_token_after_a_credentials_scheme_word(text):
             "AUTH_TOKEN=x,DB_PASSWORD=\thunter2hunter2 next=1",
             "AUTH_TOKEN='<a redacted value>' next=1",
         ),
-        # A `}` ends the canary's run and starts no token, so the scheme word is the value alone and
-        # the name after it is its own (the router's reading, issue #929).
+        # A gap after a scheme word reaches a token whatever opens it (issue #1035: flattened,
+        # `Bearer<ESC>,eyJ…` is `Bearer ,eyJ…`), so `}DB_PASSWORD=` is the token, its value with it.
+        ("A_TOKEN=Bearer }DB_PASSWORD=\thunter2hunter2 x", "A_TOKEN='<a redacted value>' x"),
+        # A `}` after a value's word ends it, and the name after it is its own (issue #929).
         (
-            "A_TOKEN=Bearer }DB_PASSWORD=\thunter2hunter2 x",
+            "A_TOKEN=x }DB_PASSWORD=\thunter2hunter2 x",
             "A_TOKEN='<a redacted value>' }DB_PASSWORD='<a redacted value>' x",
         ),
         # A name the value does not reach past its `=` is its own, and keeps its name.
@@ -518,9 +520,11 @@ _ROUTED_PIECES = [
 ]  # fmt: skip
 
 
-#: A gap that holds anything but tabs (issue #1035): the one place the two readings part.
+#: A gap that holds anything but tabs, or is followed by a `,` or a `}` (issue #1035): the one
+#: place the two readings part.
 _WIDE_GAP = re.compile(
     r"[\s\x00-\x1f\x7f-\x9f]*[^\S\t]|[\s\x00-\x1f\x7f-\x9f]*[\x00-\x08\x0e-\x1f\x7f-\x9f]"
+    r"|[\s\x00-\x1f\x7f-\x9f]+[,}]"
 )
 
 
@@ -529,9 +533,10 @@ def _wide_gap_at(text: str, at: int) -> bool:
 
 
 def test_redact_credentials_is_the_routers_on_fuzzed_text():
-    # Issue #1035: a value that opens with a gap holding anything but tabs, and a token after a
-    # scheme word and such a gap, are read past it, where the router's reading crosses only tabs. Everywhere else the two readings are one, byte for
-    # byte; and everywhere, this one ends no earlier than the router's.
+    # Issue #1035: a value that opens with a gap holding anything but tabs, or a gap a `,` or a
+    # `}` follows, and a token after a scheme word and such a gap, are read past it, where the
+    # router's reading crosses only tabs and stops at those. Everywhere else the two readings are
+    # one, byte for byte; and everywhere, this one ends no earlier than the router's.
     rng = random.Random(929)
     compared = 0
     for _ in range(3000):
